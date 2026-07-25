@@ -20,6 +20,14 @@ Mutants:
       atomic-grouping rule) — reproduces Thufir's pass-2/2 CRITICAL:
       partial-slot reconstruction of a live RegB creates a false tombstone
       that permanently suppresses the override after eventual full delivery
+  M9: revert split_blob_into_slots to escaped-key grouping (groups frontier
+      by wire key instead of unescaped logical ID) — reproduces Thufir's
+      round-2 CRITICAL: for a context whose raw ID starts with a reserved
+      prefix (e.g. "ov_s:evil"), the frontier's escaped wire key
+      ("esc:ov_s:evil") and the ov_* siblings (keyed by raw suffix "ov_s:evil")
+      resolve to different groups → register split across slots →
+      old/new slot-coordinate mixture produces partial reconstruction →
+      false tombstone → permanent false clear across publication cycles
 
 Each mutant is injected into the model via DeviceB subclass, then the
 explorer or invariant suite is rerun. The counterexample (first violation)
@@ -36,6 +44,7 @@ from exhaustive import (
     explore_b, test_concurrent_stability,
     test_compaction_register_exhaustive, test_deep_history_compaction,
     test_published_merge_closure, test_interleaved_delivery_grouping,
+    test_escaped_context_slot_grouping,
     CONTEXTS,
 )
 
@@ -380,14 +389,87 @@ def mutant_m8():
     proving that the new interleaved-delivery test has teeth.
 
     Reproduce Thufir's exact transport witness directly: source live
-    `RegB(1,0,10)` at frontier=10. Per-entry split puts `ov_s:c0`+`ov_b:c0`
-    in one slot and `ov_c:c0` in the other. An observer receiving only the
-    first slot reconstructs `RegB(1,0,0)`, re-publishes tombstone `RegB(0,1,0)`.
+    `RegB(1,0,10)` at frontier=10. Per-entry split puts frontier+`ov_s:c0`
+    in slot 0 and `ov_c:c0`+`ov_b:c0` in slot 1. An observer receiving only
+    slot 0 reconstructs `RegB(1,0,0)`, re-publishes tombstone `RegB(0,1,0)`.
     Full merge including the transient: `RegB(1,1,10)` → inactive.
 
     Confirmed by running test_interleaved_delivery_grouping with M8_PerEntrySplit;
     the witness must be caught before resorting to the full suite."""
     return test_interleaved_delivery_grouping(device_cls=M8_PerEntrySplit)
+
+
+# ---------------------------------------------------------------------------
+# M9: revert split_blob_into_slots to escaped-key grouping
+# (groups frontier by wire key instead of unescaped logical ID —
+# reproduces Thufir's round-2 CRITICAL)
+# ---------------------------------------------------------------------------
+
+class M9_EscapedKeyGrouping(DeviceB):
+    """Reverts `split_blob_into_slots` to group the frontier key by its
+    ESCAPED wire key rather than the unescaped logical context ID.
+
+    For a normal context like "c0", this is a no-op (escape_context_key("c0")
+    == "c0"), so M9 is identical to the correct model on normal contexts.
+    The defect only manifests when the raw context ID starts with a reserved
+    prefix — e.g. raw "ov_s:evil" escapes to frontier wire key "esc:ov_s:evil".
+    The ov_* sibling keys are keyed by the RAW suffix ("ov_s:evil"), while
+    the frontier is keyed by the escaped wire key ("esc:ov_s:evil") — two
+    identities for one logical context, so they land in different slots.
+
+    This reproduces Thufir's round-2 CRITICAL: across publication cycles an
+    observer can receive the new frontier slot (esc:ov_s:evil=10) plus the
+    stale old-cycle override slot (ov_s/ov_c/ov_b at b=0), reconstructing
+    RegB(s=1,c=0,b=0) at frontier=10 — baseline-dead — and emitting tombstone
+    RegB(0,1,0). Full eventual delivery merges to RegB(1,1,10) — dead under
+    clear-wins — permanently suppressing a live override.
+    """
+
+    def split_blob_into_slots(self, tie_policy=CLEAR, n_slots=2):
+        """Split by original (escaped) wire key identity — does not unescape
+        frontier keys before grouping, so escaped contexts split incorrectly."""
+        blob = self.publish_blob(tie_policy)
+        contexts = blob["contexts"]
+
+        groups = {}  # wire_key -> list of (wire_key, value)
+        for wire_key, value in contexts.items():
+            if wire_key.startswith("ov_s:"):
+                ctx = wire_key[5:]
+            elif wire_key.startswith("ov_c:"):
+                ctx = wire_key[5:]
+            elif wire_key.startswith("ov_b:"):
+                ctx = wire_key[5:]
+            else:
+                ctx = wire_key  # frontier: use escaped wire key as group ID (BUG)
+            groups.setdefault(ctx, []).append((wire_key, value))
+
+        slots = [{"v": blob["v"], "client_id": blob["client_id"], "contexts": {}}
+                 for _ in range(n_slots)]
+        for i, (_ctx, pairs) in enumerate(sorted(groups.items())):
+            slot = slots[i % n_slots]
+            for wire_key, value in pairs:
+                slot["contexts"][wire_key] = value
+        return slots
+
+
+def mutant_m9():
+    """M9: escaped-key grouping must be caught by test_escaped_context_slot_grouping —
+    proving that the escaped-context regression test has teeth.
+
+    For a context whose raw ID starts with a reserved prefix ("ov_s:evil"),
+    the frontier wire key is "esc:ov_s:evil" and the ov_* sibling keys are
+    "ov_s:ov_s:evil", "ov_c:ov_s:evil", "ov_b:ov_s:evil". The escaped-key
+    grouping treats "esc:ov_s:evil" (frontier) and "ov_s:evil" (ov_* suffix)
+    as different groups, splitting the register across slots.
+
+    Old/new slot-coordinate mixture across publication cycles then reproduces
+    the round-1 transport poison: partial reconstruction → false tombstone →
+    permanent false clear of a live override.
+
+    The test is parameterized to route through the "mismatched grouping" path
+    (else branch) when the M9 split puts frontier and siblings in different slots,
+    and the witness must be caught."""
+    return test_escaped_context_slot_grouping(device_cls=M9_EscapedKeyGrouping)
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +486,7 @@ def run_mutations():
         ("M6: last-write-wins merge", mutant_m6),
         ("M7: publish without canonicalization (reproduces pass-1/2 CRITICAL)", mutant_m7),
         ("M8: per-entry split violates atomic-grouping rule (reproduces pass-2/2 CRITICAL)", mutant_m8),
+        ("M9: escaped-key grouping splits escaped-ctx register across slots (reproduces round-2 CRITICAL)", mutant_m9),
     ]
 
     print("=" * 60)

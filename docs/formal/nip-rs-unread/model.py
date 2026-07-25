@@ -314,7 +314,7 @@ class DeviceB:
         # A "group" is: the frontier key (escaped ctx) + any ov_* siblings.
         # Contexts that appear only as ov_* keys (no frontier entry) are
         # also grouped together.
-        groups = {}  # ctx -> list of (wire_key, value)
+        groups = {}  # logical_ctx -> list of (wire_key, value)
         for wire_key, value in contexts.items():
             if wire_key.startswith("ov_s:"):
                 ctx = wire_key[5:]
@@ -323,7 +323,17 @@ class DeviceB:
             elif wire_key.startswith("ov_b:"):
                 ctx = wire_key[5:]
             else:
-                ctx = wire_key  # frontier key (possibly escaped)
+                # Frontier key: may be escaped (e.g. "esc:ov_s:evil").
+                # Derive the logical context ID by unescaping so this
+                # entry joins the same group as its ov_* siblings, which
+                # are keyed by the RAW context ID (e.g. "ov_s:evil" ->
+                # ctx = "evil", but "esc:ov_s:evil" frontier -> ctx =
+                # "ov_s:evil" after unescape).  Without this step an
+                # escaped frontier key and its ov_* siblings would be
+                # treated as two different groups, splitting the register
+                # across slots — reproducing the round-1 partial-
+                # reconstruction poison for escaped context IDs.
+                ctx = unescape_context_key(wire_key)
             groups.setdefault(ctx, []).append((wire_key, value))
 
         slots = [{"v": blob["v"], "client_id": blob["client_id"], "contexts": {}}

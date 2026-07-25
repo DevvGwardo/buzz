@@ -48,9 +48,14 @@ budget. Two candidate encodings are modeled:
 - All delivery permutations of published blobs at terminal states
 - Multi-slot union (split blob across 2 slots, deliver separately)
 - Directed deep-history check: compact → new local actions (counter
-  reuse) → delayed stale delivery (including split across 2 slots),
-  over a 2,016-point parameter cube (stale `(S,C,B)` × post-compaction
-  frontier × 7 action sequences × 2 tie policies × 3 delivery shapes)
+  reuse) → delayed stale delivery, over a 672-point parameter cube
+  (stale `(S,C,B)` × post-compaction frontier × 7 action sequences ×
+  2 tie policies × 1 delivery shape). The prior 2,016-point count
+  included two duplicate split-delivery shapes (`split_fwd`/`split_rev`)
+  that became semantically identical to `single` once the atomic-grouping
+  rule made a single-context compliant split always whole-register+empty;
+  collapsed to one meaningful shape without loss of register-level
+  coverage.
 - Cross-device compaction transparency check: same tombstone, delivered
   to an unrelated device with its own live concurrent state, over a
   312-point parameter cube (stale `(S,C,B)` × post-compaction frontier ×
@@ -175,11 +180,14 @@ invariant has teeth.
 
 ### Convergence
 
-Both candidates converge under all tested delivery permutations.
+Both candidates converge under all tested delivery permutations (algebraic
+property).
 Candidate B achieves this with componentwise `max()` merge (a standard
 state-based CRDT join). Candidate A uses a register with lexicographic
 tuple comparison — also convergent, but the register requires a
-client-identity tiebreak field.
+client-identity tiebreak field. (Convergence for Candidate B is verified
+by exhaustive BFS over all reachable states; I2–I4 and I6 are exercised
+for Candidate B only — see invariant table.)
 
 ### Legacy compatibility matrix
 
@@ -421,11 +429,11 @@ remain live and are never compacted (3 keys, ~138 bytes for channel
 contexts) — unchanged from the prior revision.
 
 **Proof obligation closed (same-device replay):**
-`exhaustive.py::test_deep_history_compaction` (2,016-point parameter
+`exhaustive.py::test_deep_history_compaction` (672-point parameter
 cube) and `test_tombstone_stale_merge_direct` verify no resurrection
 and no loss of a genuinely-live override across the compact →
-new-action → delayed-stale-delivery shape, for both single-slot and
-2-slot-split delivery, both tie policies. `mutation.py::mutant_m4`
+new-action → delayed-stale-delivery shape, for both tie policies.
+`mutation.py::mutant_m4`
 reverts to the old delete-on-dominance rule and reproduces the exact
 resurrection witness (`final_reg=RegB(s=3, c=2, b=20)`,
 `override_is_set=True`) — confirming the suite would have caught the
@@ -558,8 +566,24 @@ half of the same closure property as mandatory canonical publication:
 Implementation: amend `splitContextsIntoBudgetedSlots` to round-robin
 per-context groups (frontier key + all `ov_*` sibling keys for that context)
 rather than per-entry. `DeviceB.split_blob_into_slots` in `model.py` models
-this correctly. `mutation.py::mutant_m8` reverts to per-entry splitting and
-confirms `test_interleaved_delivery_grouping` catches Thufir's exact witness.
+this correctly.
+
+**Unescape-before-group rule (corollary — spec-amendment requirement):**
+When grouping context entries, a frontier wire key MUST be unescaped to its
+raw logical context ID before being used as the group key. A raw context ID
+starting with a reserved prefix (e.g. `ov_s:evil`) escapes to
+`esc:ov_s:evil` as its frontier wire key, while its `ov_*` siblings are
+keyed by the raw suffix (`ov_s:evil`). Without unescaping the frontier key
+before grouping, these resolve to different groups and the register splits
+across slots — reproducing the same partial-reconstruction poison across
+publication cycles via old/new slot-coordinate mixtures. Fix: derive group
+identity via `unescape_context_key(wire_key)` for frontier keys.
+`mutation.py::mutant_m9` reverts to escaped-key grouping and confirms
+`test_escaped_context_slot_grouping` catches the witness.
+
+`mutation.py::mutant_m8` reverts to per-entry splitting (M8's split puts
+frontier+`ov_s:` in slot 0 and `ov_b:`+`ov_c:` in slot 1) and confirms
+`test_interleaved_delivery_grouping` catches Thufir's exact witness.
 
 This rule carries the same normative weight as mandatory canonical publication:
 both are protocol requirements for any client implementing this override layer,
@@ -574,7 +598,7 @@ transient delivery to a third observer, preserve the live override verdict.
 
 ## Mutation harness
 
-8 mutants, all caught with recorded counterexamples:
+9 mutants, all caught with recorded counterexamples:
 
 | Mutant | Rule dropped | Counterexample |
 |--------|-------------|----------------|
@@ -585,10 +609,11 @@ transient delivery to a third observer, preserve the live override verdict.
 | M5 | uint32 value range | Value 4,294,967,296 rejected by legacy sanitization |
 | M6 | Componentwise-max merge | LWW delivery-order-dependent: convergence breaks under permutation |
 | M7 | Canonical publication (raw register serialization) | `RegB(3,2,0)`@frontier-50 join `RegB(1,2,100)`@frontier-100 = live `RegB(3,2,100)` (reproduces Thufir's pass-1/2 CRITICAL dead+dead resurrection) |
-| M8 | Atomic slot-grouping rule (per-entry split) | Live `RegB(1,0,10)` at frontier=10 split as `{frontier+ov_s}` / `{ov_b+ov_c}`; partial observer reconstructs `RegB(1,0,0)`, publishes tombstone `RegB(0,1,0)`; final merge = `RegB(1,1,10)` → inactive (reproduces Thufir's pass-2/2 CRITICAL transport witness) |
+| M8 | Atomic slot-grouping rule (per-entry split) | Live `RegB(1,0,10)` at frontier=10 split as `{frontier+ov_s:}` / `{ov_b:+ov_c:}`; partial observer reconstructs `RegB(1,0,0)`, publishes tombstone `RegB(0,1,0)`; final merge = `RegB(1,1,10)` → inactive (reproduces Thufir's pass-2/2 CRITICAL transport witness) |
+| M9 | Unescape-before-group rule (escaped-key grouping) | Live override on raw ctx `ov_s:evil` (frontier wire key `esc:ov_s:evil`); escaped-key grouping splits frontier from `ov_*` siblings; old/new slot-coordinate mixture → `RegB(1,0,0)` → tombstone `RegB(0,1,0)` → final merge = `RegB(1,1,10)` → inactive (reproduces Thufir's round-2 CRITICAL) |
 
 Each mutant is injected into the model via DeviceB subclass (M1, M2, M4,
-M6, M7, M8) or direct function evaluation (M3, M5), then the applicable
+M6, M7, M8, M9) or direct function evaluation (M3, M5), then the applicable
 invariant suite is rerun. M4 reverts to the pre-fix delete-on-dominance
 compaction rule and directly reproduces Thufir's pass-3 CRITICAL resurrection
 witness — the exact `RegB(3,0,10)` → `None` → counter-reuse → stale
@@ -597,8 +622,11 @@ fallback to the directed deep-history cube (`test_deep_history_compaction`)
 if the hand-built scenario doesn't trigger under a given tie policy. M7
 reverts `publish_blob` to raw serialization and reproduces Thufir's pass-1/2
 CRITICAL dead+dead resurrection. M8 reverts `split_blob_into_slots` to
-per-entry assignment and reproduces Thufir's pass-2/2 CRITICAL transport
-witness via `test_interleaved_delivery_grouping`.
+per-entry assignment (frontier+`ov_s:` / `ov_b:`+`ov_c:`) and reproduces
+Thufir's pass-2/2 CRITICAL transport witness via `test_interleaved_delivery_grouping`.
+M9 reverts `split_blob_into_slots` to escaped-key grouping (groups frontier by
+its wire key instead of its unescaped logical ID) and reproduces Thufir's
+round-2 CRITICAL for escaped contexts via `test_escaped_context_slot_grouping`.
 
 ## Recommendation
 
@@ -612,8 +640,10 @@ Evidence:
    tolerates a single legacy device.
 2. **Identity-free:** B needs no client_id for correctness; A's
    tiebreak creates a reinstall fragility.
-3. **CRDT properties:** Both pass all merge invariants. B's
-   componentwise max is simpler and more standard.
+3. **CRDT properties:** Candidate B passes all merge invariants (I2–I8) in
+   the exhaustive model. Candidate A's join is also correct algebraically
+   (I1, I9), but I2–I4 and I6 are not exercised for A — A is dead on I7
+   regardless. B's componentwise max is simpler and more standard.
 4. **Bytes:** B at 3 live keys costs 138 bytes/context (channel UUID) to
    243 bytes/context (thread hex64); a dead override compacts to a single
    ~45-80 byte tombstone key instead. Cap of 100 overrides stays within
@@ -653,9 +683,14 @@ Evidence:
 - Two contexts are modeled. Production users may have hundreds of contexts,
   but the CRDT properties are per-context — cross-context interactions are
   limited to the shared byte budget (tested via trim/prune interaction).
-- Multi-slot behavior is confirmed via split+merge convergence test, but
-  the split algorithm itself (`splitContextsIntoBudgetedSlots`) is not
-  modeled. Implementation-level testing is needed for slot placement.
+- Multi-slot behavior is confirmed via split+merge convergence test, and
+  the atomic slot-grouping rule is modeled by `DeviceB.split_blob_into_slots`
+  (including the escaped-context identity fix — `split_blob_into_slots`
+  unescapes frontier keys before grouping). The production TypeScript
+  implementation (`splitContextsIntoBudgetedSlots`) is NOT modeled — only
+  the abstract grouping property is verified here. Implementation-level
+  testing is still needed for slot placement, slot rebalancing, and the
+  production d-tag coordinate assignment.
 - The model assumes eventual delivery (all blobs eventually reach all
   devices). Permanent message loss is not modeled.
 - Byte sizes are computed from JSON serialization of realistic key names.

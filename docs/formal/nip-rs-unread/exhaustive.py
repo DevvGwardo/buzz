@@ -394,29 +394,17 @@ def _ancestor_ctx_dict(ctx, reg):
     return {f"ov_s:{ctx}": reg.s, f"ov_c:{ctx}": reg.c, f"ov_b:{ctx}": reg.b}
 
 
-def _ancestor_split_ctx_dicts(ctx, reg):
-    """Split the same ancestor register across 2 slots using the atomic-
-    grouping rule: all three `ov_*` sibling entries for a context travel
-    together. With only one context (`ctx`) involved, one slot gets the
-    whole group and the other is empty — this is the correct compliant
-    split for a single-context blob (no partial register possible).
-
-    This replaced the prior per-entry split that put `ov_s:` + `ov_b:`
-    in one slot and `ov_c:` alone in the other — a non-compliant split
-    that let an observer reconstruct a partial `RegB(1,0,0)` and
-    canonically publish a false tombstone `RegB(0,1,0)`.
-    """
-    return (
-        {f"ov_s:{ctx}": reg.s, f"ov_c:{ctx}": reg.c, f"ov_b:{ctx}": reg.b},
-        {},  # second slot: empty (no other contexts in this ancestor blob)
-    )
-
-
 _DEEP_HISTORY_ACTION_SEQS = [
     (), ("set",), ("clear",), ("set", "clear"), ("clear", "set"),
     ("set", "set"), ("clear", "clear"),
 ]
-_DEEP_HISTORY_DELIVERY_SHAPES = ("single", "split_fwd", "split_rev")
+# One delivery shape: single unsplit blob.  The prior "split_fwd"/"split_rev"
+# shapes are no longer distinct — with the atomic-grouping rule a single-
+# context blob's compliant split puts the whole group in one slot and the
+# other empty, making split_fwd and split_rev semantically identical to
+# single.  Keeping only one shape avoids 2/3 duplicate executions (2,016 →
+# 672 meaningful points) while losing zero register-level coverage.
+_DEEP_HISTORY_DELIVERY_SHAPES = ("single",)
 
 
 def test_deep_history_compaction(device_cls=DeviceB):
@@ -451,7 +439,6 @@ def test_deep_history_compaction(device_cls=DeviceB):
                         continue  # not a dominance/compaction scenario
                     ancestor = RegB(s=s0, c=c0, b=b0)
                     ancestor_blob = _ancestor_ctx_dict(ctx, ancestor)
-                    slot_fwd, slot_rev = _ancestor_split_ctx_dicts(ctx, ancestor)
                     for seq in _DEEP_HISTORY_ACTION_SEQS:
                         for tie_policy in (CLEAR, SET):
                             for shape in _DEEP_HISTORY_DELIVERY_SHAPES:
@@ -466,12 +453,6 @@ def test_deep_history_compaction(device_cls=DeviceB):
 
                                 if shape == "single":
                                     dev.receive_merge({"contexts": dict(ancestor_blob)})
-                                elif shape == "split_fwd":
-                                    dev.receive_merge({"contexts": dict(slot_fwd)})
-                                    dev.receive_merge({"contexts": dict(slot_rev)})
-                                else:
-                                    dev.receive_merge({"contexts": dict(slot_rev)})
-                                    dev.receive_merge({"contexts": dict(slot_fwd)})
                                 ov_after = dev.override_is_set(ctx, tie_policy)
 
                                 ref = device_cls("ref")
@@ -1071,11 +1052,12 @@ def test_multi_slot_union(device_cls=DeviceB):
 # Interleaved-delivery grouping: Thufir's CRITICAL transport counterexample
 #
 # Without the atomic-grouping rule a compliant publisher would still split
-# ov_s:/ov_c:/ov_b: across slots as independent entries.  An observer
-# holding only the slot with ov_s:+ov_b: would reconstruct RegB(1,0,0),
-# judge it baseline-dead (B=0 ≤ frontier=0), and canonically publish
-# tombstone RegB(0,1,0).  After all slots and that transient tombstone are
-# eventually merged the result is RegB(1,1,10) — dead under clear-wins —
+# ov_s:/ov_c:/ov_b: across slots as independent entries.  M8's per-entry
+# split places frontier+ov_s: in slot 0 and ov_b:+ov_c: in slot 1.  An
+# observer holding only slot 0 reconstructs RegB(1,0,0), judges it
+# baseline-dead (B=0 ≤ frontier=10), and canonically publishes tombstone
+# RegB(0,1,0).  After all slots and that transient tombstone are eventually
+# merged the result is RegB(1,1,10) — dead under clear-wins —
 # permanently suppressing a live override.
 #
 # The atomic-grouping rule closes this: every ov_* entry for a context
@@ -1088,14 +1070,28 @@ def test_multi_slot_union(device_cls=DeviceB):
 def test_interleaved_delivery_grouping(device_cls=DeviceB):
     """Exercise receive-one-slot → canonical re-publish → receive-rest →
     re-publish permutations, both slot orders, including delayed delivery
-    of the transient re-publication to a third observer.
+    of both transient re-publications to a third observer.
 
-    Oracle: a live source override must remain live at every observer
-    after eventual delivery of all blobs (source slots + any transient
-    re-publications), in all interleaving orders.
+    Protocol sequence (exact, per Paul's brief):
+      1. partial_obs receives first_slot → publishes transient_1.
+      2. partial_obs receives second_slot → publishes transient_2.
+      3. Third-party finals receive BOTH source slots AND both transient
+         publications in relevant interleaving orders.
+    Oracle: after eventual delivery of ALL blobs (both source slots +
+    both transients), every observer's override matches source liveness.
 
-    With the atomic-grouping rule (default DeviceB): PASS.
-    With per-entry splitting (M8): FAIL — Thufir's exact witness.
+    With the atomic-grouping rule (default DeviceB):
+      - The compliant split puts the full register in one slot, the other
+        is empty.  partial_obs after step 1 holds either the complete
+        register (live → transient_1 is live) or nothing (transient_1 is
+        empty/virgin).  Either way, step 2 delivers the remaining (possibly
+        empty) slot.  Final merge of all blobs = source liveness.  PASS.
+    With per-entry splitting (M8):
+      - slot 0 carries frontier + ov_s: (partial → RegB(1,0,0), dead).
+        transient_1 is tombstone RegB(0,1,0).  After step 2 partial_obs
+        holds full register but transient_1 tombstone is already in
+        circulation.  Finals that receive transient_1 get
+        RegB(1,1,10) — dead under clear-wins.  FAIL (Thufir's witness).
     """
     violations = []
 
@@ -1115,62 +1111,192 @@ def test_interleaved_delivery_grouping(device_cls=DeviceB):
         # Produce the source's two slots via the (possibly mutated) split.
         slots = src.split_blob_into_slots(tie_policy, n_slots=2)
         slot0, slot1 = slots[0], slots[1]
+        src_live = src.override_is_set("c0", tie_policy)
 
-        # For both slot-receipt orders, exercise the full interleaving:
-        #   1. Observer A receives slot i, canonically re-publishes (relay hop).
-        #   2. Final observer receives: slot i re-pub, then slot j.
-        #   3. Final observer receives: slot j, then slot i re-pub.
-        # In all paths, the final observer must see the override as live.
         for first_slot, second_slot in [(slot0, slot1), (slot1, slot0)]:
-            # Step 1: partial observer receives first slot, re-publishes.
+            # Step 1: partial_obs receives first slot, canonically re-publishes.
             partial_obs = device_cls("partial_obs")
             partial_obs.receive_merge(first_slot)
-            transient_pub = partial_obs.publish_blob(tie_policy)
+            transient_1 = partial_obs.publish_blob(tie_policy)
 
-            # Step 2: final observer gets transient first, then second slot.
-            final_a = device_cls("final_a")
-            final_a.receive_merge(transient_pub)
-            final_a.receive_merge(second_slot)
-            if not final_a.override_is_set("c0", tie_policy):
-                # Check whether this is the Thufir witness scenario:
-                # transient_pub should have been a false tombstone.
-                ov_transient = partial_obs.overrides.get("c0")
-                violations.append((
-                    "interleaved-delivery-false-clear",
-                    tie_policy, "transient_first",
-                    f"slot_order=(first={list(first_slot['contexts'].keys())[:3]}...,"
-                    f"second={list(second_slot['contexts'].keys())[:3]}...)",
-                    f"transient_reg={ov_transient}",
-                    f"final_reg={final_a.overrides.get('c0')}",
-                ))
+            # Step 2: partial_obs receives second slot, publishes again.
+            partial_obs.receive_merge(second_slot)
+            transient_2 = partial_obs.publish_blob(tie_policy)
 
-            # Step 3: final observer gets second slot first, then transient.
-            final_b = device_cls("final_b")
-            final_b.receive_merge(second_slot)
-            final_b.receive_merge(transient_pub)
-            if not final_b.override_is_set("c0", tie_policy):
-                ov_transient = partial_obs.overrides.get("c0")
-                violations.append((
-                    "interleaved-delivery-false-clear",
-                    tie_policy, "transient_second",
-                    f"slot_order=(first={list(first_slot['contexts'].keys())[:3]}...,"
-                    f"second={list(second_slot['contexts'].keys())[:3]}...)",
-                    f"transient_reg={ov_transient}",
-                    f"final_reg={final_b.overrides.get('c0')}",
-                ))
+            # Step 3: third-party finals receive BOTH source slots AND both
+            # transient publications, in several representative interleaving
+            # orders.  All must agree with source liveness.
+            # Representative orders: transient_1 before both slots (most
+            # dangerous under M8), transient_1 after both slots, and
+            # interleaved.  We check 3 explicit orders rather than all 4!
+            # permutations (24) for speed; M8's canonical false-clear path
+            # (transient_1 first, then second_slot only) is order 1.
+            check_orders = [
+                # Most dangerous: transient_1 arrives first, before any source
+                [transient_1, slot0, slot1, transient_2],
+                # Normal: both source slots first, then both transients
+                [slot0, slot1, transient_1, transient_2],
+                # Interleaved: first source, transient_1, second source, transient_2
+                [first_slot, transient_1, second_slot, transient_2],
+            ]
 
-            # Step 4: full convergence check — also receive source's full blob
-            # (the union of both slots) at a fresh observer; must agree.
-            full_src_blob = src.publish_blob(tie_policy)
-            final_c = device_cls("final_c")
-            final_c.receive_merge(full_src_blob)
-            final_c.receive_merge(transient_pub)
-            if not final_c.override_is_set("c0", tie_policy):
+            for order in check_orders:
+                final = device_cls("final")
+                for blob in order:
+                    final.receive_merge(blob)
+                final_live = final.override_is_set("c0", tie_policy)
+                if final_live != src_live:
+                    t1_reg = partial_obs.overrides.get("c0")
+                    violations.append((
+                        "interleaved-delivery-false-clear",
+                        tie_policy,
+                        f"slot_order=(first={list(first_slot['contexts'].keys())[:2]}...)",
+                        f"delivery_order={[list(b['contexts'].keys())[:2] for b in order]}",
+                        f"transient_1_reg={t1_reg}",
+                        f"final_reg={final.overrides.get('c0')}",
+                        f"expected_live={src_live} got_live={final_live}",
+                    ))
+
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Escaped-context slot-grouping regression
+#
+# Thufir's CRITICAL (round 2): a raw context ID that starts with a
+# reserved prefix (e.g. "ov_s:evil") escapes to "esc:ov_s:evil" as its
+# frontier wire key.  Before the fix, split_blob_into_slots grouped the
+# frontier by its wire key ("esc:ov_s:evil") but the ov_* siblings by
+# the raw suffix ("ov_s:evil") — two identities for one logical context.
+# The frontier and its siblings landed in different slots.
+#
+# Across publication cycles the replaceable slot d-tag coordinates
+# update slot-by-slot.  A relay can therefore serve: new frontier slot
+# (just published, carries esc:ov_s:evil=10) + stale override slot
+# (old coordinate, carries ov_s/ov_c/ov_b at b=0 from the old pub).
+# The reconstructed register is RegB(s=1, c=0, b=0) at frontier=10 —
+# baseline-dead.  Canonical re-publication emits tombstone RegB(0,1,0).
+# Eventually both current slots + the transient merge to RegB(1,1,10) —
+# dead under clear-wins — permanently suppressing a live override.
+#
+# The fix: derive the frontier's group identity via unescape_context_key
+# so it joins the same group as its ov_* siblings.  This test exercises
+# both directions: M9 (reverts to escaped-key grouping) must reproduce
+# the witness, and the correct model must pass.
+# ---------------------------------------------------------------------------
+
+def test_escaped_context_slot_grouping(device_cls=DeviceB):
+    """Regression for escaped-context identity mismatch in split_blob_into_slots.
+
+    Scenario:
+    1. Source has a live override on raw context "ov_s:evil" (escapes to
+       "esc:ov_s:evil" as frontier wire key) — Thufir's exact escaped witness.
+    2. Source publishes twice: first at frontier=0/b=0, then after advancing
+       frontier to 10 and re-marking unread (b=10).  Each publication produces
+       2 slots.  Simulates a relay retaining a stale old-cycle slot under its
+       old replaceable coordinate while only the new-cycle slot for the OTHER
+       half has been updated — the old/new slot-coordinate mixture.
+    3. An observer receives: new-cycle frontier-bearing slot (frontier=10,
+       esc:ov_s:evil=10) + stale old-cycle override slot (ov_s/ov_c/ov_b from
+       first pub where b=0).
+    4. Observer canonically re-publishes (mandatory, per NIP-RS spec).
+    5. A third-party final observer receives both current-cycle source slots
+       plus the transient re-publication.
+    6. Oracle: final observer must see the override as live.
+
+    With the unescape-before-group fix: frontier + ov_* siblings always land
+    in the same slot → no partial register → no false tombstone.  PASS.
+    With M9 (escaped-key grouping): frontier in one slot, siblings in another
+    → partial reconstruction → false tombstone → final merge dead.  FAIL.
+    """
+    violations = []
+    raw_ctx = "ov_s:evil"
+
+    for tie_policy in (CLEAR, SET):
+        # --- Publication cycle 1: initial state, frontier=0 ---
+        src_old = device_cls("src")
+        src_old.frontier[raw_ctx] = 0
+        src_old.do_mark_unread(raw_ctx)  # RegB(s=1, c=0, b=0)
+        old_slots = src_old.split_blob_into_slots(tie_policy, n_slots=2)
+        # old_slots[0] is the "stale old-coordinate slot" a relay may retain.
+
+        # --- Publication cycle 2: frontier advances, re-mark-unread ---
+        src_new = device_cls("src")
+        src_new.frontier[raw_ctx] = 10
+        src_new.do_mark_unread(raw_ctx)  # RegB(s=1, c=0, b=10) — live at frontier=10
+
+        assert src_new.override_is_set(raw_ctx, tie_policy), (
+            f"test precondition: source must be live under {tie_policy}"
+        )
+
+        new_slots = src_new.split_blob_into_slots(tie_policy, n_slots=2)
+
+        # --- Full delivery: both new slots → both current-cycle slot arrive ---
+        recv_full = device_cls("recv_full")
+        recv_full.receive_merge(new_slots[0])
+        recv_full.receive_merge(new_slots[1])
+        if not recv_full.override_is_set(raw_ctx, tie_policy):
+            violations.append((
+                "escaped-ctx-full-delivery-dead", tie_policy,
+                f"full={recv_full.overrides.get(raw_ctx)}",
+            ))
+
+        # --- Mixture: new frontier-bearing slot + stale old override slot ---
+        # Identify which new slot carries the frontier and which carries ov_*,
+        # then pair the frontier slot with the old-cycle override slot.
+        wire_frontier = escape_context_key(raw_ctx)
+
+        new_frontier_slot_idx = 0 if wire_frontier in new_slots[0]["contexts"] else 1
+        new_frontier_slot = new_slots[new_frontier_slot_idx]
+        old_override_slot = old_slots[1 - new_frontier_slot_idx]  # opposite slot
+
+        # Check whether the frontier and ov_* siblings are co-located in new_slots.
+        ov_s_key = f"ov_s:{raw_ctx}"
+        frontier_and_ov_same_slot = (
+            wire_frontier in new_slots[new_frontier_slot_idx]["contexts"] and
+            ov_s_key in new_slots[new_frontier_slot_idx]["contexts"]
+        )
+
+        if frontier_and_ov_same_slot:
+            # Correct grouping: old override slot has nothing relevant, mixture
+            # is safe by construction — the stale slot is just an empty dict.
+            # Verify anyway for defense-in-depth.
+            obs = device_cls("obs")
+            obs.receive_merge(new_frontier_slot)
+            obs.receive_merge(old_override_slot)
+            transient = obs.publish_blob(tie_policy)
+
+            final = device_cls("final")
+            final.receive_merge(new_slots[0])
+            final.receive_merge(new_slots[1])
+            final.receive_merge(transient)
+            if not final.override_is_set(raw_ctx, tie_policy):
                 violations.append((
-                    "interleaved-delivery-full-plus-transient-false-clear",
-                    tie_policy,
-                    f"final_reg={final_c.overrides.get('c0')}",
+                    "escaped-ctx-grouped-mixture-dead", tie_policy,
+                    f"transient={obs.overrides.get(raw_ctx)}",
+                    f"final={final.overrides.get(raw_ctx)}",
                 ))
+        else:
+            # Mismatched grouping (M9 path): frontier and siblings split.
+            # The mixture produces a partial register → false tombstone.
+            obs = device_cls("obs")
+            obs.receive_merge(new_frontier_slot)    # gets frontier=10, no ov_*
+            obs.receive_merge(old_override_slot)    # gets ov_s/ov_c/ov_b at b=0
+            transient = obs.publish_blob(tie_policy)
+
+            # Final observer gets everything: both new slots + transient.
+            for order in [(new_slots[0], new_slots[1]), (new_slots[1], new_slots[0])]:
+                final = device_cls("final")
+                final.receive_merge(order[0])
+                final.receive_merge(order[1])
+                final.receive_merge(transient)
+                if not final.override_is_set(raw_ctx, tie_policy):
+                    violations.append((
+                        "escaped-ctx-mixture-false-clear", tie_policy,
+                        f"obs_reg={obs.overrides.get(raw_ctx)}",
+                        f"transient_reg={transient['contexts']}",
+                        f"final_reg={final.overrides.get(raw_ctx)}",
+                    ))
 
     return violations
 
@@ -1339,6 +1465,9 @@ def run_all():
 
     print("\n--- Interleaved delivery + atomic grouping rule ---")
     report("no false clear under slot interleaving", test_interleaved_delivery_grouping())
+
+    print("\n--- Escaped-context slot-grouping regression ---")
+    report("escaped ctx: frontier + ov_* siblings same slot", test_escaped_context_slot_grouping())
 
     print("\n--- Reserved key namespace: adversarial prefix collision ---")
     report("escape/unescape + no misparse", test_reserved_namespace_collision())
