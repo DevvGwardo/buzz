@@ -64,27 +64,33 @@ budget. Two candidate encodings are modeled:
   hitting the wire (mandatory, not optional) — live unchanged, dead
   folded to the tombstone floor, virgin omitted. Checked over a directed
   witness (Thufir's exact dead+dead pair) plus a general search: every
-  pairwise join of a bounded cube of independently-dead published states
-  (300 points per tie policy), including a one-hop relay republication
-  to cover delayed/multi-hop delivery — 45,074 pairs checked total across
-  both tie policies
+  pairwise join of a bounded cube of 300 independently-dead published
+  states (156 clear-wins + 144 set-wins = 300 total across both tie
+  policies), including a one-hop relay republication to cover
+  delayed/multi-hop delivery — 45,074 pairs checked total (156² + 144²
+  + 2 directed witnesses)
 
 ## Invariants checked
 
 | # | Invariant | A | B (clear-wins) | B (set-wins) |
 |---|-----------|---|-----------------|--------------|
 | I1 | Join associative/commutative/idempotent | PASS | PASS | PASS |
-| I2 | Convergence (all delivery orders) | PASS | PASS | PASS |
-| I3 | No frontier regression | PASS | PASS | PASS |
-| I4 | Concurrent set/clear winner stable | PASS | PASS | PASS |
+| I2 | Convergence (all delivery orders) | not exercised | PASS | PASS |
+| I3 | No frontier regression | not exercised | PASS | PASS |
+| I4 | Concurrent set/clear winner stable | not exercised | PASS | PASS |
 | I5 | Compaction: no loss, no resurrection (immediate merge-back) | n/a | PASS | PASS |
 | I5c | Deep-history: compact → reuse → delayed stale delivery (same-device replay) | n/a | PASS | PASS |
 | I5d | Cross-device compaction transparency (suppress-only, not zero-divergence) | n/a | PASS | PASS |
 | I5e | Published-state merge closure: dead+dead join stays inactive | n/a | PASS | PASS |
-| I6 | Replay harmless | PASS | PASS | PASS |
+| I6 | Replay harmless | not exercised | PASS | PASS |
 | I7 | Legacy rewrite safety | **FAIL** (witness) | PASS | PASS |
 | I8 | Bounded key growth (3 keys/ctx live, 1 key/ctx tombstone) | n/a | PASS | PASS |
 | I9 | DeviceA counter absorption | PASS | n/a | n/a |
+
+Note: Candidate A is exercised only for I1, I7, and I9. BFS/convergence,
+frontier-regression, concurrent-winner, and replay tests (I2–I4, I6) are
+Candidate B-only; adding A variants would fail minimalism since A is already
+dead on I7 (legacy-rewrite erasure).
 
 I5 covers the immediate compacted-vs-pre-compaction merge shape (both
 merge orders). I5c is the same-device deep-history property this round
@@ -154,16 +160,18 @@ depends on prior local state having been compacted.
 checks two ways — Thufir's exact witness pair
 (`RegB(3,2,0)`@baseline-dead-50 join `RegB(1,2,100)`@clear-dead-100,
 raw join is live `RegB(3,2,100)`) as a directed case under both tie
-policies, and a general search over every pairwise join of a
-300-point-per-policy cube of independently-dead published states,
-including a one-hop relay republication step to cover delayed/multi-hop
-delivery (a relay that receives one operand alone and republishes —
-re-canonicalizing — before forwarding). `mutation.py::mutant_m7` reverts
+policies, and a general search over every pairwise join of a bounded
+cube of 300 independently-dead published states (156 clear-wins + 144
+set-wins = 300 total across both tie policies), including a one-hop
+relay republication step to cover delayed/multi-hop delivery (a relay
+that receives one operand alone and republishes — re-canonicalizing —
+before forwarding). The 45,074 ordered pairs checked comes from
+156² + 144² + 2 directed witnesses. `mutation.py::mutant_m7` reverts
 `publish_blob` to the pre-fix raw-serialization behavior and reproduces
 Thufir's exact resurrection witness directly, confirming the new
 invariant has teeth.
 
-
+## Candidate comparison
 
 ### Convergence
 
@@ -532,13 +540,41 @@ Production splits blobs across up to 8 slots (`READ_STATE_MAX_SLOTS`).
 `mergeReadStateEvents` merges all slots with per-context `max()`. Override
 sibling keys are individual context entries and follow the same merge path.
 
-Confirmed: splitting a published blob across 2 slots and delivering each
-separately produces the same final override and frontier state as
-delivering the full blob, regardless of delivery order.
+**Atomic slot-grouping rule (spec-amendment requirement):** a context's
+frontier entry and ALL of its `ov_*` sibling entries MUST travel in the
+same slot, including during slot growth/rebalancing. This is the transport
+half of the same closure property as mandatory canonical publication:
+
+- Without it, an observer holding only a slot containing `ov_s:ctx` (but
+  not `ov_b:ctx`) reconstructs `RegB(s=1, c=0, b=0)` — baseline-dead at
+  any nonzero frontier — and canonically publishes tombstone `RegB(0,1,0)`.
+  After full eventual delivery of all original slots plus that transient
+  tombstone, the merged result is `RegB(s=1, c=1, b=10)` — dead under
+  clear-wins — permanently suppressing a live override.
+- With the rule, a receiver always sees either the complete register group
+  or none of it; partial reconstruction is structurally impossible from a
+  compliant publisher's output.
+
+Implementation: amend `splitContextsIntoBudgetedSlots` to round-robin
+per-context groups (frontier key + all `ov_*` sibling keys for that context)
+rather than per-entry. `DeviceB.split_blob_into_slots` in `model.py` models
+this correctly. `mutation.py::mutant_m8` reverts to per-entry splitting and
+confirms `test_interleaved_delivery_grouping` catches Thufir's exact witness.
+
+This rule carries the same normative weight as mandatory canonical publication:
+both are protocol requirements for any client implementing this override layer,
+not optional optimizations.
+
+Confirmed: splitting a published blob across 2 grouped slots and delivering
+each separately produces the same final override and frontier state as
+delivering the full blob, regardless of delivery order. Interleaved-delivery
+test (`test_interleaved_delivery_grouping`) additionally verifies that
+receive-one-slot → re-publish → receive-rest permutations, including delayed
+transient delivery to a third observer, preserve the live override verdict.
 
 ## Mutation harness
 
-6 mutants, all caught with recorded counterexamples:
+8 mutants, all caught with recorded counterexamples:
 
 | Mutant | Rule dropped | Counterexample |
 |--------|-------------|----------------|
@@ -548,15 +584,21 @@ delivering the full blob, regardless of delivery order.
 | M4 | Tombstone-floor compaction (delete-on-dominance revert) | `RegB(3,0,10)` at frontier=20 compacts to `None` (vs. tombstone `RegB(0,3,0)`); local set+clear reuses counters from zero; delayed stale replay resurrects — `final_reg=RegB(s=3,c=2,b=20)`, `override_is_set=True` (reproduces Thufir's pass-3 CRITICAL) |
 | M5 | uint32 value range | Value 4,294,967,296 rejected by legacy sanitization |
 | M6 | Componentwise-max merge | LWW delivery-order-dependent: convergence breaks under permutation |
+| M7 | Canonical publication (raw register serialization) | `RegB(3,2,0)`@frontier-50 join `RegB(1,2,100)`@frontier-100 = live `RegB(3,2,100)` (reproduces Thufir's pass-1/2 CRITICAL dead+dead resurrection) |
+| M8 | Atomic slot-grouping rule (per-entry split) | Live `RegB(1,0,10)` at frontier=10 split as `{frontier+ov_s}` / `{ov_b+ov_c}`; partial observer reconstructs `RegB(1,0,0)`, publishes tombstone `RegB(0,1,0)`; final merge = `RegB(1,1,10)` → inactive (reproduces Thufir's pass-2/2 CRITICAL transport witness) |
 
 Each mutant is injected into the model via DeviceB subclass (M1, M2, M4,
-M6) or direct function evaluation (M3, M5), then the applicable invariant
-suite is rerun. M4 reverts to the pre-fix delete-on-dominance compaction
-rule and directly reproduces Thufir's pass-3 CRITICAL resurrection
+M6, M7, M8) or direct function evaluation (M3, M5), then the applicable
+invariant suite is rerun. M4 reverts to the pre-fix delete-on-dominance
+compaction rule and directly reproduces Thufir's pass-3 CRITICAL resurrection
 witness — the exact `RegB(3,0,10)` → `None` → counter-reuse → stale
 replay → `RegB(3,2,20)`,`override_is_set=True` sequence — with a
 fallback to the directed deep-history cube (`test_deep_history_compaction`)
-if the hand-built scenario doesn't trigger under a given tie policy.
+if the hand-built scenario doesn't trigger under a given tie policy. M7
+reverts `publish_blob` to raw serialization and reproduces Thufir's pass-1/2
+CRITICAL dead+dead resurrection. M8 reverts `split_blob_into_slots` to
+per-entry assignment and reproduces Thufir's pass-2/2 CRITICAL transport
+witness via `test_interleaved_delivery_grouping`.
 
 ## Recommendation
 

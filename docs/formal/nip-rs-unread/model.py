@@ -270,6 +270,16 @@ class DeviceB:
         convention. `do_compact` remains a separate storage-GC
         transition that mutates `self.overrides`; publication no
         longer depends on it having been called first.
+
+        **Atomic slot-grouping rule (spec-amendment requirement):**
+        A context's frontier entry and ALL of its `ov_*` sibling entries
+        MUST travel in the same slot. `split_blob_into_slots` below
+        enforces this by round-robining per-context groups, never
+        per-entry. A receiving client that only holds part of a context
+        group and attempts to reconstruct a `RegB` from it would see
+        partial zeroes and might canonically re-publish a false
+        tombstone. Group atomicity makes partial reconstruction
+        structurally impossible from a compliant publisher's output.
         """
         blob_ctx = {escape_context_key(k): v for k, v in self.frontier.items()}
         if not self.is_legacy:
@@ -284,6 +294,45 @@ class DeviceB:
                 else:
                     blob_ctx[f"ov_c:{k}"] = canonical.c  # tombstone: ceiling only
         return {"v": 1, "client_id": self.client_id, "contexts": blob_ctx}
+
+    def split_blob_into_slots(self, tie_policy=CLEAR, n_slots=2):
+        """Split this device's blob into `n_slots` compliant slots.
+
+        **Atomic grouping rule:** a context's frontier entry and ALL of
+        its `ov_*` sibling entries travel together in the same slot.
+        Round-robin assignment is per-context group, never per-entry.
+        This matches production `splitContextsIntoBudgetedSlots` when
+        it is amended to group by context instead of by individual entry.
+
+        Returns a list of `n_slots` blobs, each with the same `v` and
+        `client_id` but a disjoint subset of context groups.
+        """
+        blob = self.publish_blob(tie_policy)
+        contexts = blob["contexts"]
+
+        # Gather per-context groups: each group is a list of (key, value) pairs.
+        # A "group" is: the frontier key (escaped ctx) + any ov_* siblings.
+        # Contexts that appear only as ov_* keys (no frontier entry) are
+        # also grouped together.
+        groups = {}  # ctx -> list of (wire_key, value)
+        for wire_key, value in contexts.items():
+            if wire_key.startswith("ov_s:"):
+                ctx = wire_key[5:]
+            elif wire_key.startswith("ov_c:"):
+                ctx = wire_key[5:]
+            elif wire_key.startswith("ov_b:"):
+                ctx = wire_key[5:]
+            else:
+                ctx = wire_key  # frontier key (possibly escaped)
+            groups.setdefault(ctx, []).append((wire_key, value))
+
+        slots = [{"v": blob["v"], "client_id": blob["client_id"], "contexts": {}}
+                 for _ in range(n_slots)]
+        for i, (_ctx, pairs) in enumerate(sorted(groups.items())):
+            slot = slots[i % n_slots]
+            for wire_key, value in pairs:
+                slot["contexts"][wire_key] = value
+        return slots
 
     def receive_merge(self, blob):
         incoming_overrides = {}

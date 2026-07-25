@@ -395,12 +395,20 @@ def _ancestor_ctx_dict(ctx, reg):
 
 
 def _ancestor_split_ctx_dicts(ctx, reg):
-    """Split the same ancestor register across 2 slots, as production's
-    splitContextsIntoBudgetedSlots would when a blob spans multiple
-    NIP-59 events."""
+    """Split the same ancestor register across 2 slots using the atomic-
+    grouping rule: all three `ov_*` sibling entries for a context travel
+    together. With only one context (`ctx`) involved, one slot gets the
+    whole group and the other is empty — this is the correct compliant
+    split for a single-context blob (no partial register possible).
+
+    This replaced the prior per-entry split that put `ov_s:` + `ov_b:`
+    in one slot and `ov_c:` alone in the other — a non-compliant split
+    that let an observer reconstruct a partial `RegB(1,0,0)` and
+    canonically publish a false tombstone `RegB(0,1,0)`.
+    """
     return (
-        {f"ov_s:{ctx}": reg.s, f"ov_b:{ctx}": reg.b},
-        {f"ov_c:{ctx}": reg.c},
+        {f"ov_s:{ctx}": reg.s, f"ov_c:{ctx}": reg.c, f"ov_b:{ctx}": reg.b},
+        {},  # second slot: empty (no other contexts in this ancestor blob)
     )
 
 
@@ -1018,12 +1026,14 @@ def test_legacy_trim_interaction():
 # ---------------------------------------------------------------------------
 
 def test_multi_slot_union(device_cls=DeviceB):
-    """Split a published blob across 2 slots, deliver each separately,
-    verify convergence with delivering the full blob.
+    """Split a published blob across 2 slots using the atomic-grouping rule,
+    deliver each slot separately, verify convergence with delivering the full blob.
 
     Production: mergeReadStateEvents merges per-slot blobs with per-context
     max(). Override sibling keys are individual context entries, so they
-    follow the same merge path.
+    follow the same merge path. The atomic-grouping rule requires that all
+    `ov_*` sibling keys for a context travel with that context's frontier
+    key in the same slot — `split_blob_into_slots` enforces this.
     """
     violations = []
     for tie_policy in [CLEAR, SET]:
@@ -1034,13 +1044,8 @@ def test_multi_slot_union(device_cls=DeviceB):
         dev.do_mark_read("c1", 30)
 
         full_blob = dev.publish_blob(tie_policy)
-        items = list(full_blob["contexts"].items())
-        mid = len(items) // 2
-
-        slot0 = {"v": 1, "client_id": dev.client_id,
-                 "contexts": dict(items[:mid])}
-        slot1 = {"v": 1, "client_id": dev.client_id,
-                 "contexts": dict(items[mid:])}
+        slots = dev.split_blob_into_slots(tie_policy, n_slots=2)
+        slot0, slot1 = slots[0], slots[1]
 
         recv_full = device_cls("recv_full")
         recv_full.receive_merge(full_blob)
@@ -1059,6 +1064,114 @@ def test_multi_slot_union(device_cls=DeviceB):
                     violations.append(("multi-slot-override", tie_policy, ctx))
                 if f_full != f_split:
                     violations.append(("multi-slot-frontier", tie_policy, ctx))
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Interleaved-delivery grouping: Thufir's CRITICAL transport counterexample
+#
+# Without the atomic-grouping rule a compliant publisher would still split
+# ov_s:/ov_c:/ov_b: across slots as independent entries.  An observer
+# holding only the slot with ov_s:+ov_b: would reconstruct RegB(1,0,0),
+# judge it baseline-dead (B=0 ≤ frontier=0), and canonically publish
+# tombstone RegB(0,1,0).  After all slots and that transient tombstone are
+# eventually merged the result is RegB(1,1,10) — dead under clear-wins —
+# permanently suppressing a live override.
+#
+# The atomic-grouping rule closes this: every ov_* entry for a context
+# travels with the context's frontier entry, so a receiver always sees
+# either the complete register or nothing.  This test exercises both:
+# - The PASS path: grouped slots → no false tombstone possible.
+# - The FAIL path (M8): per-entry split → Thufir's exact witness reproduced.
+# ---------------------------------------------------------------------------
+
+def test_interleaved_delivery_grouping(device_cls=DeviceB):
+    """Exercise receive-one-slot → canonical re-publish → receive-rest →
+    re-publish permutations, both slot orders, including delayed delivery
+    of the transient re-publication to a third observer.
+
+    Oracle: a live source override must remain live at every observer
+    after eventual delivery of all blobs (source slots + any transient
+    re-publications), in all interleaving orders.
+
+    With the atomic-grouping rule (default DeviceB): PASS.
+    With per-entry splitting (M8): FAIL — Thufir's exact witness.
+    """
+    violations = []
+
+    # Source: live override RegB(1,0,10) at frontier=10 — Thufir's witness.
+    src_s, src_c, src_b, src_front = 1, 0, 10, 10
+
+    for tie_policy in (CLEAR, SET):
+        src = device_cls("src")
+        src.frontier["c0"] = src_front
+        src.overrides["c0"] = RegB(s=src_s, c=src_c, b=src_b)
+
+        # Confirm source is actually live.
+        assert src.override_is_set("c0", tie_policy), (
+            f"test precondition: source must be live under {tie_policy}"
+        )
+
+        # Produce the source's two slots via the (possibly mutated) split.
+        slots = src.split_blob_into_slots(tie_policy, n_slots=2)
+        slot0, slot1 = slots[0], slots[1]
+
+        # For both slot-receipt orders, exercise the full interleaving:
+        #   1. Observer A receives slot i, canonically re-publishes (relay hop).
+        #   2. Final observer receives: slot i re-pub, then slot j.
+        #   3. Final observer receives: slot j, then slot i re-pub.
+        # In all paths, the final observer must see the override as live.
+        for first_slot, second_slot in [(slot0, slot1), (slot1, slot0)]:
+            # Step 1: partial observer receives first slot, re-publishes.
+            partial_obs = device_cls("partial_obs")
+            partial_obs.receive_merge(first_slot)
+            transient_pub = partial_obs.publish_blob(tie_policy)
+
+            # Step 2: final observer gets transient first, then second slot.
+            final_a = device_cls("final_a")
+            final_a.receive_merge(transient_pub)
+            final_a.receive_merge(second_slot)
+            if not final_a.override_is_set("c0", tie_policy):
+                # Check whether this is the Thufir witness scenario:
+                # transient_pub should have been a false tombstone.
+                ov_transient = partial_obs.overrides.get("c0")
+                violations.append((
+                    "interleaved-delivery-false-clear",
+                    tie_policy, "transient_first",
+                    f"slot_order=(first={list(first_slot['contexts'].keys())[:3]}...,"
+                    f"second={list(second_slot['contexts'].keys())[:3]}...)",
+                    f"transient_reg={ov_transient}",
+                    f"final_reg={final_a.overrides.get('c0')}",
+                ))
+
+            # Step 3: final observer gets second slot first, then transient.
+            final_b = device_cls("final_b")
+            final_b.receive_merge(second_slot)
+            final_b.receive_merge(transient_pub)
+            if not final_b.override_is_set("c0", tie_policy):
+                ov_transient = partial_obs.overrides.get("c0")
+                violations.append((
+                    "interleaved-delivery-false-clear",
+                    tie_policy, "transient_second",
+                    f"slot_order=(first={list(first_slot['contexts'].keys())[:3]}...,"
+                    f"second={list(second_slot['contexts'].keys())[:3]}...)",
+                    f"transient_reg={ov_transient}",
+                    f"final_reg={final_b.overrides.get('c0')}",
+                ))
+
+            # Step 4: full convergence check — also receive source's full blob
+            # (the union of both slots) at a fresh observer; must agree.
+            full_src_blob = src.publish_blob(tie_policy)
+            final_c = device_cls("final_c")
+            final_c.receive_merge(full_src_blob)
+            final_c.receive_merge(transient_pub)
+            if not final_c.override_is_set("c0", tie_policy):
+                violations.append((
+                    "interleaved-delivery-full-plus-transient-false-clear",
+                    tie_policy,
+                    f"final_reg={final_c.overrides.get('c0')}",
+                ))
+
     return violations
 
 
@@ -1223,6 +1336,9 @@ def run_all():
 
     print("\n--- Multi-slot union ---")
     report("split+merge convergence", test_multi_slot_union())
+
+    print("\n--- Interleaved delivery + atomic grouping rule ---")
+    report("no false clear under slot interleaving", test_interleaved_delivery_grouping())
 
     print("\n--- Reserved key namespace: adversarial prefix collision ---")
     report("escape/unescape + no misparse", test_reserved_namespace_collision())

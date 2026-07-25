@@ -16,6 +16,10 @@ Mutants:
   M7: publish without canonicalization (serialize raw registers instead
       of the compact-at-publish canonical form) — reproduces Thufir's
       pass-1/2 CRITICAL: dead+dead merge resurrection
+  M8: revert split_blob_into_slots to per-entry splitting (violates the
+      atomic-grouping rule) — reproduces Thufir's pass-2/2 CRITICAL:
+      partial-slot reconstruction of a live RegB creates a false tombstone
+      that permanently suppresses the override after eventual full delivery
 
 Each mutant is injected into the model via DeviceB subclass, then the
 explorer or invariant suite is rerun. The counterexample (first violation)
@@ -31,7 +35,7 @@ from model import (
 from exhaustive import (
     explore_b, test_concurrent_stability,
     test_compaction_register_exhaustive, test_deep_history_compaction,
-    test_published_merge_closure,
+    test_published_merge_closure, test_interleaved_delivery_grouping,
     CONTEXTS,
 )
 
@@ -335,6 +339,58 @@ def mutant_m7():
 
 
 # ---------------------------------------------------------------------------
+# M8: revert split_blob_into_slots to per-entry splitting
+# (violates the atomic-grouping rule — reproduces Thufir's pass-2/2 CRITICAL)
+# ---------------------------------------------------------------------------
+
+class M8_PerEntrySplit(DeviceB):
+    """Reverts `split_blob_into_slots` to a per-entry split that violates the
+    atomic-grouping rule by separating `ov_s:` + frontier from `ov_b:` + `ov_c:`.
+
+    This reproduces Thufir's exact transport witness:
+    - Slot 0: frontier key + `ov_s:` entry (the "partial set" slot)
+    - Slot 1: `ov_c:` + `ov_b:` entries
+
+    An observer receiving only slot 0 reconstructs `RegB(s=1, c=0, b=0)` at
+    `frontier=10`. Because `frontier(10) > b(0)`, the override is baseline-dead.
+    Canonical re-publication emits tombstone `RegB(0, 1, 0)`.  After full
+    eventual delivery (both original slots + transient tombstone), the merged
+    result is `RegB(s=1, c=1, b=10)` — dead under clear-wins — permanently
+    suppressing a live override.
+    """
+
+    def split_blob_into_slots(self, tie_policy=CLEAR, n_slots=2):
+        """Split by key type: frontier + ov_s: in slot 0, ov_b: + ov_c: in slot 1.
+        Violates the atomic-grouping rule by separating ov_s: from ov_b:."""
+        blob = self.publish_blob(tie_policy)
+        slots = [{"v": blob["v"], "client_id": blob["client_id"], "contexts": {}}
+                 for _ in range(n_slots)]
+        for wire_key, value in blob["contexts"].items():
+            if wire_key.startswith("ov_b:") or wire_key.startswith("ov_c:"):
+                # ov_b and ov_c go to slot 1 — separated from their ov_s: sibling
+                slots[1]["contexts"][wire_key] = value
+            else:
+                # frontier keys and ov_s: go to slot 0
+                slots[0]["contexts"][wire_key] = value
+        return slots
+
+
+def mutant_m8():
+    """M8: per-entry splitting must be caught by test_interleaved_delivery_grouping —
+    proving that the new interleaved-delivery test has teeth.
+
+    Reproduce Thufir's exact transport witness directly: source live
+    `RegB(1,0,10)` at frontier=10. Per-entry split puts `ov_s:c0`+`ov_b:c0`
+    in one slot and `ov_c:c0` in the other. An observer receiving only the
+    first slot reconstructs `RegB(1,0,0)`, re-publishes tombstone `RegB(0,1,0)`.
+    Full merge including the transient: `RegB(1,1,10)` → inactive.
+
+    Confirmed by running test_interleaved_delivery_grouping with M8_PerEntrySplit;
+    the witness must be caught before resorting to the full suite."""
+    return test_interleaved_delivery_grouping(device_cls=M8_PerEntrySplit)
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -347,6 +403,7 @@ def run_mutations():
         ("M5: uint32 overflow bypass", mutant_m5),
         ("M6: last-write-wins merge", mutant_m6),
         ("M7: publish without canonicalization (reproduces pass-1/2 CRITICAL)", mutant_m7),
+        ("M8: per-entry split violates atomic-grouping rule (reproduces pass-2/2 CRITICAL)", mutant_m8),
     ]
 
     print("=" * 60)
