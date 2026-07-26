@@ -25,6 +25,7 @@ import { buildVideoReviewContextsByMessageId } from "@/features/messages/lib/vid
 import { useComposerHeightPadding } from "@/features/messages/ui/useComposerHeightPadding";
 import { UserProfilePanel } from "@/features/profile/ui/UserProfilePanel";
 import { ChannelFindBar } from "@/features/search/ui/ChannelFindBar";
+import { AllAgentsActivityPanel } from "@/features/channels/ui/AllAgentsActivityPanel";
 import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
 import { ChannelManagementAuxiliaryPanel } from "@/features/channels/ui/ChannelManagementAuxiliaryPanel";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
@@ -119,6 +120,9 @@ export const ChannelPane = React.memo(function ChannelPane({
   onExpandThreadReplies,
   onJoinChannel,
   onOpenAgentSession,
+  onOpenAllAgentsActivity,
+  onCloseAllAgentsActivity,
+  allAgentsActivityOpen = false,
   onOpenDm,
   onOpenMembers,
   onOpenProfilePanel,
@@ -787,21 +791,36 @@ export const ChannelPane = React.memo(function ChannelPane({
                   }
                   showTopBorder={false}
                 />
-                {/* The activity accessory is anchored in the dock's reserved
-                    bottom rail, so fading it cannot change the observed
-                    overlay height or move the conversation. Its natural
-                    content height remains responsive. */}
-                <ChannelComposerActivityAccessory
-                  agents={activityAgents}
-                  channel={activeChannel}
-                  currentPubkey={currentPubkey}
-                  onOpenAgentSession={onOpenAgentSession}
-                  openAgentSessionPubkey={openAgentSessionPubkey}
-                  profiles={profiles}
-                  typingPubkeys={typingPubkeys}
-                  visible={hasComposerBottomActivity}
-                  workingBotPubkeys={composerWorkingBotPubkeys}
-                />
+                <div
+                  className="min-h-8 overflow-visible bg-background px-5 pb-1.5 pt-0"
+                  data-testid="channel-composer-activity-row"
+                >
+                  <div className="flex h-full w-full items-center gap-2 overflow-visible">
+                    {hasComposerBotActivity ? (
+                      <div className="flex min-w-0 flex-1 overflow-visible">
+                        <BotActivityComposerAction
+                          agents={activityAgents}
+                          channelId={activeChannel?.id ?? null}
+                          onOpenAgentSession={onOpenAgentSession}
+                          onOpenAllAgentActivity={onOpenAllAgentsActivity}
+                          openAgentSessionPubkey={openAgentSessionPubkey}
+                          profiles={profiles}
+                          workingBotPubkeys={composerWorkingBotPubkeys}
+                          variant="inline"
+                        />
+                      </div>
+                    ) : null}
+                    {hasTypingActivity ? (
+                      <TypingIndicatorRow
+                        channel={activeChannel}
+                        className="min-w-0 flex-1 py-0 pl-[calc(0.75rem+1px)] pr-0 sm:pl-[calc(1rem+1px)]"
+                        currentPubkey={currentPubkey}
+                        profiles={profiles}
+                        typingPubkeys={typingPubkeys}
+                      />
+                    ) : null}
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -894,6 +913,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                       agents={activityAgents}
                       channelId={activeChannel?.id ?? null}
                       onOpenAgentSession={onOpenAgentSession}
+                      onOpenAllAgentActivity={onOpenAllAgentsActivity}
                       openAgentSessionPubkey={openAgentSessionPubkey}
                       profiles={profiles}
                       workingBotPubkeys={threadComposerBotTypingPubkeys}
@@ -915,6 +935,26 @@ export const ChannelPane = React.memo(function ChannelPane({
               />
             );
             return wrapThreadPanel(panel);
+          })()
+        ) : allAgentsActivityOpen && composerWorkingBotPubkeys.length > 0 ? (
+          (() => {
+            const panel = (
+              <AllAgentsActivityPanel
+                agents={activityAgents}
+                channelId={activeChannel?.id ?? null}
+                isSinglePanelView={
+                  useSplitAuxiliaryPane ? false : isSinglePanelView
+                }
+                layout={useSplitAuxiliaryPane ? "split" : "standalone"}
+                onClose={onCloseAllAgentsActivity!}
+                onOpenAgentSession={onOpenAgentSession}
+                profiles={profiles}
+                transparentChrome={useSplitAuxiliaryPane}
+                widthPx={threadPanelWidthPx}
+                workingBotPubkeys={composerWorkingBotPubkeys}
+              />
+            );
+            return wrapAux(panel, "all-agents-activity-panel");
           })()
         ) : activeChannel && selectedAgent ? (
           (() => {
