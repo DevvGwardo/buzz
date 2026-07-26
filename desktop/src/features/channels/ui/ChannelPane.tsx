@@ -28,6 +28,7 @@ import { useComposerHeightPadding } from "@/features/messages/ui/useComposerHeig
 import { TypingIndicatorRow } from "@/features/messages/ui/TypingIndicatorRow";
 import { UserProfilePanel } from "@/features/profile/ui/UserProfilePanel";
 import { ChannelFindBar } from "@/features/search/ui/ChannelFindBar";
+import { AllAgentsActivityPanel } from "@/features/channels/ui/AllAgentsActivityPanel";
 import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
 import { ChannelManagementAuxiliaryPanel } from "@/features/channels/ui/ChannelManagementAuxiliaryPanel";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
@@ -121,6 +122,9 @@ export const ChannelPane = React.memo(function ChannelPane({
   onExpandThreadReplies,
   onJoinChannel,
   onOpenAgentSession,
+  onOpenAllAgentsActivity,
+  onCloseAllAgentsActivity,
+  allAgentsActivityOpen = false,
   onOpenDm,
   onOpenMembers,
   onOpenProfilePanel,
@@ -798,6 +802,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                           agents={activityAgents}
                           channelId={activeChannel?.id ?? null}
                           onOpenAgentSession={onOpenAgentSession}
+                          onOpenAllAgentActivity={onOpenAllAgentsActivity}
                           openAgentSessionPubkey={openAgentSessionPubkey}
                           profiles={profiles}
                           workingBotPubkeys={composerWorkingBotPubkeys}
@@ -904,6 +909,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                       agents={activityAgents}
                       channelId={activeChannel?.id ?? null}
                       onOpenAgentSession={onOpenAgentSession}
+                      onOpenAllAgentActivity={onOpenAllAgentsActivity}
                       openAgentSessionPubkey={openAgentSessionPubkey}
                       profiles={profiles}
                       workingBotPubkeys={threadComposerBotTypingPubkeys}
@@ -925,6 +931,26 @@ export const ChannelPane = React.memo(function ChannelPane({
               />
             );
             return wrapThreadPanel(panel);
+          })()
+        ) : allAgentsActivityOpen && composerWorkingBotPubkeys.length > 0 ? (
+          (() => {
+            const panel = (
+              <AllAgentsActivityPanel
+                agents={activityAgents}
+                channelId={activeChannel?.id ?? null}
+                isSinglePanelView={
+                  useSplitAuxiliaryPane ? false : isSinglePanelView
+                }
+                layout={useSplitAuxiliaryPane ? "split" : "standalone"}
+                onClose={onCloseAllAgentsActivity!}
+                onOpenAgentSession={onOpenAgentSession}
+                profiles={profiles}
+                transparentChrome={useSplitAuxiliaryPane}
+                widthPx={threadPanelWidthPx}
+                workingBotPubkeys={composerWorkingBotPubkeys}
+              />
+            );
+            return wrapAux(panel, "all-agents-activity-panel");
           })()
         ) : activeChannel && selectedAgent ? (
           (() => {
