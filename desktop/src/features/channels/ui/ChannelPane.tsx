@@ -29,6 +29,7 @@ import { TypingIndicatorRow } from "@/features/messages/ui/TypingIndicatorRow";
 import { UserProfilePanel } from "@/features/profile/ui/UserProfilePanel";
 import { ChannelFindBar } from "@/features/search/ui/ChannelFindBar";
 import { AllAgentsActivityPanel } from "@/features/channels/ui/AllAgentsActivityPanel";
+import { agentsForAllActivityPanel } from "@/features/channels/ui/botActivityViewAll";
 import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
 import { ChannelManagementAuxiliaryPanel } from "@/features/channels/ui/ChannelManagementAuxiliaryPanel";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
@@ -410,6 +411,14 @@ export const ChannelPane = React.memo(function ChannelPane({
   // whose typing signal never arrives — and vice versa.
   const composerWorkingBotPubkeys = useChannelWorkingAgentPubkeys(
     activeChannel?.id ?? null,
+  );
+  const allActivityPanelAgents = React.useMemo(
+    () =>
+      agentsForAllActivityPanel({
+        agents: activityAgents,
+        workingBotPubkeys: composerWorkingBotPubkeys,
+      }),
+    [activityAgents, composerWorkingBotPubkeys],
   );
   const hasComposerBotActivity = composerWorkingBotPubkeys.length > 0;
   const threadComposerBotTypingPubkeys = React.useMemo(() => {
@@ -932,7 +941,7 @@ export const ChannelPane = React.memo(function ChannelPane({
             );
             return wrapThreadPanel(panel);
           })()
-        ) : allAgentsActivityOpen && composerWorkingBotPubkeys.length > 0 ? (
+        ) : allAgentsActivityOpen && allActivityPanelAgents.length > 0 ? (
           (() => {
             const panel = (
               <AllAgentsActivityPanel
