@@ -782,7 +782,8 @@ pub async fn soft_delete_event(
 }
 
 /// Soft-delete the live row for an addressable coordinate
-/// `(kind, pubkey, d_tag)` — the NIP-33 replacement key.
+/// `(kind, pubkey, d_tag)` — the NIP-33 replacement key — provided it is not
+/// newer than the deletion request.
 ///
 /// Used by `handle_a_tag_deletion` to honour NIP-09 a-tag deletions for any
 /// parameterized-replaceable kind. The WHERE clause mirrors
@@ -790,23 +791,34 @@ pub async fn soft_delete_event(
 /// `channel_id` is intentionally NOT in the key (NIP-33 replacement is global
 /// per the spec — `channel_id` is stored for query scoping, not identity).
 ///
+/// `deletion_created_at_secs` is the deletion event's own `created_at`. NIP-09
+/// scopes an `a`-tag deletion to versions at or before that instant, so a
+/// delayed or replayed tombstone signed between two versions must not erase the
+/// newer replacement. `events.created_at` is immutable per row, so the predicate
+/// alone is sufficient under concurrent replacement — no coordinate lock needed.
+///
 /// Returns `Ok(true)` if a row was deleted, `Ok(false)` if no live row matched
-/// (already deleted, or never existed).
+/// (already deleted, never existed, or strictly newer than the deletion).
 pub async fn soft_delete_by_coordinate(
     pool: &PgPool,
     community_id: CommunityId,
     kind: i32,
     pubkey: &[u8],
     d_tag: &str,
+    deletion_created_at_secs: i64,
 ) -> Result<bool> {
+    let deletion_created_at = DateTime::from_timestamp(deletion_created_at_secs, 0)
+        .ok_or(DbError::InvalidTimestamp(deletion_created_at_secs))?;
     let result = sqlx::query(
         "UPDATE events SET deleted_at = NOW() \
-         WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 AND deleted_at IS NULL",
+         WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 AND deleted_at IS NULL \
+         AND created_at <= $5",
     )
     .bind(community_id.as_uuid())
     .bind(kind)
     .bind(pubkey)
     .bind(d_tag)
+    .bind(deletion_created_at)
     .execute(pool)
     .await?;
 

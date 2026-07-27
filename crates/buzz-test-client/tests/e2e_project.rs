@@ -91,12 +91,18 @@ fn repo_announcement(keys: &Keys, repo_d: &str) -> nostr::Event {
 
 /// A NIP-09 `a`-tag-only deletion at a NIP-33 coordinate. No `e` tag, so the
 /// relay takes the coordinate-delete path rather than the event-id path.
-fn coordinate_delete(keys: &Keys, kind: u16, d_tag: &str) -> nostr::Event {
+/// `created_at` defaults to now when `None`.
+fn coordinate_delete(keys: &Keys, kind: u16, d_tag: &str, created_at: Option<u64>) -> nostr::Event {
     let coord = format!("{kind}:{}:{d_tag}", keys.public_key().to_hex());
-    EventBuilder::new(Kind::Custom(5), "")
-        .tags(vec![Tag::parse(["a", coord.as_str()]).unwrap()])
-        .sign_with_keys(keys)
-        .unwrap()
+    let builder =
+        EventBuilder::new(Kind::Custom(5), "")
+            .tags(vec![Tag::parse(["a", coord.as_str()]).unwrap()]);
+    match created_at {
+        Some(ts) => builder.custom_created_at(Timestamp::from(ts)),
+        None => builder,
+    }
+    .sign_with_keys(keys)
+    .unwrap()
 }
 
 fn addressable_filter(kind: u16, author: &Keys, d_tag: &str) -> Filter {
@@ -307,7 +313,7 @@ async fn test_project_tombstone_deletes_coordinate_and_spares_members() {
     assert_eq!(before.len(), 1, "project should be live before deletion");
 
     let ok = client
-        .send_event(coordinate_delete(&owner, PROJECT_KIND, &project_d))
+        .send_event(coordinate_delete(&owner, PROJECT_KIND, &project_d, None))
         .await
         .expect("send tombstone");
     assert!(ok.accepted, "relay rejected tombstone: {}", ok.message);
@@ -335,6 +341,84 @@ async fn test_project_tombstone_deletes_coordinate_and_spares_members() {
         1,
         "deleting a project must not touch the repositories it referenced"
     );
+
+    client.disconnect().await.expect("disconnect");
+}
+
+/// NIP-09 scopes an `a`-tag deletion to versions at or before the deletion's own
+/// `created_at`. A tombstone signed between V1 and V2 — delayed in transit or
+/// replayed by a third party — must therefore retire V1 only and leave the newer
+/// V2 head live. Before the timestamp predicate landed in
+/// `soft_delete_by_coordinate`, the coordinate delete was timestamp-blind and
+/// this sequence silently destroyed V2.
+#[tokio::test]
+#[ignore]
+async fn test_stale_tombstone_between_versions_leaves_newer_project_live() {
+    let url = relay_url();
+    let owner = Keys::generate();
+    let project_d = unique("project-stale-tombstone");
+    let now = Timestamp::now().as_secs();
+
+    let mut client = BuzzTestClient::connect(&url, &owner)
+        .await
+        .expect("connect");
+
+    let ok = client
+        .send_event(project_event(
+            &owner,
+            &project_d,
+            "V1",
+            &[],
+            Some(now - 100),
+        ))
+        .await
+        .expect("send v1");
+    assert!(ok.accepted, "relay rejected V1: {}", ok.message);
+
+    let ok = client
+        .send_event(project_event(&owner, &project_d, "V2", &[], Some(now)))
+        .await
+        .expect("send v2");
+    assert!(ok.accepted, "relay rejected V2: {}", ok.message);
+
+    // Timestamped strictly between V1 and V2: valid for V1, stale for V2.
+    let ok = client
+        .send_event(coordinate_delete(
+            &owner,
+            PROJECT_KIND,
+            &project_d,
+            Some(now - 50),
+        ))
+        .await
+        .expect("send stale tombstone");
+    assert!(
+        ok.accepted,
+        "a well-formed tombstone is still an acceptable event: {}",
+        ok.message
+    );
+
+    let after = query(
+        &mut client,
+        "stale-tombstone",
+        addressable_filter(PROJECT_KIND, &owner, &project_d),
+    )
+    .await;
+
+    assert_eq!(
+        after.len(),
+        1,
+        "a tombstone older than the live head must not delete it, got {} event(s)",
+        after.len()
+    );
+    let name = after[0]
+        .tags
+        .iter()
+        .find_map(|t| {
+            let parts = t.as_slice();
+            (parts.first().map(|s| s.as_str()) == Some("name")).then(|| parts[1].as_str())
+        })
+        .expect("surviving head must carry its name tag");
+    assert_eq!(name, "V2", "the surviving head must be the newer version");
 
     client.disconnect().await.expect("disconnect");
 }
