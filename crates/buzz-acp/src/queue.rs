@@ -392,9 +392,11 @@ pub struct EventQueue {
     /// plus any merged `cancelled_events`), so `recoverable_triggers()` can
     /// include in-flight work without re-deriving it from a live batch the
     /// queue no longer holds. Populated everywhere a channel becomes
-    /// in-flight; removed at batch completion (inside `complete_batch`) and
-    /// at both deadline-expiry blocks — kept in exact sync with
-    /// `in_flight_batch_sizes`.
+    /// in-flight. Removed at batch completion (inside `complete_batch`), at
+    /// both deadline-expiry blocks, and — uniquely — by `drain_channel`, which
+    /// purges the mirror alone so a membership removal cannot re-persist the
+    /// discarded turn while `in_flight_batch_sizes` keeps reporting an accurate
+    /// orphan count if that turn later expires.
     in_flight_batch_triggers: HashMap<Uuid, Vec<RecoverableTrigger>>,
     /// Channels mutated by a public operation since the last
     /// [`Self::take_dirty_channels`] call. Every public `&mut self` mutator
@@ -1267,9 +1269,10 @@ impl EventQueue {
     /// Drop all queued (non-in-flight) events for a channel.
     ///
     /// Used when the agent is removed from a channel — any pending events
-    /// for that channel are stale and should not be prompted. Does NOT
-    /// affect in-flight prompts (those will complete normally; the agent
-    /// may fail to act if it lost access, but that's handled by the relay).
+    /// for that channel are stale and should not be prompted. An in-flight
+    /// prompt still runs to completion (the agent may fail to act if it lost
+    /// access, but that's handled by the relay); only its durable recovery
+    /// mirror is dropped, so a crash mid-prompt cannot resurrect the turn.
     ///
     /// Also clears any `retry_after` throttle for the channel.
     ///
@@ -1290,12 +1293,22 @@ impl EventQueue {
         // barrier — and any unresolved ledger records it guards — must not
         // survive to resurrect discarded work if the agent is re-added later.
         self.unresolved_barriers.remove(&channel_id);
+        // Invalidation: drop the in-flight batch's *durable recovery mirror* so
+        // `recoverable_triggers` reports nothing for this channel and the
+        // caller's trailing ledger sync writes it empty in one shot —
+        // otherwise that sync re-persists the very trigger
+        // `Ledger::invalidate_channel` just purged, and a crash before the
+        // prompt completed would resurrect discarded work on a later re-add.
+        // `complete_batch` and the deadline-expiry paths `.remove()` this
+        // entry, so they tolerate it already being absent.
+        self.in_flight_batch_triggers.remove(&channel_id);
         self.dirty_channels.insert(channel_id);
         // Preserve in_flight_channels AND in_flight_deadlines: the in-flight
         // task will eventually complete (calling mark_complete) or the deadline
         // will expire (auto-cleaning the channel). Removing deadlines without
         // removing in_flight_channels would disable auto-expiry and leave a
-        // wedged task permanently blocking the channel.
+        // wedged task permanently blocking the channel. Only the recovery
+        // mirror above is purged; liveness tracking is untouched.
         ids
     }
 
@@ -4531,6 +4544,28 @@ mod tests {
         let drained = q.drain_channel(ch);
         assert_eq!(drained.len(), 1);
         assert!(any_in_flight(&q)); // in-flight unaffected
+    }
+
+    #[test]
+    fn test_drain_channel_purges_recovery_mirror_but_keeps_liveness() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+
+        q.push(make_queued(ch, "msg1"));
+        let _batch = q.flush_next().unwrap();
+        assert!(!q.in_flight_batch_triggers[&ch].is_empty());
+
+        q.drain_channel(ch);
+
+        // Recovery mirror is purged: nothing left for the ledger to re-persist,
+        // so the membership-removal sync cannot resurrect the discarded turn.
+        assert!(!q.in_flight_batch_triggers.contains_key(&ch));
+        assert!(q.recoverable_triggers(ch).is_empty());
+
+        // Liveness tracking survives: the in-flight task still completes or
+        // expires normally (removing either would wedge the channel).
+        assert!(q.in_flight_channels.contains(&ch));
+        assert!(q.in_flight_deadlines.contains_key(&ch));
     }
 
     #[test]

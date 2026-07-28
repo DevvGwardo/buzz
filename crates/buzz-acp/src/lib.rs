@@ -9079,6 +9079,110 @@ mod boot_recovery_integration_tests {
         );
     }
 
+    #[test]
+    fn test_membership_removal_while_in_flight_does_not_resurrect_on_reload() {
+        // Regression guard (Wes, PR review): the membership-removal path runs
+        // `drain_channel` → `ledger.invalidate_channel` → `sync_dirty`.
+        // `drain_channel` deliberately preserves `in_flight_channels` /
+        // `in_flight_deadlines` so a live task can never wedge the channel,
+        // but `recoverable_triggers` also reads `in_flight_batch_triggers`.
+        // If the removal transition leaves that recovery mirror populated, the
+        // trailing `sync_dirty` re-persists the very trigger
+        // `invalidate_channel` just purged — so a crash before the prompt
+        // completes, followed by a re-add, resurrects discarded work.
+        //
+        // Field-level proof that the liveness tables survive the mirror purge
+        // lives in `queue.rs`'s
+        // `test_drain_channel_purges_recovery_mirror_but_keeps_liveness`.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", "ws://localhost:3000", 0);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event = make_channel_event(&keys, ch, "in-flight turn");
+
+        // Queue an event and dispatch it, so the channel is in-flight and its
+        // trigger is mirrored in `in_flight_batch_triggers`.
+        queue.push(QueuedEvent::new(
+            ch,
+            event.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+        let batch = queue.flush_next().expect("event must dispatch");
+        assert_eq!(batch.events.len(), 1);
+        sync_dirty(&mut queue, &mut ledger);
+        assert!(
+            Ledger::load(dir.path(), "test_pubkey", "ws://localhost:3000", 0)
+                .1
+                .channels
+                .contains_key(&ch),
+            "setup: in-flight turn must be durable before removal"
+        );
+
+        // Membership removal, in the exact order lib.rs performs it.
+        queue.drain_channel(ch);
+        ledger.invalidate_channel(ch);
+        sync_dirty(&mut queue, &mut ledger);
+
+        let (_, staged) = Ledger::load(dir.path(), "test_pubkey", "ws://localhost:3000", 0);
+        assert!(
+            !staged.channels.contains_key(&ch),
+            "removed channel must not survive on disk — a re-add would resurrect \
+             discarded work (got: {:?})",
+            staged.channels,
+        );
+
+        // The wedge-prevention invariant the purge must not disturb: the
+        // in-flight task is still tracked, so it can complete or expire
+        // normally rather than blocking the channel forever.
+        assert!(
+            queue.is_channel_in_flight(ch),
+            "in_flight_channels must be preserved across removal"
+        );
+    }
+
+    #[test]
+    fn test_completion_after_membership_removal_leaves_ledger_empty() {
+        // Companion to the test above, covering the non-crash path: the
+        // in-flight prompt that survived removal eventually completes.
+        // `complete_batch` removes the (already-purged) trigger entry and
+        // syncs — the ledger must stay empty rather than being rewritten
+        // from the completing batch.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", "ws://localhost:3000", 0);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event = make_channel_event(&keys, ch, "in-flight turn");
+
+        queue.push(QueuedEvent::new(
+            ch,
+            event.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+        let batch = queue.flush_next().expect("event must dispatch");
+        queue.drain_channel(ch);
+        ledger.invalidate_channel(ch);
+        sync_dirty(&mut queue, &mut ledger);
+
+        // Prompt returns after the agent lost access.
+        queue.complete_batch(ch, Some(batch), crate::queue::BatchDisposition::Success);
+        sync_dirty(&mut queue, &mut ledger);
+
+        let (_, staged) = Ledger::load(dir.path(), "test_pubkey", "ws://localhost:3000", 0);
+        assert!(
+            staged.channels.is_empty(),
+            "completion after removal must leave no durable record (got: {:?})",
+            staged.channels,
+        );
+        assert!(
+            !queue.is_channel_in_flight(ch),
+            "completion must release the channel"
+        );
+    }
+
     // ── Persisted prompt_tag through from_recovered ──────────────────────
 
     #[tokio::test]
