@@ -610,6 +610,46 @@ mod tests {
     }
 
     #[test]
+    fn test_persist_over_existing_file_replaces_previous_snapshot() {
+        // `persist_candidate` writes `<path>.tmp` then renames it over an
+        // already-existing `<path>`. Guards the destination-exists case of
+        // that rename on every platform this test runs on — notably
+        // Windows, where `MoveFileExW` needs `MOVEFILE_REPLACE_EXISTING`
+        // for the overwrite to succeed.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _staged) =
+            Ledger::load(dir.path(), "deadbeefdeadbeefdeadbeef", TEST_RELAY_URL, 0);
+        let ch = Uuid::new_v4();
+
+        ledger.sync(ch, vec![trigger("snapshot-a", 1, 100, false)]);
+        let first = read_file_channels(ledger.path.as_ref().unwrap());
+        assert_eq!(first.get(&ch).unwrap()[0].event_id, "snapshot-a");
+
+        // Second write to the same path: the destination now exists.
+        ledger.sync(ch, vec![trigger("snapshot-b", 2, 200, false)]);
+        assert!(
+            !ledger.dirty,
+            "overwrite persist must succeed, leaving the ledger clean"
+        );
+
+        let second = read_file_channels(ledger.path.as_ref().unwrap());
+        let recs = second.get(&ch).expect("channel must still be on disk");
+        assert_eq!(recs.len(), 1, "snapshot B replaces A rather than appending");
+        assert_eq!(
+            recs[0].event_id, "snapshot-b",
+            "reload must observe the second snapshot, not the first"
+        );
+
+        // The temp file must not survive a successful rename.
+        let mut tmp = ledger.path.as_ref().unwrap().as_os_str().to_os_string();
+        tmp.push(".tmp");
+        assert!(
+            !PathBuf::from(tmp).exists(),
+            "temp file must be consumed by the rename"
+        );
+    }
+
+    #[test]
     fn test_ttl_filter_drops_expired_records() {
         let dir = tempfile::tempdir().unwrap();
         let ch = Uuid::new_v4();
