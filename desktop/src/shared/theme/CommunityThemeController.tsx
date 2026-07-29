@@ -5,6 +5,8 @@ import { useIdentityQuery } from "@/shared/api/hooks";
 import {
   DEFAULT_COMMUNITY_THEME,
   cacheAndApplyCommunityTheme,
+  communityThemeApplyExpectation,
+  communityThemePersistenceAction,
   hasMigratedCommunityTheme,
   markCommunityThemeMigrated,
   readCommunityThemePreference,
@@ -36,9 +38,25 @@ export function CommunityThemeController() {
     followSystem: theme.followSystem,
   });
 
+  const currentPreferenceRef = useRef<CommunityThemePreference>({
+    version: 1,
+    theme: theme.selectedThemeName as CommunityThemePreference["theme"],
+    accent: theme.accentColor,
+    followSystem: theme.followSystem,
+  });
+  currentPreferenceRef.current = {
+    version: 1,
+    theme: theme.selectedThemeName as CommunityThemePreference["theme"],
+    accent: theme.accentColor,
+    followSystem: theme.followSystem,
+  };
+
   const applyPreference = useCallback(
     (preference: CommunityThemePreference) => {
-      expectedAppliedRef.current = preference;
+      expectedAppliedRef.current = communityThemeApplyExpectation(
+        preference,
+        currentPreferenceRef.current,
+      );
       theme.applyAppearance(preference);
     },
     [theme.applyAppearance],
@@ -137,8 +155,12 @@ export function CommunityThemeController() {
       accent: theme.accentColor,
       followSystem: theme.followSystem,
     };
-    const expected = expectedAppliedRef.current;
-    if (expected && sameCommunityThemePreference(expected, preference)) {
+    const persistenceAction = communityThemePersistenceAction(
+      expectedAppliedRef.current,
+      preference,
+    );
+    if (persistenceAction === "defer") return;
+    if (persistenceAction === "acknowledge") {
       expectedAppliedRef.current = null;
       return;
     }

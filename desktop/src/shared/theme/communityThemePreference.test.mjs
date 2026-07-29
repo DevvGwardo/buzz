@@ -3,6 +3,8 @@ import test from "node:test";
 import {
   DEFAULT_COMMUNITY_THEME,
   cacheAndApplyCommunityTheme,
+  communityThemeApplyExpectation,
+  communityThemePersistenceAction,
   communityThemeStorageKey,
   parseCommunityThemePreference,
   readCommunityThemePreference,
@@ -116,4 +118,37 @@ test("remote preference still applies when its local cache write fails", () => {
     },
   );
   assert.deepEqual(applied, DEFAULT_COMMUNITY_THEME);
+});
+
+test("already-applied relay state leaves the next user edit publishable", () => {
+  const applied = {
+    ...DEFAULT_COMMUNITY_THEME,
+    theme: "catppuccin-latte",
+    followSystem: false,
+  };
+
+  assert.equal(communityThemeApplyExpectation(applied, applied), null);
+  assert.deepEqual(
+    communityThemeApplyExpectation(applied, DEFAULT_COMMUNITY_THEME),
+    applied,
+  );
+});
+
+test("community switch defers stale outgoing appearance persistence", () => {
+  const outgoing = {
+    ...DEFAULT_COMMUNITY_THEME,
+    theme: "houston",
+    followSystem: false,
+  };
+  const incoming = {
+    ...DEFAULT_COMMUNITY_THEME,
+    theme: "catppuccin-latte",
+  };
+
+  assert.equal(communityThemePersistenceAction(incoming, outgoing), "defer");
+  assert.equal(
+    communityThemePersistenceAction(incoming, incoming),
+    "acknowledge",
+  );
+  assert.equal(communityThemePersistenceAction(null, incoming), "persist");
 });
