@@ -143,6 +143,14 @@ pub async fn get_agent_models(
         return Ok(models);
     }
 
+    if let Some(models) = discover_cursor_models(&agent_command, persisted_model.clone()).await? {
+        return Ok(models);
+    }
+
+    if let Some(models) = discover_grok_models(&agent_command, persisted_model.clone()).await? {
+        return Ok(models);
+    }
+
     run_agent_models_command(
         resolved_acp,
         agent_command,
@@ -311,6 +319,14 @@ pub async fn discover_agent_models(
         discover_databricks_models(&state.http_client, &effective_provider, &merged_env, None)
             .await?
     {
+        return Ok(models);
+    }
+
+    if let Some(models) = discover_cursor_models(&resolved_agent, None).await? {
+        return Ok(models);
+    }
+
+    if let Some(models) = discover_grok_models(&resolved_agent, None).await? {
         return Ok(models);
     }
 
@@ -676,6 +692,236 @@ async fn discover_anthropic_models(
         agent_version: "models-api".to_string(),
         models,
         agent_default_model: None,
+        selected_model,
+        supports_switching: true,
+    }))
+}
+
+fn is_cursor_agent_command(agent_command: &str) -> bool {
+    known_acp_runtime(agent_command).is_some_and(|runtime| runtime.id == "cursor")
+        || agent_command.eq_ignore_ascii_case("cursor-agent")
+}
+
+/// Parse `cursor-agent models` text:
+///   Available models
+///
+///   auto - Auto (default)
+///   cursor-grok-4.5-medium - Cursor Grok 4.5 Medium
+pub(super) fn parse_cursor_models_output(stdout: &str) -> Vec<AgentModelInfo> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.eq_ignore_ascii_case("available models") {
+            continue;
+        }
+        let Some((id, name)) = line.split_once(" - ") else {
+            continue;
+        };
+        let id = id.trim();
+        let name = name.trim();
+        if id.is_empty() || name.is_empty() || id.contains(' ') {
+            continue;
+        }
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        models.push(AgentModelInfo {
+            id: id.to_string(),
+            name: Some(name.to_string()),
+            description: None,
+        });
+    }
+    models
+}
+
+async fn discover_cursor_models(
+    agent_command: &str,
+    selected_model: Option<String>,
+) -> Result<Option<AgentModelsResponse>, String> {
+    if !is_cursor_agent_command(agent_command) {
+        return Ok(None);
+    }
+
+    let resolved = resolve_command(agent_command)
+        .ok_or_else(|| missing_command_message(agent_command, "Cursor Agent CLI"))?;
+
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&resolved);
+        if let Some(ref path) = crate::managed_agents::readiness::cli_probe::augmented_path() {
+            cmd.env("PATH", path);
+        }
+        cmd.arg("models");
+        crate::util::configure_no_window(&mut cmd);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| format!("failed to spawn cursor-agent models: {e}"))
+    })
+    .await
+    .map_err(|e| format!("cursor model discovery task failed: {e}"))?
+    .map_err(|e: String| e)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "cursor-agent models failed (exit {}): {stderr}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let models = parse_cursor_models_output(&stdout);
+    if models.is_empty() {
+        return Err("cursor-agent models returned no models".to_string());
+    }
+
+    let agent_default_model = models
+        .iter()
+        .find(|model| model.id == "auto")
+        .map(|model| model.id.clone());
+
+    Ok(Some(AgentModelsResponse {
+        agent_name: "cursor".to_string(),
+        agent_version: "cursor-agent-models".to_string(),
+        models,
+        agent_default_model,
+        selected_model,
+        supports_switching: true,
+    }))
+}
+
+fn is_grok_agent_command(agent_command: &str) -> bool {
+    known_acp_runtime(agent_command).is_some_and(|runtime| runtime.id == "grok")
+        || agent_command.eq_ignore_ascii_case("grok")
+}
+
+/// Parse `grok models` text:
+///   Available models:
+///     - grok-4.5
+///     * composer-2.5 (default)
+///
+/// The CLI marks the default with a leading `*` and an optional `(default)`
+/// suffix. That suffix is **not** a display name — the UI uses `name` over
+/// `id` when present, so storing `"(default)"` as the name made the row show
+/// only that marker instead of the model id.
+pub(super) fn parse_grok_models_output(stdout: &str) -> Vec<AgentModelInfo> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.eq_ignore_ascii_case("available models:") {
+            continue;
+        }
+        let payload = if let Some(rest) = line.strip_prefix("- ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("* ") {
+            rest
+        } else {
+            continue;
+        };
+        let id = payload
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim()
+            // Defensive: never treat a bare marker as an id.
+            .trim_matches(|c: char| c == '(' || c == ')' || c == '*');
+        if id.is_empty()
+            || id.eq_ignore_ascii_case("default")
+            || id.contains(' ')
+            || !seen.insert(id.to_string())
+        {
+            continue;
+        }
+        // Remaining text after the id is usually just "(default)" — ignore it.
+        // Real display names come from ACP modelState when available; the CLI
+        // listing is id-only.
+        let name = None;
+        models.push(AgentModelInfo {
+            id: id.to_string(),
+            name,
+            description: None,
+        });
+    }
+    models
+}
+
+/// Resolve which model id is the CLI default from `grok models` output.
+pub(super) fn parse_grok_default_model(stdout: &str) -> Option<String> {
+    let mut from_star: Option<String> = None;
+    let mut from_header: Option<String> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(payload) = line.strip_prefix("* ") {
+            if let Some(id) = payload
+                .split_whitespace()
+                .next()
+                .map(str::trim)
+                .filter(|id| !id.is_empty() && !id.eq_ignore_ascii_case("default"))
+            {
+                from_star = Some(id.to_string());
+            }
+        }
+        if let Some(value) = line.strip_prefix("Default model:") {
+            let id = value.trim();
+            if !id.is_empty() {
+                from_header = Some(id.to_string());
+            }
+        }
+    }
+    from_star.or(from_header)
+}
+
+async fn discover_grok_models(
+    agent_command: &str,
+    selected_model: Option<String>,
+) -> Result<Option<AgentModelsResponse>, String> {
+    if !is_grok_agent_command(agent_command) {
+        return Ok(None);
+    }
+
+    let resolved = resolve_command(agent_command)
+        .ok_or_else(|| missing_command_message(agent_command, "Grok CLI"))?;
+
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&resolved);
+        if let Some(ref path) = crate::managed_agents::readiness::cli_probe::augmented_path() {
+            cmd.env("PATH", path);
+        }
+        cmd.arg("models");
+        crate::util::configure_no_window(&mut cmd);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| format!("failed to spawn grok models: {e}"))
+    })
+    .await
+    .map_err(|e| format!("grok model discovery task failed: {e}"))?
+    .map_err(|e: String| e)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "grok models failed (exit {}): {stderr}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let models = parse_grok_models_output(&stdout);
+    if models.is_empty() {
+        return Err("grok models returned no models".to_string());
+    }
+
+    let agent_default_model = parse_grok_default_model(&stdout)
+        .or_else(|| models.first().map(|model| model.id.clone()));
+
+    Ok(Some(AgentModelsResponse {
+        agent_name: "grok".to_string(),
+        agent_version: "grok-models".to_string(),
+        models,
+        agent_default_model,
         selected_model,
         supports_switching: true,
     }))

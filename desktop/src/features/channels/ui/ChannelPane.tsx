@@ -39,7 +39,7 @@ import { useThreadViewModeSwitch } from "@/features/channels/ui/useThreadViewMod
 import { useFocusDrawerPresence } from "@/features/channels/ui/useFocusDrawerPresence";
 import { useChannelWorkingAgentPubkeys } from "@/features/agents/agentWorkingSignal";
 import { BotActivityComposerAction } from "@/features/channels/ui/BotActivityBar";
-import { ChannelComposerActivityAccessory } from "@/features/channels/ui/ChannelComposerActivityAccessory";
+import { TypingIndicatorRow } from "@/features/messages/ui/TypingIndicatorRow";
 import {
   containsWelcomePersonaMention,
   WelcomeComposerBanner,

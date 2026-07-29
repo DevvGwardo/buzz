@@ -23,6 +23,7 @@ pub(crate) fn read_config_surface(
             "claude" => super::claude::read_config_file().map(|c| (c, true)),
             "codex" => super::codex::read_config_file().map(|c| (c, true)),
             "buzz-agent" => super::buzz_agent::read_config_file().map(|c| (c, true)),
+            "grok" => super::grok::read_config_file().map(|c| (c, true)),
             _ => None,
         })
         .unwrap_or_else(|| (RuntimeFileConfig::default(), false));

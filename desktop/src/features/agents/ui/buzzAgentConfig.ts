@@ -105,6 +105,13 @@ export function getProviderEffortConfig(
   if (provider === "openai") {
     return openaiConfig(m);
   }
+  // Grok CLI / ACP: low | medium | high (see `grok agent --reasoning-effort`).
+  if (provider === "grok") {
+    return {
+      validValues: ["low", "medium", "high"],
+      defaultValue: "medium",
+    };
+  }
   if (provider === "databricks_v2") {
     // Route by model family: claude* → Anthropic tables, gpt-5* → OpenAI tables.
     // Non-Claude concrete models (e.g. llama-3) go through MlflowChatCompletions,

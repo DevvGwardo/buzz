@@ -505,7 +505,20 @@ pub fn spawn_agent_child(
                 )
             })?;
     let effective_command = &descriptor.command;
-    let agent_args = &descriptor.args;
+    let agent_args = {
+        let base = descriptor.args.clone();
+        if super::known_acp_runtime(effective_command).is_some_and(|rt| rt.id == "grok") {
+            let effort = descriptor
+                .env
+                .get("BUZZ_AGENT_THINKING_EFFORT")
+                .map(String::as_str);
+            let with_model =
+                super::inject_grok_model_arg(base, effective_cfg.model.value.as_deref());
+            super::inject_grok_reasoning_effort_arg(with_model, effort)
+        } else {
+            base
+        }
+    };
 
     let log_path = super::managed_agent_runtime_log_path(app, &runtime_key)?;
     append_log_marker(
@@ -859,6 +872,20 @@ pub fn spawn_agent_child(
     // cannot clobber BUZZ_PRIVATE_KEY, NOSTR_PRIVATE_KEY, etc.
     for (key, value) in &descriptor.env {
         command.env(key, value);
+    }
+    // Shared UI key → harness-native effort env (e.g. GOOSE_THINKING_EFFORT).
+    // Grok reads effort via CLI `--reasoning-effort` (injected above); buzz-agent
+    // already consumes BUZZ_AGENT_THINKING_EFFORT directly.
+    if let Some(meta) = runtime_meta {
+        if let Some(native_key) = meta.thinking_env_var {
+            if native_key != "BUZZ_AGENT_THINKING_EFFORT" {
+                if let Some(effort) = descriptor.env.get("BUZZ_AGENT_THINKING_EFFORT") {
+                    if !descriptor.env.contains_key(native_key) {
+                        command.env(native_key, effort);
+                    }
+                }
+            }
+        }
     }
     configure_runtime_cli(&mut command, runtime_meta);
 

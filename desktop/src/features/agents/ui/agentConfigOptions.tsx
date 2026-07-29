@@ -139,6 +139,8 @@ const PERSONA_MODEL_OPTIONS_BY_RUNTIME: Record<
   "buzz-agent": [DEFAULT_MODEL_OPTION],
   claude: [DEFAULT_MODEL_OPTION],
   codex: [DEFAULT_MODEL_OPTION],
+  cursor: [DEFAULT_MODEL_OPTION],
+  grok: [DEFAULT_MODEL_OPTION],
 };
 
 export function getRuntimePersonaModelOptions(

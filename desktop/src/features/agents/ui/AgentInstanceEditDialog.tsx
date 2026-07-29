@@ -89,6 +89,12 @@ import {
   runtimeDropdownAction,
   usePendingHarnessSelection,
 } from "./addCustomHarness";
+import {
+  BUZZ_AGENT_THINKING_EFFORT,
+  BUZZ_AGENT_THINKING_EFFORT_VALUES,
+  getProviderEffortConfig,
+} from "./buzzAgentConfig";
+import { useEffortAutoClear } from "./buzzAgentModelTuningFields";
 
 const ADVANCED_FIELDS_MOTION_TRANSITION = {
   duration: 0.18,
@@ -304,6 +310,7 @@ export function AgentInstanceEditDialog({
     selectedRuntimeId,
   ]);
 
+
   const llmProviderFieldVisible =
     runtimeSupportsLlmProviderSelection(prospectiveRuntimeId);
 
@@ -409,6 +416,58 @@ export function AgentInstanceEditDialog({
     (inheritedSubmission.provider ?? "").trim() ||
     inheritedProviderDefault.value;
   const providerForDiscovery = llmProviderFieldVisible ? effectiveProvider : "";
+
+  // Effort is always available. Persist as BUZZ_AGENT_THINKING_EFFORT so every
+  // harness shares one control; spawn maps it for Grok/Goose/buzz-agent.
+  const effortEnvKey = BUZZ_AGENT_THINKING_EFFORT;
+  const effortProviderId =
+    prospectiveRuntimeId === "grok"
+      ? "grok"
+      : prospectiveRuntimeId === "claude"
+        ? "anthropic"
+        : prospectiveRuntimeId === "codex"
+          ? "openai"
+          : effectiveProvider || "";
+  const { validValues: effortValid, defaultValue: effortDefault } =
+    getProviderEffortConfig(effortProviderId, model);
+  const currentEffort = envVars[effortEnvKey] ?? "";
+  useEffortAutoClear({
+    currentEffort,
+    effortValid,
+    onClear: () => {
+      setEnvVars((prev) => {
+        if (!(effortEnvKey in prev)) return prev;
+        const next = { ...prev };
+        delete next[effortEnvKey];
+        return next;
+      });
+    },
+  });
+  const effortInheritLabel = (
+    inheritedEnvVarsForAdvanced as Record<string, string | undefined>
+  )[effortEnvKey]
+    ? `Default (${
+        (inheritedEnvVarsForAdvanced as Record<string, string | undefined>)[
+          effortEnvKey
+        ]
+      })`
+    : globalConfig.env_vars[effortEnvKey]
+      ? `Default (${globalConfig.env_vars[effortEnvKey]})`
+      : effortDefault != null
+        ? `Default (${effortDefault})`
+        : "Default";
+  const effortDropdownOptions: PersonaDropdownOption[] = [
+    { label: effortInheritLabel, value: "" },
+    ...BUZZ_AGENT_THINKING_EFFORT_VALUES.flatMap((value) => {
+      if (!(effortValid as readonly string[]).includes(value)) return [];
+      return [
+        {
+          label: value === effortDefault ? `${value} (default)` : value,
+          value,
+        },
+      ];
+    }),
+  ];
 
   const {
     discoveredModelOptions,
@@ -1131,6 +1190,35 @@ export function AgentInstanceEditDialog({
               ) : null}
             </div>
 
+            {/* Reasoning effort — same shell/control as harness + model */}
+            <div className="space-y-1.5">
+              <label
+                className="text-sm font-medium text-foreground"
+                htmlFor="edit-agent-thinking-effort"
+              >
+                Reasoning effort
+                <span className={PERSONA_LABEL_OPTIONAL_CLASS}>Optional</span>
+              </label>
+              <PersonaDropdownField
+                disabled={updateMutation.isPending}
+                id="edit-agent-thinking-effort"
+                onValueChange={(value) => {
+                  setEnvVars((prev) => {
+                    const next = { ...prev };
+                    if (value === "") {
+                      delete next[effortEnvKey];
+                    } else {
+                      next[effortEnvKey] = value;
+                    }
+                    return next;
+                  });
+                }}
+                options={effortDropdownOptions}
+                placeholder={effortInheritLabel}
+                value={currentEffort}
+              />
+            </div>
+
             <AgentAiDefaultsNotice
               onEditDefaults={() => setAiDefaultsOpen(true)}
               triggerRef={aiDefaultsTriggerRef}
@@ -1184,9 +1272,13 @@ export function AgentInstanceEditDialog({
                       disabled={updateMutation.isPending}
                       envVars={envVars}
                       fileSatisfiedEnvKeys={fileSatisfiedEnvKeys}
-                      hiddenEnvKeys={
-                        topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []
-                      }
+                      hiddenEnvKeys={[
+                        ...(topLevelSecretEnvVar
+                          ? [topLevelSecretEnvVar]
+                          : []),
+                        // Top-level Effort control owns this key.
+                        ...(effortEnvKey ? [effortEnvKey] : []),
+                      ]}
                       focusKey={
                         initialFocus?.type === "env_key"
                           ? initialFocus.key

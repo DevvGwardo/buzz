@@ -629,7 +629,9 @@ export function AgentConfigFields({
       ? "anthropic"
       : selectedRuntimeId === "codex"
         ? "openai"
-        : "";
+        : selectedRuntimeId === "grok"
+          ? "grok"
+          : "";
   const effortProvider = providerFieldVisible
     ? (config.provider ?? "")
     : implicitEffortProvider;

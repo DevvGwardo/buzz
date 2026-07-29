@@ -692,9 +692,17 @@ pub(crate) fn normalize_agent_command_identity(command: &str) -> String {
 
 fn default_agent_args(command: &str) -> Option<Vec<String>> {
     match normalize_agent_command_identity(command).as_str() {
-        "goose" => Some(vec!["acp".to_string()]),
+        "goose" | "hermes" | "hermes-agent" | "hermes-acp" | "hermes_acp" => {
+            Some(vec!["acp".to_string()])
+        }
         "codex" | "codex-acp" | "claude-agent-acp" | "claude-code-acp" | "claude-code"
         | "claudecode" | "buzz-agent" => Some(Vec::new()),
+        "grok" => Some(vec![
+            "agent".to_string(),
+            "--always-approve".to_string(),
+            "stdio".to_string(),
+        ]),
+        "cursor-agent" | "cursor" => Some(vec!["--trust".to_string(), "acp".to_string()]),
         _ => None,
     }
 }
@@ -786,6 +794,23 @@ pub fn normalize_agent_args(command: &str, agent_args: Vec<String>) -> Vec<Strin
         return default_args;
     }
 
+    let identity = normalize_agent_command_identity(command);
+
+    // Legacy cursor records stored only "acp" — upgrade to trusted headless default.
+    if identity == "cursor-agent"
+        && normalized.len() == 1
+        && normalized[0].eq_ignore_ascii_case("acp")
+    {
+        return default_args;
+    }
+
+    // Grok ACP is `agent … stdio`, not bare `acp`. Harness switches leave
+    // Goose/Cursor-style `["acp"]` on the record and cold-start every pool
+    // worker into "Device not configured (os error 6)".
+    if identity == "grok" && !grok_args_look_valid(&normalized) {
+        return default_args;
+    }
+
     // Older callers relied on the Goose-specific default even for runtimes like
     // Codex and Claude. Treat that legacy fallback as "no args" for zero-arg
     // providers so desktop- and env-based launches behave the same way.
@@ -795,6 +820,15 @@ pub fn normalize_agent_args(command: &str, agent_args: Vec<String>) -> Vec<Strin
     }
 
     normalized
+}
+
+fn grok_args_look_valid(args: &[String]) -> bool {
+    if args.len() == 1 && args[0].eq_ignore_ascii_case("acp") {
+        return false;
+    }
+    let has_agent = args.iter().any(|arg| arg == "agent");
+    let has_stdio = args.iter().any(|arg| arg == "stdio");
+    has_agent && has_stdio
 }
 
 /// Propagate legacy env-var aliases to their canonical names.
@@ -1593,6 +1627,43 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_cursor_agent_args_to_trusted_acp() {
+        assert_eq!(
+            normalize_agent_args("cursor-agent", Vec::new()),
+            vec!["--trust", "acp"]
+        );
+    }
+
+    #[test]
+    fn normalizes_grok_agent_args_to_stdio() {
+        assert_eq!(
+            normalize_agent_args("grok", Vec::new()),
+            vec!["agent", "--always-approve", "stdio"]
+        );
+    }
+
+    #[test]
+    fn upgrades_legacy_acp_args_for_grok() {
+        assert_eq!(
+            normalize_agent_args("grok", vec!["acp".into()]),
+            vec!["agent", "--always-approve", "stdio"]
+        );
+        assert_eq!(
+            normalize_agent_args(
+                "/Users/dev/.grok/bin/grok",
+                vec![
+                    "--reasoning-effort".into(),
+                    "low".into(),
+                    "-m".into(),
+                    "grok-4.5".into(),
+                    "acp".into(),
+                ]
+            ),
+            vec!["agent", "--always-approve", "stdio"]
+        );
+    }
+
+    #[test]
     fn normalize_agent_command_identity_variants() {
         assert_eq!(normalize_agent_command_identity("goose"), "goose");
         assert_eq!(
@@ -1660,6 +1731,34 @@ mod tests {
         assert_eq!(
             normalize_agent_args("codex-acp", vec!["ACP".into()]),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn hermes_defaults_to_acp_arg() {
+        assert_eq!(default_agent_args("hermes"), Some(vec!["acp".to_string()]));
+        assert_eq!(
+            default_agent_args("hermes-agent"),
+            Some(vec!["acp".to_string()])
+        );
+        assert_eq!(
+            default_agent_args("hermes-acp"),
+            Some(vec!["acp".to_string()])
+        );
+        // Path-qualified and case variants normalize correctly.
+        assert_eq!(
+            default_agent_args("/usr/local/bin/hermes"),
+            Some(vec!["acp".to_string()])
+        );
+        assert_eq!(default_agent_args("Hermes"), Some(vec!["acp".to_string()]));
+    }
+
+    #[test]
+    fn hermes_not_treated_as_codex_for_network_env() {
+        assert_eq!(codex_network_env("hermes", "ws://localhost:3000"), None);
+        assert_eq!(
+            codex_network_env("hermes-agent", "ws://localhost:3000"),
+            None
         );
     }
 

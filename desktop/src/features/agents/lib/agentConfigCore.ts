@@ -127,41 +127,33 @@ export function deriveAgentConfigFieldModel({
     value: config.model,
   });
 
-  if (runtime?.thinkingEnvVar) {
-    fields.push({
-      kind: "effort",
-      optionSource:
-        runtime.id === "buzz-agent"
-          ? "buzzAgentCatalog"
+  // Effort is offered for every harness. Persist as BUZZ_AGENT_THINKING_EFFORT
+  // (spawn maps it for Grok CLI / Goose / buzz-agent). Claude may also apply
+  // live via ACP thought_level when a session is up.
+  fields.push({
+    kind: "effort",
+    optionSource:
+      runtime?.id === "buzz-agent"
+        ? "buzzAgentCatalog"
+        : runtime?.id === "claude"
+          ? "harnessNative"
           : "legacyProviderModelCatalog",
-      currentPersistence: {
-        kind: "envVar",
-        key: BUZZ_AGENT_THINKING_EFFORT,
-      },
-      targetApplication: { kind: "envVar", key: runtime.thinkingEnvVar },
-      render: "control",
-      value: valueFromEnv(config, BUZZ_AGENT_THINKING_EFFORT),
-    });
-  } else if (runtime?.id === "claude") {
-    fields.push({
-      kind: "effort",
-      optionSource: "harnessNative",
-      currentPersistence: { kind: "unavailable" },
-      targetApplication: {
-        kind: "acpConfigOption",
-        id: "effort",
-        category: "thought_level",
-      },
-      render: "deferredUntilNativeOptionsAvailable",
-      value: null,
-    });
-  } else {
-    omissions.push({
-      kind: "effort",
-      reason:
-        runtime?.id === "codex" ? "ownedByModelId" : "unsupportedByHarness",
-    });
-  }
+    currentPersistence: {
+      kind: "envVar",
+      key: BUZZ_AGENT_THINKING_EFFORT,
+    },
+    targetApplication: runtime?.thinkingEnvVar
+      ? { kind: "envVar", key: runtime.thinkingEnvVar }
+      : runtime?.id === "claude"
+        ? {
+            kind: "acpConfigOption",
+            id: "effort",
+            category: "thought_level",
+          }
+        : { kind: "envVar", key: BUZZ_AGENT_THINKING_EFFORT },
+    render: "control",
+    value: valueFromEnv(config, BUZZ_AGENT_THINKING_EFFORT),
+  });
 
   return {
     fields,

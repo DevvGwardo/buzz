@@ -513,6 +513,16 @@ impl AcpClient {
             cmd.env("CODEX_CONFIG", merged);
         }
 
+        // Buzz-managed agents must never execute the operator's personal cron
+        // schedule. A goose ACP child starts a scheduler over the shared
+        // `schedule.json`, so a pool of N children fires every scheduled job N
+        // times — under the wrong identity and racing standalone goose.
+        //
+        // Set last, and with no operator-wins escape hatch, so it beats both a
+        // conflicting persona `extra_env` entry and any inherited parent value.
+        // Agent builds that don't recognize the variable ignore it.
+        cmd.env(GOOSE_SCHEDULER_DISABLED_ENV, "true");
+
         // Spawn the agent in its own process group so SIGKILL doesn't propagate
         // to the harness's own process group on Unix.
         // tokio::process::Command::process_group is a stable tokio API (no extra imports needed).

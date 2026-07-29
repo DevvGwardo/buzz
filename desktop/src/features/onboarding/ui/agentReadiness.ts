@@ -47,10 +47,22 @@ export function resolveAgentReadiness(
   }
 
   if (
-    (preferredRuntime.id === "claude" || preferredRuntime.id === "codex") &&
+    (preferredRuntime.id === "claude" ||
+      preferredRuntime.id === "codex" ||
+      preferredRuntime.id === "cursor" ||
+      preferredRuntime.id === "grok") &&
     (preferredRuntime.authStatus.status === "logged_in" ||
       preferredRuntime.authStatus.status === "not_applicable")
   ) {
+    if (
+      preferredRuntime.id === "cursor" ||
+      preferredRuntime.id === "grok"
+    ) {
+      const model = globalConfig.model?.trim() ?? "";
+      if (model.length === 0) {
+        return { ready: false };
+      }
+    }
     return {
       ready: true,
       reason: "cli",

@@ -89,6 +89,12 @@ import {
   runtimeDropdownAction,
   usePendingHarnessSelection,
 } from "./addCustomHarness";
+import {
+  BUZZ_AGENT_THINKING_EFFORT,
+  BUZZ_AGENT_THINKING_EFFORT_VALUES,
+  getProviderEffortConfig,
+} from "./buzzAgentConfig";
+import { useEffortAutoClear } from "./buzzAgentModelTuningFields";
 
 type AgentDefinitionDialogProps = {
   open: boolean;
@@ -536,6 +542,53 @@ export function AgentDefinitionDialog({
       : "",
     selectedRuntime,
   });
+
+  // Reasoning effort is offered for every harness. Persist as
+  // BUZZ_AGENT_THINKING_EFFORT; spawn maps it for Grok/Goose/buzz-agent.
+  const effortProviderId =
+    runtime === "grok"
+      ? "grok"
+      : runtime === "claude"
+        ? "anthropic"
+        : runtime === "codex"
+          ? "openai"
+          : effectiveProvider || "";
+  const { validValues: effortValid, defaultValue: effortDefault } =
+    getProviderEffortConfig(effortProviderId, model);
+  const currentEffort = envVars[BUZZ_AGENT_THINKING_EFFORT] ?? "";
+  useEffortAutoClear({
+    currentEffort,
+    effortValid,
+    onClear: () => {
+      setEnvVars((prev) => {
+        if (!(BUZZ_AGENT_THINKING_EFFORT in prev)) return prev;
+        const next = { ...prev };
+        delete next[BUZZ_AGENT_THINKING_EFFORT];
+        return next;
+      });
+    },
+  });
+  const effortInheritLabel = inheritedEnvVarsForAdvanced[
+    BUZZ_AGENT_THINKING_EFFORT
+  ]
+    ? `Default (${inheritedEnvVarsForAdvanced[BUZZ_AGENT_THINKING_EFFORT]})`
+    : globalConfig.env_vars[BUZZ_AGENT_THINKING_EFFORT]
+      ? `Default (${globalConfig.env_vars[BUZZ_AGENT_THINKING_EFFORT]})`
+      : effortDefault != null
+        ? `Default (${effortDefault})`
+        : "Default";
+  const effortDropdownOptions: PersonaDropdownOption[] = [
+    { label: effortInheritLabel, value: "" },
+    ...BUZZ_AGENT_THINKING_EFFORT_VALUES.flatMap((value) => {
+      if (!(effortValid as readonly string[]).includes(value)) return [];
+      return [
+        {
+          label: value === effortDefault ? `${value} (default)` : value,
+          value,
+        },
+      ];
+    }),
+  ];
   const staticModelOptions = getPersonaModelOptions(runtime, effectiveProvider);
   const runtimeModelOptions = getRuntimePersonaModelOptions(runtime);
   const {
@@ -599,6 +652,12 @@ export function AgentDefinitionDialog({
       })),
     { label: "Custom provider...", value: CUSTOM_PROVIDER_DROPDOWN_VALUE },
   ];
+  // Harnesses without a discovered model catalog (e.g. Hermes) expose only the
+  // fallback "Default model" option. Stripping it would leave the dropdown with
+  // just "Custom model…", so keep the default when no explicit models exist.
+  const hasExplicitModelOptions = modelOptions.some(
+    (option) => option.id.trim().length > 0,
+  );
   const modelDropdownOptions: PersonaDropdownOption[] =
     buildModelDropdownOptions({
       allowCustom: !isRelayMesh,
@@ -608,7 +667,10 @@ export function AgentDefinitionDialog({
       options: modelOptions,
     })
       .filter(
-        (option) => isRelayMesh || option.value !== AUTO_MODEL_DROPDOWN_VALUE,
+        (option) =>
+          isRelayMesh ||
+          option.value !== AUTO_MODEL_DROPDOWN_VALUE ||
+          !hasExplicitModelOptions,
       )
       .map((option) =>
         isRelayMesh && option.value === AUTO_MODEL_DROPDOWN_VALUE
@@ -946,6 +1008,38 @@ export function AgentDefinitionDialog({
                 ) : null}
               </AnimatePresence>
 
+              {aiConfigurationMode === "custom" && modelFieldVisible ? (
+                <div className="space-y-1.5">
+                  <label
+                    className="text-sm font-medium text-foreground"
+                    htmlFor="persona-thinking-effort"
+                  >
+                    Reasoning effort
+                    <span className={PERSONA_LABEL_OPTIONAL_CLASS}>
+                      Optional
+                    </span>
+                  </label>
+                  <PersonaDropdownField
+                    disabled={isPending}
+                    id="persona-thinking-effort"
+                    onValueChange={(value) => {
+                      setEnvVars((prev) => {
+                        const next = { ...prev };
+                        if (value === "") {
+                          delete next[BUZZ_AGENT_THINKING_EFFORT];
+                        } else {
+                          next[BUZZ_AGENT_THINKING_EFFORT] = value;
+                        }
+                        return next;
+                      });
+                    }}
+                    options={effortDropdownOptions}
+                    placeholder={effortInheritLabel}
+                    value={currentEffort}
+                  />
+                </div>
+              ) : null}
+
               {aiConfigurationMode === "defaults" ? (
                 <AgentCreateAiDefaultsSummary
                   canChooseProvider={runtimeCanChooseLlmProvider}
@@ -1015,9 +1109,11 @@ export function AgentDefinitionDialog({
                       disabled={isPending}
                       envVars={envVars}
                       fileSatisfiedEnvKeys={localModeGate.fileSatisfiedEnvKeys}
-                      hiddenEnvKeys={
-                        topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []
-                      }
+                      hiddenEnvKeys={[
+                        ...(topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []),
+                        // Top-level Reasoning effort owns this key.
+                        BUZZ_AGENT_THINKING_EFFORT,
+                      ]}
                       inheritedEnvVars={inheritedEnvVarsForAdvanced}
                       model={model}
                       modelTuningRuntimeId={runtime}

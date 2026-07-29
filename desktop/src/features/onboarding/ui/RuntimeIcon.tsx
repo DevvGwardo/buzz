@@ -12,6 +12,7 @@ import { RUNTIME_MARKS } from "./HarnessMarks";
 // `currentColor`, so they adapt to dark/light without bitmap filters.
 const RUNTIME_LOGOS: Record<string, string> = {
   claude: claudeLogoUrl,
+  // Grok falls through to runtime.avatarUrl (x.ai favicon) until a local asset lands.
 };
 
 // Public-path logos for bundled presets. Served from /harness-logos/ at runtime.
