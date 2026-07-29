@@ -978,6 +978,33 @@ test("project overview does not paint a background behind its cards", async ({
   }
 });
 
+test("repository rows identify their git host", async ({ page }) => {
+  await enableProjectsFeature(page);
+  await installMockBridge(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await page.getByTestId("open-projects-view").click();
+  await page.getByRole("button", { name: "Repositories", exact: true }).click();
+  await page.getByRole("button", { name: "List layout" }).click();
+
+  const buzzHostIcon = page
+    .getByTestId("repository-row-buzz")
+    .getByTestId("repository-host-icon");
+  await expect(buzzHostIcon).toHaveAttribute(
+    "aria-label",
+    "Buzz-hosted repository",
+  );
+  await expect(
+    page
+      .getByTestId("repository-row-relay-tools")
+      .getByTestId("repository-host-icon"),
+  ).toHaveAttribute("aria-label", "Git data hosted on github.com");
+
+  await buzzHostIcon.hover();
+  await expect(
+    page.getByRole("tooltip", { name: "Buzz-hosted repository" }),
+  ).toBeVisible();
+});
+
 test("project subsections do not paint backgrounds behind list or grid items", async ({
   page,
 }) => {

@@ -4915,6 +4915,7 @@ const MOCK_PROJECT_SEEDS = [
     name: "buzz",
     description:
       "Relay, desktop, and mobile clients for the Buzz community platform.",
+    cloneUrl: `${DEFAULT_RELAY_HTTP_URL}/git/${MOCK_IDENTITY_PUBKEY}/buzz`,
     owner: MOCK_IDENTITY_PUBKEY,
     contributors: [ALICE_PUBKEY, BOB_PUBKEY, CHARLIE_PUBKEY],
     activityLevel: 4,
@@ -4923,6 +4924,7 @@ const MOCK_PROJECT_SEEDS = [
     dtag: "relay-tools",
     name: "relay-tools",
     description: "Operator tooling and admin CLI for relay deployments.",
+    cloneUrl: "https://github.com/block/relay-tools.git",
     owner: ALICE_PUBKEY,
     contributors: [MOCK_IDENTITY_PUBKEY, BOB_PUBKEY],
     activityLevel: 2,
@@ -4931,6 +4933,7 @@ const MOCK_PROJECT_SEEDS = [
     dtag: "design-system",
     name: "design-system",
     description: "Shared UI tokens, typography ramps, and component library.",
+    cloneUrl: `${DEFAULT_RELAY_HTTP_URL}/git/${BOB_PUBKEY}/design-system`,
     owner: BOB_PUBKEY,
     contributors: [ALICE_PUBKEY],
     activityLevel: 1,
@@ -5028,7 +5031,7 @@ function buildMockProjectEvents(): RelayEvent[] {
           ["d", seed.dtag],
           ["name", seed.name],
           ["description", seed.description],
-          ["clone", `https://relay.example.com/git/${owner}/${seed.dtag}`],
+          ["clone", seed.cloneUrl],
           ...seed.contributors.map((pubkey) => ["p", pubkey]),
         ],
         owner,
@@ -5093,10 +5096,7 @@ function buildMockProjectEvents(): RelayEvent[] {
             ? [
                 ["h", "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50"],
                 ["branch-name", `feature/mock-${dayOffset}-${index}`],
-                [
-                  "clone",
-                  `https://relay.example.com/git/${owner}/${seed.dtag}`,
-                ],
+                ["clone", seed.cloneUrl],
               ]
             : []),
         ];

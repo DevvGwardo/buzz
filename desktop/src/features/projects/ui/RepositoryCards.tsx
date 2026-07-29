@@ -1,4 +1,4 @@
-import { FolderGit2, GitBranch, SquareTerminal } from "lucide-react";
+import { FolderGit2, GitBranch, Globe, SquareTerminal } from "lucide-react";
 
 import type {
   Project,
@@ -6,12 +6,15 @@ import type {
   Repository,
 } from "@/features/projects/hooks";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
+import { projectRepoHostForRepository } from "@/features/projects/lib/projectRepoHost";
 import {
   formatExactTimestamp,
   relativeTime,
 } from "@/features/projects/lib/projectsViewHelpers";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
+import { BuzzMark } from "@/shared/ui/buzz-logo/BuzzMark";
 import { Card } from "@/shared/ui/card";
 import { DropdownMenuItem } from "@/shared/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
@@ -27,6 +30,7 @@ import {
   ProjectPeopleStack,
   ProjectStatsRow,
 } from "./ProjectCards";
+import { GitHubMark } from "./GitHubMark";
 import { ProjectListRowMenu } from "./ProjectListRowMenu";
 import { projectTerminalLabel } from "./useOpenProjectTerminal";
 
@@ -42,6 +46,40 @@ type RepositoryItemProps = RepositoryListItem & {
   profiles?: UserProfileLookup;
   summary?: ProjectActivitySummary;
 };
+
+function RepositoryHostIcon({ repository }: { repository: Repository }) {
+  const host = projectRepoHostForRepository(repository, useRelayOrigin());
+  const label =
+    host.kind === "buzz"
+      ? "Buzz-hosted repository"
+      : host.kind === "external"
+        ? `Git data hosted on ${host.host}`
+        : "Repository host";
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          aria-label={label}
+          className="pointer-events-auto flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border/60 bg-muted/40 text-muted-foreground"
+          data-testid="repository-host-icon"
+          role="img"
+        >
+          {host.kind === "buzz" ? (
+            <BuzzMark className="h-4.5 w-5" />
+          ) : host.kind === "external" && host.host === "github.com" ? (
+            <GitHubMark className="h-4.5 w-4.5" />
+          ) : host.kind === "external" ? (
+            <Globe className="h-4.5 w-4.5" />
+          ) : (
+            <FolderGit2 className="h-4.5 w-4.5" />
+          )}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 function RepositoryOpenButton({
   onOpen,
@@ -68,9 +106,7 @@ function RepositoryIdentity({
 }) {
   return (
     <>
-      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border/60 bg-muted/40">
-        <FolderGit2 className="h-4.5 w-4.5 text-muted-foreground" />
-      </span>
+      <RepositoryHostIcon repository={repository} />
       <div className="min-w-0">
         <div className="flex min-w-0 items-center gap-2">
           <span className={PROJECT_LIST_ROW_TITLE_CLASS}>

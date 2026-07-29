@@ -7,7 +7,12 @@ import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export type ProjectsViewMode = "grid" | "list";
-export type ProjectsRepositoryScope = "all" | "mine" | "local";
+export type ProjectsRepositoryScope =
+  | "all"
+  | "mine"
+  | "local"
+  | "buzz"
+  | "linked";
 export type ProjectsWorkItemScope = "all" | "mine";
 export type ProjectsFilter =
   | "all"
@@ -79,7 +84,14 @@ export function readStoredRepositoryScope(): ProjectsRepositoryScope {
     const value = globalThis.localStorage?.getItem(
       PROJECTS_REPOSITORY_SCOPE_STORAGE_KEY,
     );
-    if (value === "mine" || value === "local") return value;
+    if (
+      value === "mine" ||
+      value === "local" ||
+      value === "buzz" ||
+      value === "linked"
+    ) {
+      return value;
+    }
     const legacyFilter = globalThis.localStorage?.getItem(
       PROJECTS_FILTER_STORAGE_KEY,
     );

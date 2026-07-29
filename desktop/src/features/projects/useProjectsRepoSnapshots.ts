@@ -8,6 +8,10 @@ import {
 import type { ProjectRepoSnapshot } from "@/shared/api/types";
 import type { Project } from "./hooks";
 import { selectProjectRepository } from "./projectModels";
+import {
+  type ProjectRepoUnavailableReason,
+  projectRepoUnavailableReason,
+} from "./lib/projectRepoAvailability";
 
 // Remote snapshots are backed by a blobless `git clone` per repository, so the
 // overview scan is deliberately throttled and cached for a long time.
@@ -55,8 +59,12 @@ async function fetchProjectSnapshot(
 async function fetchProjectsRepoSnapshots(
   projects: Project[],
   reposDir: string | null | undefined,
-): Promise<Record<string, ProjectRepoSnapshot>> {
+): Promise<{
+  snapshots: Record<string, ProjectRepoSnapshot>;
+  unavailable: Record<string, ProjectRepoUnavailableReason>;
+}> {
   const snapshots: Record<string, ProjectRepoSnapshot> = {};
+  const unavailable: Record<string, ProjectRepoUnavailableReason> = {};
   const queue = [...projects];
 
   const workers = Array.from(
@@ -67,16 +75,20 @@ async function fetchProjectsRepoSnapshots(
         if (!project) return;
         try {
           const snapshot = await fetchProjectSnapshot(project, reposDir);
-          if (snapshot) snapshots[project.id] = snapshot;
-        } catch {
-          // Best-effort: unreachable or empty repositories are skipped.
+          if (snapshot) {
+            snapshots[project.id] = snapshot;
+          } else {
+            unavailable[project.id] = "missing";
+          }
+        } catch (error) {
+          unavailable[project.id] = projectRepoUnavailableReason(error);
         }
       }
     },
   );
 
   await Promise.all(workers);
-  return snapshots;
+  return { snapshots, unavailable };
 }
 
 /**

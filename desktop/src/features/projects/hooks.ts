@@ -701,11 +701,12 @@ export function useProjectRepoSnapshotQuery(
   branchName?: string | null,
   pullRequest?: ProjectPullRequest | null,
   tag?: { name: string; commit: string } | null,
+  enabled = true,
 ) {
   const selectedBranch = branchName ?? project?.defaultBranch ?? null;
 
   return useQuery({
-    enabled: Boolean(project?.cloneUrls[0]),
+    enabled: Boolean(enabled && project?.cloneUrls[0]),
     queryKey: [
       "project",
       project?.id ?? "none",

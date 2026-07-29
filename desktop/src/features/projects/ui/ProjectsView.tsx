@@ -18,6 +18,10 @@ import { useRepositoryActivitySummariesQuery } from "@/features/projects/reposit
 import { useCreateProjectMutation } from "@/features/projects/useCreateProject";
 import { selectProjectRepository } from "@/features/projects/projectModels";
 import { useProjectsRepoSnapshotsQuery } from "@/features/projects/useProjectsRepoSnapshots";
+import {
+  projectRepoHostForProject,
+  projectRepoHostForRepository,
+} from "@/features/projects/lib/projectRepoHost";
 import { ProjectsActivityFeed } from "@/features/projects/ui/ProjectsActivityFeed";
 import {
   EmptyFilteredState,
@@ -79,6 +83,7 @@ import { useIdentityQuery } from "@/shared/api/hooks";
 import { topChromeInset } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { Button } from "@/shared/ui/button";
 import { PageHeader } from "@/shared/ui/PageHeader";
 
@@ -98,6 +103,8 @@ const REPOSITORY_SCOPE_OPTIONS: Array<{
   { label: "All", value: "all" },
   { label: "My Repositories", value: "mine" },
   { label: "Local", value: "local" },
+  { label: "Buzz-hosted", value: "buzz" },
+  { label: "Linked", value: "linked" },
 ];
 const PULL_REQUEST_SCOPE_OPTIONS: Array<{
   label: string;
@@ -117,6 +124,7 @@ const ISSUE_SCOPE_OPTIONS: Array<{
 export function ProjectsView() {
   const { goProject } = useAppNavigation();
   const { activeCommunity } = useCommunities();
+  const relayOrigin = useRelayOrigin();
   const scrollIdleTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
@@ -186,9 +194,18 @@ export function ProjectsView() {
   const projectsWorkItemsQuery = useProjectsWorkItemsQuery(
     filter === "all" || filter === "prs" || filter === "issues" ? projects : [],
   );
-  // One blobless clone per unique repository — only scan while the overview
-  // header (filter === "all") is actually visible.
-  const snapshotProjects = filter === "all" ? projects : [];
+  // One blobless clone per primary Buzz repository, only while the overview
+  // header is visible.
+  const snapshotProjects = React.useMemo(
+    () =>
+      filter === "all"
+        ? projects.filter(
+            (project) =>
+              projectRepoHostForProject(project, relayOrigin).kind === "buzz",
+          )
+        : [],
+    [filter, projects, relayOrigin],
+  );
   const repoSnapshotsQuery = useProjectsRepoSnapshotsQuery(
     snapshotProjects,
     activeCommunity?.reposDir,
@@ -304,6 +321,14 @@ export function ProjectsView() {
           return isProjectMine(project, currentPubkey);
         if (repositoryScope === "local")
           return hasLocalCheckout(project, localRepoNames);
+        if (repositoryScope === "buzz")
+          return (
+            projectRepoHostForProject(project, relayOrigin).kind === "buzz"
+          );
+        if (repositoryScope === "linked")
+          return (
+            projectRepoHostForProject(project, relayOrigin).kind === "external"
+          );
         if (filter === "agents") {
           return projectHasAgent(project, people, profiles);
         }
@@ -333,6 +358,7 @@ export function ProjectsView() {
     localRepoNames,
     profiles,
     projects,
+    relayOrigin,
     repositoryScope,
     sort,
   ]);
@@ -366,6 +392,18 @@ export function ProjectsView() {
         if (repositoryScope === "local") {
           return hasLocalRepositoryCheckout(repository, localRepoNames);
         }
+        if (repositoryScope === "buzz") {
+          return (
+            projectRepoHostForRepository(repository, relayOrigin).kind ===
+            "buzz"
+          );
+        }
+        if (repositoryScope === "linked") {
+          return (
+            projectRepoHostForRepository(repository, relayOrigin).kind ===
+            "external"
+          );
+        }
         return true;
       })
       .sort((left, right) => {
@@ -388,6 +426,7 @@ export function ProjectsView() {
     filter,
     localRepoNames,
     projects,
+    relayOrigin,
     repositoryActivitySummariesQuery.data,
     repositoryScope,
     sort,
@@ -564,6 +603,9 @@ export function ProjectsView() {
               people={projectPeople(project, summary)}
               profiles={profiles}
               project={project}
+              repositoryUnavailableReason={
+                repoSnapshotsQuery.data?.unavailable[project.id]
+              }
               summary={summary}
             />
           );
@@ -588,6 +630,9 @@ export function ProjectsView() {
               people={projectPeople(project, summary)}
               profiles={profiles}
               project={project}
+              repositoryUnavailableReason={
+                repoSnapshotsQuery.data?.unavailable[project.id]
+              }
               summary={summary}
             />
           );
@@ -686,7 +731,7 @@ export function ProjectsView() {
         profiles={profiles}
         projects={projects}
         pullRequests={projectsWorkItemsQuery.data?.pullRequests.items ?? []}
-        snapshots={repoSnapshotsQuery.data}
+        snapshots={repoSnapshotsQuery.data?.snapshots}
       />
     </>
   );
