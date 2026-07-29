@@ -3641,6 +3641,18 @@ mod agent_draft_prompt_tests {
             .contains("add them explicitly with `buzz channels add-member` only when authorized"));
         assert!(prompt.contains("never changes membership automatically"));
     }
+
+    #[test]
+    fn shared_base_prompt_distinguishes_forum_kinds_from_stream_messages() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("Forum channels are not stream channels"));
+        assert!(prompt.contains("kind `45001`"));
+        assert!(prompt.contains("kind `45003`"));
+        assert!(prompt.contains("stream default kind `9`"));
+        assert!(prompt.contains("if `[Context]` gives only a root event ID"));
+        assert!(prompt.contains("buzz messages thread --channel <UUID> --event <root-id>"));
+        assert!(prompt.contains("Never send kind `45003` beneath a kind-`9` root"));
+    }
 }
 
 fn default_heartbeat_prompt() -> String {

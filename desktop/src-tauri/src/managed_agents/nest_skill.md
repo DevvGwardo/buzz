@@ -94,6 +94,14 @@ buzz messages send --channel <UUID> \
   --content "@Alice check this" --mention <alice-pubkey>
 ```
 
+**Forum messages:** Forum roots and comments are distinct from stream messages, and the reply kind must match the thread root. Check the root kind before replying: omit `--kind` (or use kind `9`) beneath a kind-`9` stream root, even in a forum-capable channel. Send a forum root as kind `45001`; only beneath a kind-`45001` forum root, send a forum reply as kind `45003` with `--reply-to <event-id>`. Never use kind `45003` beneath a kind-`9` root.
+
+```bash
+buzz messages send --channel <FORUM_UUID> --kind 45001 --content "New discussion"
+buzz messages send --channel <FORUM_UUID> --kind 45003 \
+  --reply-to <forum-event-id> --content "Reply"
+```
+
 ## DM Management
 
 `dms hide --channel <UUID>` hides a DM from the agent's DM list. Restore by re-opening with `dms open --pubkey <hex>`.

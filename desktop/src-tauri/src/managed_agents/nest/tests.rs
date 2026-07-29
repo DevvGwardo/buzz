@@ -42,6 +42,14 @@ fn nest_skill_contains_safe_mention_workflow() {
 }
 
 #[test]
+fn nest_skill_contains_forum_workflow() {
+    assert!(BUZZ_CLI_SKILL_MD.contains("forum root as kind `45001`"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("forum reply as kind `45003`"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("reply kind must match the thread root"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("Never use kind `45003` beneath a kind-`9` root"));
+}
+
+#[test]
 fn ensure_nest_creates_all_dirs_and_agents_md() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(".buzz");
