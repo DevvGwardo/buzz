@@ -71,6 +71,39 @@ test("instance-edit routes to AgentInstanceEditDialog with its contract props", 
   });
 });
 
+test("instance-edit routes to AgentInstanceEditDialog for a persona-linked agent", () => {
+  // Regression guard: the pencil path in UserProfilePanel now unconditionally
+  // opens the instance-edit dialog, so a definition-backed agent (personaId
+  // present) must reach AgentInstanceEditDialog — not AgentDefinitionDialog.
+  // Before the fix, handleEditAgent short-circuited to the definition dialog
+  // for any agent with a resolvedPersona, making instance settings unreachable.
+  const linkedAgent = { pubkey: "abc", name: "test-agent", personaId: "p1" };
+  const onEditLinkedPersona = noop;
+  const onOpenChange = noop;
+  const onUpdated = noop;
+
+  const element = AgentDialog({
+    mode: "instance-edit",
+    agent: linkedAgent,
+    onEditLinkedPersona,
+    onOpenChange,
+    onUpdated,
+    open: true,
+  });
+
+  assert.equal(element.type, AgentRunLocationProvider);
+  const form = element.props.children;
+  assert.equal(form.type, AgentInstanceEditDialog);
+  assert.deepEqual(form.props, {
+    agent: linkedAgent,
+    onEditLinkedPersona,
+    onOpenChange,
+    onUpdated,
+    open: true,
+    initialFocus: undefined,
+  });
+});
+
 test("instance-edit publishes the run location resolved from the agent backend", () => {
   const routeWithBackend = (backend) =>
     AgentDialog({
