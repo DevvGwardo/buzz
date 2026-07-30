@@ -227,6 +227,34 @@ const VAD_THRESHOLD: f32 = 0.5;
 /// How long the worker waits on the audio channel before checking the shutdown flag.
 const RECV_TIMEOUT: Duration = Duration::from_millis(50);
 
+enum AudioReceive {
+    Bytes(Vec<u8>),
+    Retry,
+    Stop,
+}
+
+fn receive_audio(
+    audio_rx: &Receiver<Vec<u8>>,
+    is_shutting_down: bool,
+    flush_on_shutdown: bool,
+) -> AudioReceive {
+    if is_shutting_down {
+        if !flush_on_shutdown {
+            return AudioReceive::Stop;
+        }
+        return match audio_rx.try_recv() {
+            Ok(bytes) => AudioReceive::Bytes(bytes),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => AudioReceive::Stop,
+        };
+    }
+
+    match audio_rx.recv_timeout(RECV_TIMEOUT) {
+        Ok(bytes) => AudioReceive::Bytes(bytes),
+        Err(mpsc::RecvTimeoutError::Timeout) => AudioReceive::Retry,
+        Err(mpsc::RecvTimeoutError::Disconnected) => AudioReceive::Stop,
+    }
+}
+
 /// 50 ms cooldown after TTS stops before STT re-enables.
 /// Prevents the tail of TTS audio from being transcribed as speech.
 /// Previous value (200 ms) was eating the first word when the user spoke
@@ -339,10 +367,7 @@ fn stt_worker(
         .as_ref()
         .is_some_and(|p| p.load(Ordering::Acquire));
     loop {
-        // Check shutdown flag before blocking.
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
+        let is_shutting_down = shutdown.load(Ordering::Acquire);
 
         // Track TTS transitions to set the cooldown timer.
         let tts_now = tts_activity.active.load(Ordering::Acquire);
@@ -368,11 +393,13 @@ fn stt_worker(
             ptt_was_active = ptt_now;
         }
 
-        // Use recv_timeout so we can periodically check the shutdown flag.
-        let bytes = match audio_rx.recv_timeout(RECV_TIMEOUT) {
-            Ok(b) => b,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break, // Sender dropped.
+        // Dictation drains audio already accepted by the IPC command before
+        // flushing its final transcript. Huddles retain their immediate
+        // shutdown behavior so leaving cannot publish a late transcript.
+        let bytes = match receive_audio(&audio_rx, is_shutting_down, config.flush_on_shutdown) {
+            AudioReceive::Bytes(bytes) => bytes,
+            AudioReceive::Retry => continue,
+            AudioReceive::Stop => break,
         };
 
         // Drain any additional pending messages to batch-process.
@@ -413,8 +440,33 @@ fn stt_worker(
         }
     }
 
-    if config.flush_on_shutdown && !speech_buf.is_empty() {
-        flush_to_stt(&speech_buf, &recognizer, &text_tx);
+    if config.flush_on_shutdown {
+        if !input_buf_48k.is_empty() {
+            input_buf_48k.resize(chunk_in, 0.0);
+            let resampled = resample_chunk(&mut resampler, &input_buf_48k);
+            process_16k_samples(
+                &resampled,
+                &mut leftover_16k,
+                &mut vad,
+                &mut speech_buf,
+                &mut silence_frames,
+                &mut in_speech,
+                &mut barge_in_frames,
+                &recognizer,
+                &text_tx,
+                &tts_activity.active,
+                &tts_activity.synthesizing,
+                config.tts_cancel.as_deref(),
+                &mut tts_stopped_at,
+                config.ptt_active.as_ref(),
+                config.silence_flush_frames,
+                config.max_speech_samples,
+                config.partial_flush_samples,
+            );
+        }
+        if !speech_buf.is_empty() {
+            flush_to_stt(&speech_buf, &recognizer, &text_tx);
+        }
     }
 }
 
@@ -643,7 +695,9 @@ use super::drain_until_shutdown;
 
 #[cfg(test)]
 mod tests {
-    use super::tts_playback_ended;
+    use std::sync::mpsc;
+
+    use super::{receive_audio, tts_playback_ended, AudioReceive};
 
     #[test]
     fn decoder_gap_is_not_a_playback_end() {
@@ -653,5 +707,31 @@ mod tests {
     #[test]
     fn drained_completed_stream_is_a_playback_end() {
         assert!(tts_playback_ended(true, false, false));
+    }
+
+    #[test]
+    fn dictation_shutdown_drains_accepted_audio() {
+        let (audio_tx, audio_rx) = mpsc::sync_channel(1);
+        audio_tx.send(vec![1, 2, 3, 4]).unwrap();
+
+        assert!(matches!(
+            receive_audio(&audio_rx, true, true),
+            AudioReceive::Bytes(bytes) if bytes == [1, 2, 3, 4]
+        ));
+        assert!(matches!(
+            receive_audio(&audio_rx, true, true),
+            AudioReceive::Stop
+        ));
+    }
+
+    #[test]
+    fn huddle_shutdown_does_not_drain_accepted_audio() {
+        let (audio_tx, audio_rx) = mpsc::sync_channel(1);
+        audio_tx.send(vec![1, 2, 3, 4]).unwrap();
+
+        assert!(matches!(
+            receive_audio(&audio_rx, true, false),
+            AudioReceive::Stop
+        ));
     }
 }

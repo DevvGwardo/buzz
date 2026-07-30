@@ -1,11 +1,5 @@
-import type * as React from "react";
-import { useCallback, useMemo, useRef } from "react";
-import {
-  DEFAULT_AUTO_SUBMIT_PHRASE,
-  getAutoSubmitMatch,
-  parseAutoSubmitPhrases,
-  replaceTrailingTranscribedText,
-} from "../lib/voiceInput";
+import { useCallback, useRef } from "react";
+import { replaceTrailingTranscribedText } from "../lib/voiceInput";
 import { useLocalDictation } from "./useLocalDictation";
 
 interface UseDictationOptions {
@@ -15,24 +9,13 @@ interface UseDictationOptions {
   getText: () => string;
   /** Set composer text */
   setText: (value: string) => void;
-  /** Send the message */
-  onSend: (text: string) => void;
-  /** Ref that is `true` when sending is blocked (uploading, preparing mention, etc.) */
-  isSendBlockedRef?: React.MutableRefObject<boolean>;
 }
 
 export function useDictation({
   disabled = false,
   getText,
   setText,
-  onSend,
-  isSendBlockedRef,
 }: UseDictationOptions) {
-  const autoSubmitPhrases = useMemo(
-    () => parseAutoSubmitPhrases(DEFAULT_AUTO_SUBMIT_PHRASE),
-    [],
-  );
-  const stopRecordingRef = useRef<() => void>(() => {});
   const lastTranscriptRef = useRef("");
 
   const handleTranscript = useCallback(
@@ -44,36 +27,12 @@ export function useDictation({
         previous,
         transcript,
       );
-      const match = getAutoSubmitMatch(transcript, autoSubmitPhrases);
-
-      if (!match) {
-        setText(merged);
-        // Reset to empty — each streaming partial is an independent segment
-        // (the native engine flushes and clears its buffer). The next transcript
-        // should be appended, not replace this one.
-        lastTranscriptRef.current = "";
-        return;
-      }
-
-      const textWithoutPhrase = replaceTrailingTranscribedText(
-        latest,
-        previous,
-        match.textWithoutPhrase,
-      );
-      if (!textWithoutPhrase.trim()) return;
-
-      stopRecordingRef.current();
-
-      if (isSendBlockedRef?.current) {
-        setText(textWithoutPhrase);
-        return;
-      }
-
-      setText(textWithoutPhrase.trim());
-      onSend(textWithoutPhrase.trim());
+      setText(merged);
+      // Each native flush is an independent segment, so the next transcript
+      // appends instead of replacing this one.
       lastTranscriptRef.current = "";
     },
-    [autoSubmitPhrases, getText, onSend, isSendBlockedRef, setText],
+    [getText, setText],
   );
 
   const dictation = useLocalDictation({
@@ -83,8 +42,6 @@ export function useDictation({
     },
     onTranscriptText: handleTranscript,
   });
-
-  stopRecordingRef.current = dictation.stopRecording;
 
   return dictation;
 }

@@ -2,29 +2,46 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  DEFAULT_AUTO_SUBMIT_PHRASE,
-  getAutoSubmitMatch,
-  parseAutoSubmitPhrases,
+  getDictationSendDecision,
   replaceTrailingTranscribedText,
 } from "./voiceInput.ts";
 
-// ── parseAutoSubmitPhrases ──────────────────────────────────────────────────
-
-test("parseAutoSubmitPhrases_returnsEmptyForNullish", () => {
-  assert.deepEqual(parseAutoSubmitPhrases(null), []);
-  assert.deepEqual(parseAutoSubmitPhrases(undefined), []);
-  assert.deepEqual(parseAutoSubmitPhrases(""), []);
+test("dictation send stops capture before submitting", () => {
+  assert.equal(
+    getDictationSendDecision({
+      isRecording: true,
+      isStarting: false,
+      isTranscribing: true,
+    }),
+    "stop-recording",
+  );
+  assert.equal(
+    getDictationSendDecision({
+      isRecording: false,
+      isStarting: true,
+      isTranscribing: false,
+    }),
+    "stop-recording",
+  );
 });
 
-test("parseAutoSubmitPhrases_splitsNormalizesAndDedupes", () => {
-  assert.deepEqual(parseAutoSubmitPhrases("Submit, send it, submit, "), [
-    "submit",
-    "send it",
-  ]);
-});
-
-test("parseAutoSubmitPhrases_stripsTrailingPunctuation", () => {
-  assert.deepEqual(parseAutoSubmitPhrases("submit!"), ["submit"]);
+test("dictation send waits for the final transcript", () => {
+  assert.equal(
+    getDictationSendDecision({
+      isRecording: false,
+      isStarting: false,
+      isTranscribing: true,
+    }),
+    "wait",
+  );
+  assert.equal(
+    getDictationSendDecision({
+      isRecording: false,
+      isStarting: false,
+      isTranscribing: false,
+    }),
+    "send",
+  );
 });
 
 // ── replaceTrailingTranscribedText ──────────────────────────────────────────
@@ -69,82 +86,4 @@ test("replaceTrailingTranscribedText_noDoubleSpaceBeforePunctuation", () => {
     replaceTrailingTranscribedText("Hello", "", ", world"),
     "Hello, world",
   );
-});
-
-// ── getAutoSubmitMatch ──────────────────────────────────────────────────────
-
-test("getAutoSubmitMatch_returnsNullWhenPhraseAbsent", () => {
-  assert.equal(
-    getAutoSubmitMatch("hello there", parseAutoSubmitPhrases("submit")),
-    null,
-  );
-});
-
-test("getAutoSubmitMatch_returnsNullWhenPhrasesEmpty", () => {
-  // DEFAULT_AUTO_SUBMIT_PHRASE is empty (auto-submit disabled by default).
-  assert.equal(
-    getAutoSubmitMatch(
-      "send this message submit",
-      parseAutoSubmitPhrases(DEFAULT_AUTO_SUBMIT_PHRASE),
-    ),
-    null,
-  );
-});
-
-test("getAutoSubmitMatch_matchesTrailingPhraseAndStripsIt", () => {
-  const match = getAutoSubmitMatch(
-    "send this message submit",
-    parseAutoSubmitPhrases("submit"),
-  );
-  assert.ok(match);
-  assert.equal(match.matchedPhrase, "submit");
-  assert.equal(match.textWithoutPhrase, "send this message");
-});
-
-test("getAutoSubmitMatch_ignoresPhraseMidSentence", () => {
-  // "submit" is not at the end, so it must not auto-send.
-  assert.equal(
-    getAutoSubmitMatch(
-      "submit the form later",
-      parseAutoSubmitPhrases("submit"),
-    ),
-    null,
-  );
-});
-
-test("getAutoSubmitMatch_requiresWordBoundaryBeforePhrase", () => {
-  // "resubmit" ends with "submit" but is not a standalone word → no match.
-  assert.equal(
-    getAutoSubmitMatch("resubmit", parseAutoSubmitPhrases("submit")),
-    null,
-  );
-});
-
-test("getAutoSubmitMatch_toleratesTrailingPunctuation", () => {
-  const match = getAutoSubmitMatch(
-    "ship it submit.",
-    parseAutoSubmitPhrases("submit"),
-  );
-  assert.ok(match);
-  assert.equal(match.textWithoutPhrase, "ship it");
-});
-
-test("getAutoSubmitMatch_matchesMultiWordPhrase", () => {
-  const match = getAutoSubmitMatch(
-    "please do this send it",
-    parseAutoSubmitPhrases("send it"),
-  );
-  assert.ok(match);
-  assert.equal(match.matchedPhrase, "send it");
-  assert.equal(match.textWithoutPhrase, "please do this");
-});
-
-test("getAutoSubmitMatch_prefersLongestPhrase", () => {
-  const match = getAutoSubmitMatch(
-    "text please submit now",
-    parseAutoSubmitPhrases("submit now, now"),
-  );
-  assert.ok(match);
-  assert.equal(match.matchedPhrase, "submit now");
-  assert.equal(match.textWithoutPhrase, "text please");
 });

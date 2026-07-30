@@ -1,6 +1,7 @@
 import type * as React from "react";
-import { useRef } from "react";
+import { useCallback, useRef } from "react";
 import { useFeatureEnabled } from "@/shared/features";
+import { getDictationSendDecision } from "../lib/voiceInput";
 import { DictationButton } from "../ui/DictationButton";
 import { useComposerDictation } from "./useComposerDictation";
 
@@ -12,7 +13,6 @@ interface UseMessageComposerDictationOptions {
   isUploadingRef: React.MutableRefObject<boolean>;
   setComposerContent: (text: string) => void;
   setEditorContent: (text: string) => void;
-  submitMessageRef: React.MutableRefObject<() => void>;
   draftKey: string | null;
   composerRef: React.RefObject<HTMLElement | null>;
 }
@@ -24,11 +24,29 @@ export function useMessageComposerDictation({
   const enabled = useFeatureEnabled("voiceDictation");
   const setEditorContentRef = useRef(setEditorContent);
   setEditorContentRef.current = setEditorContent;
-  return useComposerDictation({
+  const dictation = useComposerDictation({
     ...options,
     enabled,
     setEditorContentRef,
   });
+  const { isRecording, isStarting, isTranscribing, stopRecording } = dictation;
+  const prepareToSubmit = useCallback(() => {
+    const decision = getDictationSendDecision({
+      isRecording,
+      isStarting,
+      isTranscribing,
+    });
+    if (decision === "stop-recording") {
+      stopRecording();
+    }
+    return decision === "send";
+  }, [isRecording, isStarting, isTranscribing, stopRecording]);
+
+  return {
+    ...dictation,
+    isSendBlocked: isRecording || isStarting || isTranscribing,
+    prepareToSubmit,
+  };
 }
 
 export function MessageComposerDictationAction({

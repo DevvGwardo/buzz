@@ -21,7 +21,6 @@ interface UseComposerDictationOptions {
   setComposerContent: (text: string) => void;
   /** Ref to a function that updates the Tiptap editor document. */
   setEditorContentRef: React.MutableRefObject<(text: string) => void>;
-  submitMessageRef: React.MutableRefObject<() => void>;
   /** When this key changes (channel/thread switch), active dictation is stopped. */
   draftKey?: string | null;
   /** Ref to the composer's container element for focus tracking. */
@@ -30,7 +29,7 @@ interface UseComposerDictationOptions {
 
 /**
  * Thin wrapper around `useDictation` pre-wired for the MessageComposer's
- * state management (syncContentRef, setComposerContent, editor, submitMessageRef).
+ * state management (syncContentRef, setComposerContent, editor).
  *
  * Uses the local Parakeet STT engine — fully offline, no relay or API key needed.
  */
@@ -43,7 +42,6 @@ export function useComposerDictation({
   isUploadingRef,
   setComposerContent,
   setEditorContentRef,
-  submitMessageRef,
   draftKey,
   composerRef,
 }: UseComposerDictationOptions) {
@@ -62,16 +60,16 @@ export function useComposerDictation({
       setComposerContent(text);
       setEditorContentRef.current(text);
     },
-    onSend: (text) => {
-      setComposerContent(text);
-      setEditorContentRef.current(text);
-      // Submit synchronously — the content ref is already set above, so
-      // syncComposerContentFromEditor() will serialize the editor which now
-      // holds the dictated text.
-      submitMessageRef.current();
-    },
-    isSendBlockedRef,
   });
+  const startRecordingRef = useRef(dictation.startRecording);
+  const stopRecordingRef = useRef(dictation.stopRecording);
+  const isRecordingRef = useRef(dictation.isRecording);
+  const isStartingRef = useRef(dictation.isStarting);
+  const shortcutHeldRef = useRef(false);
+  startRecordingRef.current = dictation.startRecording;
+  stopRecordingRef.current = dictation.stopRecording;
+  isRecordingRef.current = dictation.isRecording;
+  isStartingRef.current = dictation.isStarting;
 
   // Track which composer is active (most recently focused) so that the global
   // ⌘D shortcut only dispatches to one instance when multiple are mounted.
@@ -162,30 +160,31 @@ export function useComposerDictation({
       if (el && !el.contains(document.activeElement)) return;
       // Don't start dictation in disabled/blocked composers.
       if (disabledRef.current || isSendBlockedRef.current) return;
-      if (!dictation.isRecording && !dictation.isStarting) {
-        dictation.startRecording();
+      if (
+        !shortcutHeldRef.current &&
+        !isRecordingRef.current &&
+        !isStartingRef.current
+      ) {
+        shortcutHeldRef.current = true;
+        void startRecordingRef.current();
       }
     }
     function handleKeyUp() {
-      if (dictation.isRecording || dictation.isStarting) {
-        dictation.stopRecording();
-      }
+      if (!shortcutHeldRef.current) return;
+      shortcutHeldRef.current = false;
+      stopRecordingRef.current();
     }
     window.addEventListener("buzz:dictation-key-down", handleKeyDown);
     window.addEventListener("buzz:dictation-key-up", handleKeyUp);
     return () => {
       window.removeEventListener("buzz:dictation-key-down", handleKeyDown);
       window.removeEventListener("buzz:dictation-key-up", handleKeyUp);
+      if (shortcutHeldRef.current) {
+        shortcutHeldRef.current = false;
+        stopRecordingRef.current();
+      }
     };
-  }, [
-    instanceId,
-    composerRef,
-    enabled,
-    dictation.isRecording,
-    dictation.isStarting,
-    dictation.startRecording,
-    dictation.stopRecording,
-  ]);
+  }, [instanceId, composerRef, enabled]);
 
   return dictation;
 }

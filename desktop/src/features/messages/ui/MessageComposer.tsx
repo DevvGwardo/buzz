@@ -210,7 +210,7 @@ function MessageComposerImpl({
     emojiAutocomplete.isEmojiAutocompleteOpen;
 
   const submitMessageRef = React.useRef<() => void>(() => {});
-  const stopDictationRef = React.useRef<() => void>(() => {});
+  const prepareDictationSubmitRef = React.useRef<() => boolean>(() => true);
   const composerScrollRef = React.useRef<HTMLDivElement>(null);
 
   // Set after `useLinkEditor` exists below; the editor's link-click handler
@@ -275,11 +275,10 @@ function MessageComposerImpl({
     isUploadingRef,
     setComposerContent,
     setEditorContent: richText.setContent,
-    submitMessageRef,
     draftKey: effectiveDraftKey,
     composerRef: composerScrollRef,
   });
-  stopDictationRef.current = dictation.cancelRecording;
+  prepareDictationSubmitRef.current = dictation.prepareToSubmit;
   const linkEditor = useLinkEditor(richText);
   syncContentRefFromEditorRef.current = () => {
     const markdown = richText.getMarkdown();
@@ -518,12 +517,13 @@ function MessageComposerImpl({
 
   // ── Submit message ──────────────────────────────────────────────────
   const submitMessage = React.useCallback(async () => {
+    if (!prepareDictationSubmitRef.current()) return;
+
     const trimmed = syncComposerContentFromEditor().trim();
 
     // Edit mode
     if (editTargetRef.current && onEditSaveRef.current) {
       if (isSendingRef.current || isUploadingRef.current) return;
-      stopDictationRef.current();
       const currentPendingImeta = media.pendingImetaRef.current;
       const hasMedia = currentPendingImeta.length > 0;
       // Empty text + zero attachments is a no-op (don't let edit become an
@@ -600,8 +600,6 @@ function MessageComposerImpl({
     ) {
       return;
     }
-    stopDictationRef.current();
-
     const capturedThreadContext = onCaptureSendContext?.() ?? null;
     if (
       capturedThreadContext !== null &&
@@ -841,11 +839,13 @@ function MessageComposerImpl({
       disabled ||
       media.isUploading ||
       mentionSendFlow.isPreparingMentionSend ||
+      dictation.isSendBlocked ||
       (isContentEmpty && media.pendingImeta.length === 0),
     [
       disabled,
       media.isUploading,
       mentionSendFlow.isPreparingMentionSend,
+      dictation.isSendBlocked,
       isContentEmpty,
       media.pendingImeta.length,
     ],
