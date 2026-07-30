@@ -21,6 +21,9 @@ JOBS="${3:?usage: lhtb-high.sh <label> <manifest> <jobs> <seat>...}"
 shift 3
 SEATS=("$@")
 N=8
+# A fresh smoke needs a fresh jobs dir: gatecheck globs every result.json under
+# it, so a previous failed attempt would fail the gate a second time.
+TAG="${SMOKE_TAG:-smoke}"
 
 # Resolve siblings relative to this script, so it works both from the repo
 # checkout and from a copy dropped in $HOME on a benchmark box.
@@ -33,17 +36,17 @@ cd "$HOME/buzz/benchmarks/harbor-buzz-orchestra" || exit 1
 docker ps --format '{{.Names}}' | grep -v '^buzz-benchmark-' \
   | xargs -r docker rm -f > /dev/null 2>&1 || true
 
-echo "=== $(date -u +%H:%M:%SZ) [$LABEL] SMOKE $MANIFEST (great-expectations-audit, 0.15x)"
-"$HERE/lhtb-smoke.sh" "$MANIFEST" "${JOBS}-smoke" > "$HOME/${JOBS}-smoke.log" 2>&1
+echo "=== $(date -u +%H:%M:%SZ) [$LABEL] SMOKE $MANIFEST (great-expectations-audit, ${SMOKE_MULT:-0.15}x)"
+"$HERE/lhtb-smoke.sh" "$MANIFEST" "${JOBS}-${TAG}" > "$HOME/${JOBS}-${TAG}.log" 2>&1
 echo "=== $(date -u +%H:%M:%SZ) [$LABEL] smoke exited rc=$?"
 
-python3 "$HERE/gatecheck.py" "jobs/${JOBS}-smoke" "${SEATS[@]}"
+python3 "$HERE/gatecheck.py" "jobs/${JOBS}-${TAG}" "${SEATS[@]}"
 gate=$?
 
 if [ "$gate" -ne 0 ]; then
   echo "=== $(date -u +%H:%M:%SZ) [$LABEL] gate FAILED -- NOT starting the full run."
-  echo "===        inspect ~/${JOBS}-smoke.log and"
-  echo "===        jobs/${JOBS}-smoke/*/*/agent/buzz/*.stdout.log"
+  echo "===        inspect ~/${JOBS}-${TAG}.log and"
+  echo "===        jobs/${JOBS}-${TAG}/*/*/agent/buzz/*.stdout.log"
   exit 1
 fi
 

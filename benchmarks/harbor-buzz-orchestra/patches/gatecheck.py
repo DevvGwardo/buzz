@@ -24,16 +24,29 @@ Four gates, each of which has silently ruined a run before:
 
 import json
 import pathlib
+import re
 import sys
 
 jobs = pathlib.Path(sys.argv[1])
 required = set(sys.argv[2:])
 
+
+def role(agent_id: str) -> str:
+    """Roster id behind a receipt's agent_id.
+
+    Receipts carry the *instance* id -- `lead-1`, `scout-1`, `worker-1` -- while
+    the manifest roster and this script's arguments carry the role, because a
+    seat with `count: 2` produces `worker-1` and `worker-2`. Comparing the two
+    directly fails the gate on a cell where every seat spoke perfectly.
+    """
+    return re.sub(r"-\d+$", "", agent_id)
+
+
 seats: set[str] = set()
 for f in jobs.glob("*/*/agent/buzz/receipts.jsonl"):
     for line in f.read_text().splitlines():
         if line.strip():
-            seats.add(json.loads(line).get("agent_id", "?"))
+            seats.add(role(json.loads(line).get("agent_id", "?")))
 
 results = sorted(jobs.glob("*/*/result.json"))
 phases, phased_receipts, rewards = [], [], []
