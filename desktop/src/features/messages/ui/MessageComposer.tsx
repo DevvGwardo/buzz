@@ -2,9 +2,9 @@ import * as React from "react";
 
 import { EditorContent } from "@tiptap/react";
 import { useChannelLinks } from "@/features/messages/lib/useChannelLinks";
+import type { ChannelSuggestion } from "@/features/messages/lib/useChannelLinks";
 import { handleAgentSnapshotPaste } from "@/features/messages/lib/agentSnapshotClipboard";
 import { useComposerAutofocus } from "@/features/messages/lib/useComposerAutofocus";
-import type { ChannelSuggestion } from "@/features/messages/lib/useChannelLinks";
 import { useDrafts } from "@/features/messages/lib/useDrafts";
 import { resolveSentDraftKey } from "@/features/messages/ui/draftSubmitKey";
 import { useEmojiAutocomplete } from "@/features/messages/lib/useEmojiAutocomplete";
@@ -39,22 +39,26 @@ import {
 import { useLinkEditor } from "@/features/messages/lib/useLinkEditor";
 import { useComposerSpoilerParticles } from "@/features/messages/lib/useComposerSpoilerParticles";
 import { useTypingBroadcast } from "@/features/messages/useTypingBroadcast";
+import {
+  MessageComposerDictationAction,
+  useMessageComposerDictation,
+} from "@/features/dictation";
 import { getBuzzCodeBlockClipboardText } from "@/shared/lib/codeBlockClipboard";
 import { cn } from "@/shared/lib/cn";
-import { ChannelAutocomplete } from "./ChannelAutocomplete";
 import { ComposerReplyEditBanner } from "./ComposerReplyEditBanner";
 import { ComposerAttachments, DropZoneOverlay } from "./ComposerAttachments";
-import { EmojiAutocomplete } from "./EmojiAutocomplete";
-import {
-  MentionAutocomplete,
-  type MentionSuggestion,
-} from "./MentionAutocomplete";
+import type { MentionSuggestion } from "./MentionAutocomplete";
 import { ComposerDockToolbar } from "./ComposerDockToolbar";
 import { NonMemberMentionDialog } from "./NonMemberMentionDialog";
 import { useMentionSendFlow } from "./useMentionSendFlow";
 import { usePersistentAgentMentionHydration } from "./usePersistentAgentMentionHydration";
 import { useComposerContentState } from "./useComposerContentState";
 import { useDraftPersistLifecycle } from "./useDraftPersistSnapshot";
+import {
+  MessageComposerAutocompletes,
+  MessageComposerUploadError,
+} from "./MessageComposerOverlays";
+import { useComposerScrollToBottom } from "./useComposerScrollToBottom";
 
 import type { MessageComposerProps } from "./MessageComposer.types";
 
@@ -206,6 +210,7 @@ function MessageComposerImpl({
     emojiAutocomplete.isEmojiAutocompleteOpen;
 
   const submitMessageRef = React.useRef<() => void>(() => {});
+  const stopDictationRef = React.useRef<() => void>(() => {});
   const composerScrollRef = React.useRef<HTMLDivElement>(null);
 
   // Set after `useLinkEditor` exists below; the editor's link-click handler
@@ -219,13 +224,7 @@ function MessageComposerImpl({
   >(null);
   const onLinkShortcutRef = React.useRef<(() => boolean) | null>(null);
 
-  const scrollComposerToBottom = React.useCallback(() => {
-    window.requestAnimationFrame(() => {
-      const scrollElement = composerScrollRef.current;
-      if (!scrollElement) return;
-      scrollElement.scrollTop = scrollElement.scrollHeight;
-    });
-  }, []);
+  const scrollComposerToBottom = useComposerScrollToBottom(composerScrollRef);
 
   const computedPlaceholder = editTarget
     ? "Edit your message"
@@ -268,6 +267,19 @@ function MessageComposerImpl({
     },
   });
 
+  const dictation = useMessageComposerDictation({
+    syncContentRef: syncContentRefFromEditorRef,
+    disabled,
+    disabledRef,
+    isSendingRef,
+    isUploadingRef,
+    setComposerContent,
+    setEditorContent: richText.setContent,
+    submitMessageRef,
+    draftKey: effectiveDraftKey,
+    composerRef: composerScrollRef,
+  });
+  stopDictationRef.current = dictation.cancelRecording;
   const linkEditor = useLinkEditor(richText);
   syncContentRefFromEditorRef.current = () => {
     const markdown = richText.getMarkdown();
@@ -278,7 +290,6 @@ function MessageComposerImpl({
   onLinkSelectionChangeRef.current = linkEditor.showFromCursor;
   onLinkShortcutRef.current = linkEditor.openFromShortcut;
   useComposerSpoilerParticles(richText.editor, composerScrollRef);
-
   const persistentMentionHydration = usePersistentAgentMentionHydration({
     audienceScope,
     hydrationKey: effectiveDraftKey,
@@ -512,6 +523,7 @@ function MessageComposerImpl({
     // Edit mode
     if (editTargetRef.current && onEditSaveRef.current) {
       if (isSendingRef.current || isUploadingRef.current) return;
+      stopDictationRef.current();
       const currentPendingImeta = media.pendingImetaRef.current;
       const hasMedia = currentPendingImeta.length > 0;
       // Empty text + zero attachments is a no-op (don't let edit become an
@@ -588,6 +600,7 @@ function MessageComposerImpl({
     ) {
       return;
     }
+    stopDictationRef.current();
 
     const capturedThreadContext = onCaptureSendContext?.() ?? null;
     if (
@@ -920,42 +933,22 @@ function MessageComposerImpl({
             }}
           >
             {ownsDropZone && media.isDragOver && <DropZoneOverlay />}
-            <EmojiAutocomplete
-              onSelect={applyEmojiInsert}
-              selectedIndex={emojiAutocomplete.emojiSelectedIndex}
-              suggestions={
-                emojiAutocomplete.isEmojiAutocompleteOpen
-                  ? emojiAutocomplete.emojiSuggestions
-                  : []
+            <MessageComposerAutocompletes
+              applyChannelInsert={applyChannelInsert}
+              applyEmojiInsert={applyEmojiInsert}
+              applyMentionInsert={applyMentionInsert}
+              channelLinks={channelLinks}
+              emojiAutocomplete={emojiAutocomplete}
+              mentions={mentions}
+            />
+            <MessageComposerUploadError
+              message={
+                media.uploadState.status === "error"
+                  ? media.uploadState.message
+                  : null
               }
+              onDismiss={() => media.setUploadState({ status: "idle" })}
             />
-            <ChannelAutocomplete
-              onSelect={applyChannelInsert}
-              selectedIndex={channelLinks.channelSelectedIndex}
-              suggestions={
-                channelLinks.isChannelOpen
-                  ? channelLinks.channelSuggestions
-                  : []
-              }
-            />
-            <MentionAutocomplete
-              onFetchMore={mentions.fetchMoreSuggestions}
-              onSelect={applyMentionInsert}
-              selectedIndex={mentions.mentionSelectedIndex}
-              suggestions={mentions.isMentionOpen ? mentions.suggestions : []}
-            />
-            {media.uploadState.status === "error" ? (
-              <div className="mb-2 rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                Upload failed: {media.uploadState.message}
-                <button
-                  className="ml-2 underline"
-                  onClick={() => media.setUploadState({ status: "idle" })}
-                  type="button"
-                >
-                  Dismiss
-                </button>
-              </div>
-            ) : null}
 
             {(media.pendingImeta.length > 0 || media.isUploading) && (
               <div className="mb-2 flex items-center gap-2">
@@ -989,7 +982,14 @@ function MessageComposerImpl({
               layoutMode={layoutMode}
               composerDisabled={disabled}
               editor={richText.editor}
-              extraActions={toolbarExtraActions}
+              extraActions={
+                <MessageComposerDictationAction
+                  dictation={dictation}
+                  disabled={disabled}
+                >
+                  {toolbarExtraActions}
+                </MessageComposerDictationAction>
+              }
               formattingDisabled={disabled}
               isEmojiPickerOpen={isEmojiPickerOpen}
               isFormattingOpen={isFormattingOpen}

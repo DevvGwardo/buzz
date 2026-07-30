@@ -85,6 +85,7 @@ import { useIdentityQuery } from "@/shared/api/hooks";
 import { useRelayAutoHeal } from "@/shared/api/useRelayAutoHeal";
 import { useDeferredStartup } from "@/shared/hooks/useDeferredStartup";
 import { useWebviewScrollBoundaryLock } from "@/shared/hooks/useWebviewScrollBoundaryLock";
+import { useVoiceDictationShortcut } from "@/features/dictation";
 import { joinChannel } from "@/shared/api/tauri";
 import type { ChannelVisibility, SearchHit } from "@/shared/api/types";
 import { ChannelNavigationProvider } from "@/shared/context/ChannelNavigationContext";
@@ -151,6 +152,7 @@ export function AppShell() {
   });
   // Settings lives in history so back returns to the previous app entry.
   const settingsOpen = location.pathname === "/settings";
+  useVoiceDictationShortcut(settingsOpen);
   const locationSearchSection = (location.search as { section?: unknown })
     .section;
   const settingsSection: SettingsSection = isSettingsSection(
