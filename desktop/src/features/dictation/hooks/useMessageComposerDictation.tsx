@@ -67,8 +67,10 @@ export function useMessageComposerDictation({
       isStarting,
       isTranscribing,
     });
-    if (decision === "stop-recording") {
+    if (decision !== "send") {
       sendAfterTranscriptionRef.current = true;
+    }
+    if (decision === "stop-recording") {
       stopRecording();
     }
     return decision === "send";
