@@ -25,19 +25,35 @@ pub fn run_event_sync(app: &tauri::AppHandle, owner_keys: &nostr::Keys, db_path:
 /// `AppState::keys` mutex. The reconcile itself is still synchronous JSON,
 /// SQLite, and signing work, so it runs on the blocking pool rather than an
 /// async worker.
+///
+/// # Ordering: reconcile, then barrier, and both before the flush publishes
+///
+/// The reconcile marks changed coordinates `pending_sync = 1`; the boot barrier
+/// ([`crate::managed_agents::config_barrier::run_boot_barrier`]) then decides
+/// which of those may actually go out and gates the rest. Running the barrier
+/// after the reconcile is what lets it see the rows the reconcile just queued —
+/// the stale-store republish it exists to suppress is created right here. The
+/// flush loop's first tick is 30s of relay lookups away, so in practice the gate
+/// is set before anything publishes; if a flush did win the race, the barrier
+/// still gates every later sweep.
 pub fn spawn_event_sync(
     app: tauri::AppHandle,
     owner_keys: nostr::Keys,
     db_path: std::path::PathBuf,
 ) {
     tauri::async_runtime::spawn(async move {
+        let barrier_app = app.clone();
         if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
             run_event_sync(&app, &owner_keys, &db_path);
         })
         .await
         {
             eprintln!("buzz-desktop: event-sync: spawn_blocking failed: {e}");
+            // The barrier still runs: a failed reconcile leaves whatever rows
+            // a previous boot queued, and gating those is exactly the case the
+            // barrier exists for.
         }
+        crate::managed_agents::config_barrier::run_boot_barrier(&barrier_app).await;
     });
 }
 

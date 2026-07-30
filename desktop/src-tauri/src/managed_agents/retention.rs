@@ -208,6 +208,7 @@ pub fn open_retention_db(path: &Path) -> Result<Connection, String> {
             event_id TEXT,
             baseline_event_id TEXT,
             baseline_content TEXT,
+            publish_blocked INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (kind, pubkey, d_tag)
         );",
     )
@@ -480,12 +481,23 @@ pub fn get_retained_personas(
 /// deletion soft-deletes every live row at the coordinate with no timestamp
 /// comparison, so a tombstone published AFTER the replacement would wipe it.
 /// Within each group, oldest first for the same reason.
+///
+/// # The publication gate (V3.9)
+///
+/// `publish_blocked = 1` withholds a row from this list while leaving it
+/// retained. The boot pass sets it when it decides a coordinate must stop
+/// publishing — a head it cannot see, or a conflict parked for the user —
+/// and clearing `pending_sync` would be wrong for both: the local content is
+/// still the thing this device believes, and dropping the flag would lose that.
+/// Suppression therefore needs a state of its own, and this query is the single
+/// place it takes effect. Anything that bypasses this function bypasses the
+/// gate.
 pub fn get_pending_sync(conn: &Connection) -> Result<Vec<RetainedEvent>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync, event_id
              FROM persona_events
-             WHERE pending_sync = 1
+             WHERE pending_sync = 1 AND publish_blocked = 0
              ORDER BY (kind != 5), created_at ASC",
         )
         .map_err(|e| format!("failed to prepare pending sync query: {e}"))?;
@@ -507,6 +519,57 @@ pub fn get_pending_sync(conn: &Connection) -> Result<Vec<RetainedEvent>, String>
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("failed to read pending sync row: {e}"))
+}
+
+/// Every coordinate this owner has queued for publish, gated or not.
+///
+/// The boot barrier enumerates from disk, but a pending row can outlive its
+/// record: a deleted persona, a removed agent, or a kind-5 tombstone all leave
+/// a queued row with nothing on disk to enumerate. Those are precisely the rows
+/// that publish unsupervised, so the barrier unions this with its disk walk.
+///
+/// Tombstone rows are mapped back to the coordinate they target, since that is
+/// the coordinate the decision is about. Rows whose gate is already set are
+/// still returned: a gate must be re-decided each boot so suppression can lift
+/// once the condition that caused it is gone.
+pub fn pending_coordinates(conn: &Connection, pubkey: &str) -> Result<Vec<(u32, String)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, d_tag FROM persona_events
+             WHERE pending_sync = 1 AND pubkey = ?1",
+        )
+        .map_err(|e| format!("failed to prepare pending coordinate query: {e}"))?;
+
+    let rows = stmt
+        .query_map(params![pubkey], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("failed to query pending coordinates: {e}"))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (kind, d_tag) = row.map_err(|e| format!("failed to read pending coordinate: {e}"))?;
+        out.push(if kind == buzz_core_pkg::kind::KIND_DELETION {
+            match parse_tombstone_retention_d_tag(&d_tag) {
+                Some(target) => target,
+                // An unparseable tombstone key names no coordinate, so there is
+                // nothing to decide about. Skipped rather than guessed at.
+                None => continue,
+            }
+        } else {
+            (kind, d_tag)
+        });
+    }
+    Ok(out)
+}
+
+/// Recover the target coordinate from a tombstone row's retention key.
+///
+/// Inverse of [`tombstone_retention_d_tag`]. Splits once from the left because
+/// only the kind prefix is structural — a target d-tag may itself contain `:`.
+fn parse_tombstone_retention_d_tag(key: &str) -> Option<(u32, String)> {
+    let (kind, d_tag) = key.split_once(':')?;
+    Some((kind.parse().ok()?, d_tag.to_string()))
 }
 
 /// Clear the `pending_sync` flag for an event the relay just confirmed.
@@ -535,6 +598,114 @@ pub fn mark_synced(
     Ok(())
 }
 
+/// Drop a queued publish without touching the row's retained content.
+///
+/// Used by the boot pass for a queued event that publishes exactly what the
+/// baseline already says is published — a reconcile re-sign carrying no new
+/// intent. Such a row can never become publishable, so gating it would hold it
+/// forever; clearing the flag is the honest outcome.
+///
+/// Distinct from [`mark_synced`], which clears the flag on evidence the RELAY
+/// accepted those exact bytes. This clears it on evidence the relay already
+/// had them.
+pub fn clear_pending_sync(
+    conn: &Connection,
+    kind: u32,
+    pubkey: &str,
+    d_tag: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE persona_events SET pending_sync = 0
+         WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
+        params![kind, pubkey, d_tag],
+    )
+    .map_err(|e| format!("failed to clear pending sync: {e}"))?;
+
+    Ok(())
+}
+
+/// Withhold a coordinate from the flush loop without discarding its content.
+///
+/// Set when the boot pass decides a coordinate must stop publishing: a head it
+/// could not see (V3.10 suppression) or a conflict parked for the user (V3.6).
+/// The row keeps `pending_sync` and its content — this device still believes
+/// that content — but [`get_pending_sync`] will not hand it to the publisher.
+///
+/// Idempotent, and a no-op on a coordinate with no row: there is nothing to
+/// withhold until something is retained there.
+pub fn set_publish_blocked(
+    conn: &Connection,
+    kind: u32,
+    pubkey: &str,
+    d_tag: &str,
+    blocked: bool,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE persona_events SET publish_blocked = ?4
+         WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
+        params![kind, pubkey, d_tag, i32::from(blocked)],
+    )
+    .map_err(|e| format!("failed to set publish gate: {e}"))?;
+
+    Ok(())
+}
+
+/// The baseline recorded for a coordinate: what this install last agreed was
+/// published there.
+///
+/// Read as a unit because the two columns are only meaningful together — an
+/// id without content cannot be compared, and content without an id has no
+/// provenance. `None` means the baseline was never established.
+pub fn get_baseline(
+    conn: &Connection,
+    kind: u32,
+    pubkey: &str,
+    d_tag: &str,
+) -> Result<Option<(String, String)>, String> {
+    conn.query_row(
+        "SELECT baseline_event_id, baseline_content
+         FROM persona_events
+         WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
+        params![kind, pubkey, d_tag],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(|e| format!("failed to get baseline: {e}"))
+    // Both halves must be present: a row carrying only one is not a usable
+    // baseline and is treated as if none was recorded.
+    .map(|row| row.and_then(|(id, content)| Some((id?, content?))))
+}
+
+/// Record what this install now agrees is published at a coordinate.
+///
+/// Only the boot decision pass and the publish-confirmation path call this: a
+/// baseline is a claim about the RELAY's state, so it may only be stamped from
+/// an event that is actually on the relay — never from local disk content that
+/// has not been published.
+pub fn set_baseline(
+    conn: &Connection,
+    kind: u32,
+    pubkey: &str,
+    d_tag: &str,
+    baseline_event_id: &str,
+    baseline_content: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE persona_events
+         SET baseline_event_id = ?4, baseline_content = ?5
+         WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
+        params![kind, pubkey, d_tag, baseline_event_id, baseline_content],
+    )
+    .map_err(|e| format!("failed to set baseline: {e}"))?;
+
+    Ok(())
+}
+
 /// Delete a retained event by its coordinate.
 ///
 /// Called from the synchronous, lock-held delete-persona command body so the
@@ -555,6 +726,30 @@ pub fn delete_retained_event(
     .map_err(|e| format!("failed to delete retained event: {e}"))?;
 
     Ok(())
+}
+
+/// Whether a coordinate's row is currently withheld from the flush loop.
+///
+/// Test-only: production code never asks, because
+/// [`get_pending_sync`] applies the gate in SQL rather than filtering after
+/// the fact. Tests need to distinguish "withheld" from "no row at all", which
+/// a `get_pending_sync` count alone cannot.
+#[cfg(test)]
+pub fn is_publish_blocked(
+    conn: &Connection,
+    kind: u32,
+    pubkey: &str,
+    d_tag: &str,
+) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT publish_blocked FROM persona_events
+         WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
+        params![kind, pubkey, d_tag],
+        |row| row.get::<_, i32>(0),
+    )
+    .optional()
+    .map_err(|e| format!("failed to read publish gate: {e}"))
+    .map(|blocked| blocked == Some(1))
 }
 
 /// Check if the retention store has any persona events for the given pubkey.

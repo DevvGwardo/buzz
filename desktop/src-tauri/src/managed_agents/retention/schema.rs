@@ -13,6 +13,10 @@
 //!   published. This is what lets the boot pass tell "the user edited this
 //!   locally" from "this store never learned about the newer relay head",
 //!   instead of inferring intent from a content diff.
+//! - `publish_blocked` — the publication gate. A pending row is normally
+//!   published by the flush loop; a row the boot pass suppressed must stay
+//!   retained but unpublished, and there is no other state that expresses
+//!   "durable, but must not go out."
 //!
 //! # Crash and concurrency safety
 //!
@@ -27,10 +31,11 @@
 use rusqlite::{Connection, TransactionBehavior};
 
 /// Columns added after the initial `persona_events` shape.
-const ADDED_COLUMNS: [(&str, &str); 3] = [
+const ADDED_COLUMNS: [(&str, &str); 4] = [
     ("event_id", "TEXT"),
     ("baseline_event_id", "TEXT"),
     ("baseline_content", "TEXT"),
+    ("publish_blocked", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// Bring `persona_events` up to the current column set.
