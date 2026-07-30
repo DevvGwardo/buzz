@@ -112,7 +112,7 @@ because its enforcing mechanism is one small, boring thing — a refusal at
 payload construction (I1), a key-shape validator (I2), an ephemeral event
 the agent already publishes (I3), a deterministic name plus one annotation
 compare (I4), a timer that fires an existing shutdown channel (I5). The
-same rule holds below: the deploy state machine is one loop over six
+same rule holds below: the deploy state machine is one loop over seven
 ordered rows; the Secret scheme is "unique name, write first, reference
 exactly"; GC is one label-select with two filters (annotation, same-clock
 age). Where
@@ -547,7 +547,8 @@ observation; on any conflict, *re-enter from step 1* rather than fail:
 | terminated (Succeeded/Failed) | delete residue, wait for disappearance, re-enter (→ create) | the **normal restart path**: how a user revives a reaped or shut-down agent |
 | live and **started** (harness container running) | **strict no-op; return existing `agent_id`** | Start must never silently kill a live agent mid-turn; "already running" is the honest answer, consistent with I3 |
 | exists but **never started**, provably non-recoverable — referenced Secret confirmed absent (by a consistent read, below), or invalid image reference | delete (preconditioned, below), wait for disappearance, re-enter (→ create) | a pod whose harness never ran is not a live agent: nothing can be killed mid-turn (I3), it never held the identity (I4), auto-stop cannot bound it (I5's reaper lives in the harness), and no-op'ing it would return a permanently inert instance as success on every future Start. "Provably" means the provider verified the referenced object's absence or the spec-level defect itself — never a reason string alone |
-| exists, **never started**, recoverable — self-healable startup states: `Unschedulable` (scale-from-zero autoscaling), image pull / `ImagePullBackOff`, transient `CreateContainerConfigError` | observe until started or the operation deadline expires, then return the latest redacted condition — **never delete, on this call or any later one** | these states routinely self-heal — an autoscaler provisions the node, the pull retries, the kubelet re-resolves the Secret (it retries a never-created container regardless of `restartPolicy`). And recoverable-timeout MUST stay observational *across calls*: any finite pod-age threshold can collide with the cluster's own pod-age thresholds (Cluster Autoscaler's `--new-pod-scale-up-delay` / per-pod `pod-scale-up-delay` annotation — the FAQ's example is `"600s"`), and delete-recreate resets exactly the age the autoscaler keys on, converting a slow cold start into a livelock in which every individual decision is correct. A later deploy re-reads: started → strict no-op; still recoverable → observe under the new call's deadline without resetting pod age; provably non-recoverable → the row above. A permanently unschedulable pod persisting until operator action is the honest cost — a generic provider cannot know when an autoscaler will act, and M1 already makes substrate residue the operator's boundary |
+| exists, **never started**, recoverable, **fingerprint matches** current desired create intent (below) — self-healable startup states: `Unschedulable` (scale-from-zero autoscaling), image pull / `ImagePullBackOff`, transient `CreateContainerConfigError` | observe until started or the operation deadline expires, then return the latest redacted condition — **never delete, on this call or any later one** | these states routinely self-heal — an autoscaler provisions the node, the pull retries, the kubelet re-resolves the Secret (it retries a never-created container regardless of `restartPolicy`). And recoverable-timeout MUST stay observational *across calls*: any finite pod-age threshold can collide with the cluster's own pod-age thresholds (Cluster Autoscaler's `--new-pod-scale-up-delay` / per-pod `pod-scale-up-delay` annotation — the FAQ's example is `"600s"`), and delete-recreate resets exactly the age the autoscaler keys on, converting a slow cold start into a livelock in which every individual decision is correct. A later deploy re-reads: started → strict no-op; still recoverable and same intent → observe under the new call's deadline without resetting pod age; provably non-recoverable → the non-recoverable row. Repeated **identical** Starts can therefore never delete anything, whatever the pod's age — a genuinely slow cluster persists until it heals or an operator acts, and M1 already makes substrate residue the operator's boundary |
+| exists, **never started**, recoverable, **fingerprint differs or absent** — the recorded create-intent fingerprint does not match what *this* deploy would create | delete (preconditioned, below), wait for disappearance, re-enter (→ create) | this is not the same generation the user is waiting on — it is a pod built from configuration the user has since *changed*, and without this row the change can never materialize: the pod name is deterministic, GC only reaps terminated pods, Stop needs a live harness, I5's reaper lives in the harness, and there is no `undeploy` — so a never-started pod wedged by its own config (a `memory_request` no node satisfies, a quota-blocked namespace) would swallow every future edit while reporting only "startup not confirmed", indistinguishable from a slow cluster. Divergence is evidence, not a clock: age resets only on a user-initiated config change, which genuinely is a new pod spec — no threshold exists to collide with the autoscaler. A **started** pod is never touched by this row: live → strict no-op regardless of divergence (edits reach it via the documented next-generation consequence) |
 
 **Startup is part of create — phase is not readiness.** `Pending` (and even
 `Running` at the pod level) does not mean the harness started: a pod can sit
@@ -561,10 +562,11 @@ error carrying the actionable condition (the container waiting `reason` /
 pod condition), not a generic timeout. "Live" in the no-op row above means
 **started**, for the same reason — this is the lesson ephemeral-runner
 controllers learned upstream (inspect container state, not pod phase).
-Classification MUST combine container state, pod conditions, and
-referenced-object existence — **reason strings alone are not a
+Classification MUST combine container state, pod conditions,
+referenced-object existence, and the recorded create-intent fingerprint —
+**reason strings alone are not a
 stable fatality taxonomy**, and pod age is never one (age triggers nothing
-destructive; see the recoverable row and the controlled-view rule below).
+destructive; see the recoverable rows and the controlled-view rule below).
 In particular, `Unschedulable` is not fatal: a
 scale-from-zero pod reports it while the autoscaler provisions capacity,
 and the kubelet retries a container that never got a container status
@@ -579,7 +581,8 @@ fresh node, scale-from-zero scheduling, all of it. But the deadline bounds
 **how long one Start waits synchronously**, nothing more. Deadline expiry
 on a still-progressing startup is reported as "startup not confirmed within
 the deadline", and MUST NOT trigger cleanup or forced recycle — on this
-call *or any later one* (the recoverable row above): the next deploy's
+call *or any later one* (the recoverable rows above — what replaces a
+never-started pod is a *config change*, never a deadline): the next deploy's
 reconciler observes whatever the startup became and takes the matching row,
 preserving the pod's `creationTimestamp` for whatever cluster machinery
 keys on it. Whether ten minutes fits the intended cluster class is a
@@ -605,10 +608,60 @@ instance. The other two live here:
   authorized by a classification MUST carry `preconditions.uid` **and**
   `preconditions.resourceVersion` from that exact observation
   (`metav1.Preconditions` supports both), making the edge a
-  compare-and-delete. A failed precondition (409) is neither an error nor
+  compare-and-delete. A failed precondition is neither an error nor
   permission to retry the delete: re-enter from step 1 and classify the
   object that exists now. The full-pubkey annotation check remains — the
   precondition pins *when*, the annotation pins *whose*.
+
+**The 409 discriminator is `Status.reason`, never the status code
+(normative).** Two rules in this section require *opposite* actions on
+the same HTTP status: a failed delete precondition and a create-conflict
+are **both 409** (`NewConflict` and `NewAlreadyExists` each carry
+`Code: http.StatusConflict` — `apimachinery/pkg/api/errors/errors.go`).
+The discriminator is the Kubernetes API `Status.reason` field:
+`Conflict` → abandon the delete and re-enter from step 1;
+`AlreadyExists` on create → the convergence rule below (clean up only the
+losing attempt's Secret, re-read, adopt the winner). An implementation
+that branches on the code alone will eventually take the adoption path on
+a failed delete or vice versa. This does not contradict the
+reason-strings warning above: API `Status.reason` is a machine-readable
+contract token defined by `metav1.Status`; *container waiting* reasons
+are kubelet-produced strings with no such contract — the spec distrusts
+the latter, not the former.
+
+**Create-intent fingerprint (normative).** The divergence discriminator
+in the never-started rows is a recorded annotation,
+`buzz.block.xyz/create-intent`, written at pod create — the same shape as
+the image-reference and pubkey annotations the pod already carries. Its
+value is an **unkeyed SHA-256** over a canonical serialization of the
+provider's **non-secret create-intent template**, computed *before* the
+create call. The scope rule that makes a plain hash safe: the input
+covers exactly the provider-controlled fields that can affect scheduling
+or container creation — resolved image reference, resource
+requests/limits, service account, PodSpec command/args, volumes/mounts,
+security context, and the provider's other pod-shape knobs — and **never
+Secret data or attempt identity**. Secret *values* cannot cause the
+never-started wedge this discriminator exists to clear (scheduling reads
+pod fields, not Secret values; a bad launch value produces a started
+container that fails at the relay — a different row), so hashing them
+buys nothing and a plain hash over low-entropy secrets published in a
+world-readable annotation would be a dictionary oracle; excluding them
+removes the oracle and with it any need for an HMAC key or nsec-derived
+key material. Two normalization requirements, or every attempt diverges
+by construction: the per-attempt Secret *name* in `envFrom` MUST be
+replaced by a fixed placeholder (or the pre-binding template serialized
+instead of the concrete PodSpec), and API metadata / server- and
+admission-produced output (UID, `resourceVersion`, timestamps, defaulted
+fields, the fingerprint annotation itself) is excluded structurally —
+the serializer never sees it, an invariant checkable by inspection.
+Comparison is always recorded-annotation vs freshly-computed intent,
+**never** a diff against the live pod spec: admission defaulting and
+mutation would make every pod look divergent, which is why the
+fingerprint is computed pre-create. A missing referenced Secret stays
+handled by the most-recent absence check (the non-recoverable row), not
+by fingerprint divergence; and divergence authorizes deletion only
+through the never-started recoverable row — a started pod is strict
+no-op whatever its fingerprint says.
 
 **No-op means zero mutation.** The live-instance row MUST NOT replace or
 patch the Secret, patch metadata, or delete anything belonging to the
@@ -624,7 +677,14 @@ would — cleaning up only its own losing attempt's residue, never the
 winner's (the Kubernetes binding makes this concrete via per-attempt Secret
 names, §K8s Secrets); it MUST treat delete-not-found as success; and it
 MUST loop until a
-stable outcome or the operation deadline (600s) expires. Without this rule,
+stable outcome or the operation deadline (600s) expires. One deliberate
+asymmetry: the **create loser does not apply the fingerprint-divergence
+row to the pod that just beat it**, even when the winner's fingerprint
+differs from its own intent — it adopts or reconciles the elected winner.
+Two contenders with different payloads would otherwise ping-pong deletes
+through the conflict path. A *subsequent* deploy that walks in and
+observes that never-started divergent winner replaces it normally.
+Without this rule,
 "two deploys return an `agent_id`" (the idempotency claim below) is false
 under concurrency.
 
@@ -633,7 +693,11 @@ running remote agent do not take effect until it next exits (unlike local
 agents, which re-resolve on every spawn). This is an accepted v1 tradeoff;
 a deliberate "recycle" affordance (stop-then-start) is the v2 path to
 immediate application. [DECISION — default is no-op; owner may overrule
-toward forcible recycle.]
+toward forcible recycle.] Note the asymmetry is deliberate and points the
+right way: an edit *cannot* reach a started pod until it exits, but it
+*can* reach a never-started one immediately (fingerprint divergence) —
+the never-started pod is the one the user is editing *because* it did not
+start.
 
 Idempotency in the protocol sense: any number of concurrent or sequential
 `deploy`s with the same payload converge to one live instance, and every
@@ -854,6 +918,10 @@ regardless of `HOME`.
     **load-bearing**: per §Deploy State Machine step 1, every label-selected
     object's annotation MUST equal the derived pubkey before the provider
     no-ops against it, deletes it, mutates its Secret, or returns its name
+  - annotation `buzz.block.xyz/create-intent: <sha256-of-intent-template>` — the
+    recorded create intent (§Deploy State Machine, create-intent
+    fingerprint), written at pod create; the divergence discriminator for
+    never-started pods
   - Secret name: `buzz-agent-<first-12-hex>-<gen>`, where `<gen>` is a random
     per-create-attempt **generation token** — unique, never reused, carrying
     the same label and annotation. The pod's `envFrom` references this exact
@@ -1086,10 +1154,13 @@ A provider is conforming iff:
    annotation before any action, live (= **started**, §Deploy State
    Machine) → strict no-op (zero mutation), never-started states
    classified by evidence not reason strings (provably-broken →
-   preconditioned delete-recreate; recoverable → observe, never delete,
-   on this call or any later one), destructive reads consistent and
+   preconditioned delete-recreate; recoverable + same create-intent
+   fingerprint → observe, never delete, on this call or any later one;
+   recoverable + divergent fingerprint → preconditioned delete-recreate),
+   destructive reads consistent and
    destructive deletes UID+resourceVersion-preconditioned (§Deploy State
-   Machine controlled-view rule), success only on confirmed container
+   Machine controlled-view rule), 409s discriminated by `Status.reason`,
+   success only on confirmed container
    start, conflicts converge by re-entry, delete-not-found is success.
 5. The deployed harness invocation enables an inactivity bound (I5) and the
    substrate does not resurrect terminated instances.
@@ -1114,7 +1185,7 @@ MUST NOT redirect the nsec (both cases are exactly what path+metadata
 comparison misses) — and an envtest/kind suite
 can drive item 4's reconciler against a real apiserver — concurrent
 deploys, a deletion-marked pod, terminal restart, an annotation-mismatch
-collision, and SIGTERM→presence-offline for items 5–6. Two families of
+collision, and SIGTERM→presence-offline for items 5–6. Three families of
 cases are mandatory because they were the review-found failure modes:
 **startup discrimination** (slow-but-valid scheduling → poll-then-succeed;
 `Unschedulable` during scale-from-zero → observed until the autoscaler
@@ -1135,7 +1206,27 @@ NOT delete Secret A — the §K8s GC age gate under test; provider death after
 Secret create → the age gate protects, then a later GC reaps; and a
 **provider local clock fast beyond the margin** MUST NOT delete an
 in-flight Secret — cheap with a fake clock, and the same-clock rule's
-skip-on-absent-`Date` arm is exercised by stripping the header). A model checker is
+skip-on-absent-`Date` arm is exercised by stripping the header). A third
+family pins the **divergence discriminator and the 409 split**: a failed
+delete precondition (code 409, reason `Conflict`) → re-read and
+re-classify, never the create-conflict cleanup/adoption path; a create
+conflict (code 409, reason `AlreadyExists`) → loser-Secret cleanup and
+winner adoption, never treated as a failed delete; identical desired
+intent + permanently-Pending pod → no delete across arbitrarily many
+Starts, regardless of age; a resource/image correction against a
+never-started pod → fingerprint differs, preconditioned
+delete-and-recreate (the wedge-escape case); the same correction against
+a **started** pod → strict zero-mutation no-op; admission
+defaulting/mutating the live pod → no false divergence (the comparison
+uses the recorded annotation); the fingerprint serializer property,
+asserted structurally — changing only Secret *values* or the generated
+Secret *name* leaves the fingerprint unchanged, changing any
+fingerprinted pod-create field changes it (equivalently: the serializer
+has no access to Secret data or attempt identity); and the
+conflict-path asymmetry — two no-instance contenders with different
+payloads: the create loser adopts the elected winner rather than
+deleting it for divergence, while a subsequent deploy observing that
+never-started divergent winner replaces it. A model checker is
 the wrong tool here: the failure modes found in review were wrong
 *abstractions of Kubernetes* (a nonexistent `Terminating` phase, non-atomic
 delete, phase-as-readiness, non-atomic Secret→pod against GC), which a
@@ -1256,6 +1347,14 @@ Marked `[DECISION]` inline; consolidated:
   adopts the now-running pod", not a livelock). The remaining SLO ruling
   is UX-only: is ten minutes of synchronous waiting the right ceiling for
   the intended cluster class?
+- **I. Never-started escape hatch** — the create-intent fingerprint
+  (§Deploy State Machine) lets a config *change* replace a never-started
+  pod, closing the config wedge. The open ruling: is divergence-triggered
+  replacement enough, or does v1 owe users an explicit in-product "clear
+  this stuck deployment" affordance for a never-started pod whose config
+  they have *not* changed (a genuinely slow or broken cluster)? Both
+  reviewers agree on the mechanism; this is the remaining product
+  question layered on top of it.
 
 ## Summary
 
