@@ -220,14 +220,27 @@ is worthless if nothing checks it before the nsec crosses the trust
 boundary — and at `c1bca1b56` nothing does: `provider_deploy` invokes
 `deploy` directly, so a stale UI-time probe (or a binary replaced on PATH
 since that probe) can receive `private_key_nsec` unchecked (Known Defect
-5). The deploy path MUST: resolve the provider id **once**; invoke `info`
-on that resolved executable; validate a compatible `protocol_version`; then
-invoke `deploy` on the **same executable identity** — at minimum the same
-canonical path with unchanged stable file identity/metadata (dev/inode or
-equivalent, size, mtime) between the two invocations, failing or
-re-prompting on any change. A UI-time probe result MUST NOT satisfy this
-gate. Remembered digest-based approval (Terraform-lock style) is a stronger
-follow-up, not a v1 requirement.
+5). The deploy path MUST: resolve the provider id **once**; copy the
+resolved candidate into a desktop-owned, private, non-writable **staging
+file**, computing its digest during the copy; invoke `info` **on the
+staged artifact**; validate an explicit, supported `protocol_version`
+(§Info — absence is an error); invoke `deploy` on the **same staged
+artifact**; delete it afterward. Staged bytes are what "same executable
+identity" means here: the nsec goes to the exact bytes that answered
+`info`. Path-plus-metadata comparison (dev/inode, size, mtime) is NOT an
+acceptable substitute for this guarantee — unchanged metadata can miss an
+in-place content rewrite, and a pathname can be swapped between the check
+and the moment `Command` opens it, which is precisely the
+check-then-exec race the gate exists to close. A UI-time probe result
+MUST NOT satisfy this gate. If a platform makes staged execution
+impossible for some provider (e.g. an executable that only runs from its
+install location due to relative dependencies or signing constraints),
+the implementation MUST NOT silently fall back to metadata and still
+claim this gate: it degrades explicitly to *accidental-replacement
+detection* (path + file-identity compare), surfaces that weaker level in
+the deploy diagnostics, and the spec text for that platform carries the
+narrower claim. Remembered digest-based approval (Terraform-lock style)
+is a stronger follow-up, not a v1 requirement.
 
 ### Invocation
 
@@ -272,8 +285,11 @@ wire-contract version, following the pattern Docker's CLI plugins
 converged on: the desktop rejects a provider whose `protocol_version` it
 does not speak, with an error naming both versions and the binary path,
 instead of failing later inside a half-understood `deploy`. A missing
-`protocol_version` is treated as `1` for exactly one major cycle, then
-becomes an error.
+`protocol_version` is an **error, not a presumed `1`**: there is no
+deployed provider population to grandfather, and a gate that infers
+compatibility for exactly the class of binary that never declared any
+defeats its own pre-secret guarantee (§Discovery). Fail closed — it is
+also simpler: no migration clock, no "major cycle" to define.
 
 `config_schema` drives the UI form: `properties[*].default` prefill,
 string/number/boolean coercion, `required` gating. A provider MAY compute
@@ -1087,10 +1103,15 @@ A provider is conforming iff:
 
 Conformance is testable without mechanization: a fake-provider harness can
 exercise items 1–3 and 7 over the wire contract — including the pre-secret
-negotiation gate (§Discovery): an incompatible `protocol_version` MUST be
-rejected before any request carrying `private_key_nsec` is sent, and an
-executable replaced between the deploy-path `info` and `deploy` MUST fail
-the same-identity check rather than receive the nsec — and an envtest/kind suite
+negotiation gate (§Discovery): an incompatible **or absent**
+`protocol_version` MUST be rejected before any request carrying
+`private_key_nsec` is sent; a **same-inode content rewrite** of the
+resolved binary after resolution MUST NOT reach the deploy invocation
+(the staged artifact still carries the bytes that answered `info`); and a
+**pathname swap after validation** — the resolved path re-pointed at a
+different file between the gate's checks and process spawn — likewise
+MUST NOT redirect the nsec (both cases are exactly what path+metadata
+comparison misses) — and an envtest/kind suite
 can drive item 4's reconciler against a real apiserver — concurrent
 deploys, a deletion-marked pod, terminal restart, an annotation-mismatch
 collision, and SIGTERM→presence-offline for items 5–6. Two families of
@@ -1176,8 +1197,8 @@ Desktop- and harness-side, discovered during this design:
    `deploy` request without any preceding `info` on the same resolved
    executable; §Discovery's pre-secret negotiation gate is a design, not a
    description, until the deploy command performs
-   resolve-once → `info` → compatibility check → `deploy` on the same
-   executable identity.
+   resolve-once → stage-and-digest → `info` → explicit-version check →
+   `deploy`, both invocations running the staged bytes.
 
 ## Implementation Correspondence
 
@@ -1185,7 +1206,7 @@ Desktop- and harness-side, discovered during this design:
 |---|---|
 | Discovery, resolution rule | `desktop/src-tauri/src/managed_agents/backend.rs` (`discover_provider_candidates`, `resolve_provider_binary`) |
 | Invocation, output caps, exit rule | `backend.rs` (`invoke_provider`) |
-| Pre-secret negotiation gate | *to be added*: `backend.rs` deploy path — resolve-once → `info` → version check → same-identity `deploy` (Known Defect 5) |
+| Pre-secret negotiation gate | *to be added*: `backend.rs` deploy path — resolve-once → stage-and-digest → `info` → explicit-version check → `deploy` on the staged bytes (Known Defect 5) |
 | Redaction | `backend.rs` (`redact_secrets_with`) |
 | I2 validation | `backend.rs` (`validate_provider_config`) |
 | I1 refusal, payload | `desktop/src-tauri/src/commands/agents_deploy.rs` |
