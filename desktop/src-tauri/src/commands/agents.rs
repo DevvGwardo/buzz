@@ -875,6 +875,7 @@ pub async fn create_managed_agent(
                 input.start_on_app_launch
             },
             auto_restart_on_config_change: true,
+            resume_on_restart: true,
             runtime_pid: None,
             backend: input.backend.clone(),
             backend_agent_id: None,

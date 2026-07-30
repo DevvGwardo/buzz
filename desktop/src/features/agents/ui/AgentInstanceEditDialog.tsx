@@ -23,7 +23,10 @@ import { Button } from "@/shared/ui/button";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
-import { setManagedAgentAutoRestart } from "@/shared/api/tauriManagedAgents";
+import {
+  setManagedAgentAutoRestart,
+  setManagedAgentResumeOnRestart,
+} from "@/shared/api/tauriManagedAgents";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
 import {
   AUTO_PROVIDER_DROPDOWN_VALUE,
@@ -144,6 +147,9 @@ export function AgentInstanceEditDialog({
   const [envVars, setEnvVars] = React.useState<EnvVarsValue>(agent.envVars);
   const [autoRestartOnConfigChange, setAutoRestartOnConfigChange] =
     React.useState(agent.autoRestartOnConfigChange);
+  const [resumeOnRestart, setResumeOnRestart] = React.useState(
+    agent.resumeOnRestart,
+  );
   const personasQuery = usePersonasQuery();
   const linkedPersona = React.useMemo(
     () =>
@@ -193,6 +199,7 @@ export function AgentInstanceEditDialog({
       setIsCustomProviderEditing(false);
       setEnvVars(agent.envVars);
       setAutoRestartOnConfigChange(agent.autoRestartOnConfigChange);
+      setResumeOnRestart(agent.resumeOnRestart);
       setRespondTo(agent.respondTo);
       setRespondToAllowlist(agent.respondToAllowlist);
       setAvatarUrl(agent.avatarUrl ?? "");
@@ -734,6 +741,9 @@ export function AgentInstanceEditDialog({
           autoRestartOnConfigChange,
         );
       }
+      if (resumeOnRestart !== agent.resumeOnRestart) {
+        await setManagedAgentResumeOnRestart(agent.pubkey, resumeOnRestart);
+      }
       showAgentProfileSyncWarning(result.agent.name, result.profileSyncError);
       handleOpenChange(false);
       onUpdated?.(result.agent);
@@ -1200,6 +1210,7 @@ export function AgentInstanceEditDialog({
                       parallelism={parallelism}
                       provider={effectiveProvider}
                       requiredEnvKeys={advancedRequiredEnvKeys}
+                      resumeOnRestart={resumeOnRestart}
                       systemPrompt={systemPrompt}
                       onAcpCommandChange={setAcpCommand}
                       onAgentArgsChange={setAgentArgs}
@@ -1207,6 +1218,7 @@ export function AgentInstanceEditDialog({
                       onEnvVarsChange={setEnvVars}
                       onInheritHarnessChange={setInheritHarness}
                       onParallelismChange={setParallelism}
+                      onResumeOnRestartChange={setResumeOnRestart}
                       onSystemPromptChange={setSystemPrompt}
                     />
                   </motion.div>

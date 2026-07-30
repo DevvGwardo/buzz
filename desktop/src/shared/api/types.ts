@@ -371,6 +371,11 @@ export type ManagedAgent = {
   logPath: string;
   startOnAppLaunch: boolean;
   autoRestartOnConfigChange: boolean;
+  /**
+   * Resume interrupted turns after a harness restart. Maps to
+   * `buzz-acp --resume-on-restart`; default on.
+   */
+  resumeOnRestart: boolean;
   backend: ManagedAgentBackend;
   backendAgentId: string | null;
   /** Who the agent should respond to. Maps to `buzz-acp --respond-to`. */

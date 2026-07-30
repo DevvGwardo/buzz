@@ -252,6 +252,7 @@ fn record_with(
         persona_source_version: None,
         start_on_app_launch: false,
         auto_restart_on_config_change: true,
+        resume_on_restart: true,
         runtime_pid: None,
         backend: Default::default(),
         backend_agent_id: None,

@@ -335,6 +335,7 @@ pub fn build_managed_agent_summary(
         last_error_code: record.last_error_code,
         start_on_app_launch: record.start_on_app_launch,
         auto_restart_on_config_change: record.auto_restart_on_config_change,
+        resume_on_restart: record.resume_on_restart,
         log_path,
         respond_to: record.respond_to,
         respond_to_allowlist: record.respond_to_allowlist.clone(),
@@ -725,6 +726,13 @@ pub fn spawn_agent_child(
 
     if let Some(max_dur) = record.max_turn_duration_seconds {
         command.env("BUZZ_ACP_MAX_TURN_DURATION", max_dur.to_string());
+    }
+    // Emitted only when the toggle is OFF, so the harness default stays the
+    // source of truth when ON — same rationale as BUZZ_ACP_IDLE_TIMEOUT above.
+    // The key is not reserved, so a user setting it in the env-vars editor wins
+    // (descriptor.env is written last; see the user-env block below).
+    if !record.resume_on_restart {
+        command.env("BUZZ_ACP_RESUME_ON_RESTART", "false");
     }
     command.env("BUZZ_ACP_AGENTS", record.parallelism.to_string());
     command.env("BUZZ_ACP_MULTIPLE_EVENT_HANDLING", "steer");

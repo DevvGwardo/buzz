@@ -28,6 +28,7 @@ export function EditAgentAdvancedFields({
   parallelism,
   provider,
   requiredEnvKeys,
+  resumeOnRestart,
   systemPrompt,
   onAcpCommandChange,
   onAgentArgsChange,
@@ -35,6 +36,7 @@ export function EditAgentAdvancedFields({
   onInheritHarnessChange,
   onParallelismChange,
   onAutoRestartChange,
+  onResumeOnRestartChange,
   onSystemPromptChange,
 }: {
   acpCommand: string;
@@ -61,6 +63,7 @@ export function EditAgentAdvancedFields({
   /** Active LLM provider id — forwarded to BuzzAgentModelTuningFields for effort filtering. */
   provider?: string;
   requiredEnvKeys: readonly string[];
+  resumeOnRestart: boolean;
   systemPrompt: string;
   onAcpCommandChange: (value: string) => void;
   onAgentArgsChange: (value: string) => void;
@@ -68,6 +71,7 @@ export function EditAgentAdvancedFields({
   onInheritHarnessChange: (value: boolean) => void;
   onParallelismChange: (value: string) => void;
   onAutoRestartChange: (value: boolean) => void;
+  onResumeOnRestartChange: (value: boolean) => void;
   onSystemPromptChange: (value: string) => void;
 }) {
   return (
@@ -115,6 +119,27 @@ export function EditAgentAdvancedFields({
           {autoRestartOnConfigChange
             ? "Restarts this agent automatically when its configuration changes, once it is idle and connected."
             : "Configuration changes only show the restart badge; restart manually to apply them."}
+        </p>
+      </div>
+
+      {/* Resume interrupted turns after restart (BUZZ_ACP_RESUME_ON_RESTART) */}
+      <div className="space-y-1.5">
+        <label
+          className="flex items-center gap-2 text-sm font-medium"
+          htmlFor="edit-agent-resume-on-restart"
+        >
+          <input
+            checked={resumeOnRestart}
+            id="edit-agent-resume-on-restart"
+            onChange={(event) => onResumeOnRestartChange(event.target.checked)}
+            type="checkbox"
+          />
+          Resume interrupted turns after restart
+        </label>
+        <p className="text-xs text-muted-foreground">
+          {resumeOnRestart
+            ? "Picks up turns that were still running when this agent last stopped, after a crash, restart, or app update."
+            : "Turns interrupted by a crash, restart, or app update are dropped and never picked up."}
         </p>
       </div>
 

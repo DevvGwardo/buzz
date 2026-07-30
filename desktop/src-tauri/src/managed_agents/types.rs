@@ -122,6 +122,7 @@ impl AgentDefinition {
             env_vars: self.env_vars,
             start_on_app_launch: false,
             auto_restart_on_config_change: true,
+            resume_on_restart: true,
             runtime_pid: None,
             backend: BackendKind::default(),
             backend_agent_id: None,
@@ -314,6 +315,10 @@ pub struct ManagedAgentRecord {
     /// frontend only fires when the agent is idle, connected, and local.
     #[serde(default = "default_auto_restart_on_config_change")]
     pub auto_restart_on_config_change: bool,
+    /// Replay the durable pending-turn ledger on harness boot so a crash or app
+    /// update does not drop in-flight work (`BUZZ_ACP_RESUME_ON_RESTART`).
+    #[serde(default = "default_resume_on_restart")]
+    pub resume_on_restart: bool,
     #[serde(default)]
     pub runtime_pid: Option<u32>,
     #[serde(default)]
@@ -563,6 +568,7 @@ pub struct ManagedAgentSummary {
     pub last_error_code: Option<i64>,
     pub start_on_app_launch: bool,
     pub auto_restart_on_config_change: bool,
+    pub resume_on_restart: bool,
     pub log_path: String,
     pub respond_to: RespondTo,
     pub respond_to_allowlist: Vec<String>,
@@ -822,6 +828,10 @@ fn default_start_on_app_launch() -> bool {
 }
 
 fn default_auto_restart_on_config_change() -> bool {
+    true
+}
+
+fn default_resume_on_restart() -> bool {
     true
 }
 
