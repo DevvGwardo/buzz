@@ -112,9 +112,10 @@ because its enforcing mechanism is one small, boring thing — a refusal at
 payload construction (I1), a key-shape validator (I2), an ephemeral event
 the agent already publishes (I3), a deterministic name plus one annotation
 compare (I4), a timer that fires an existing shutdown channel (I5). The
-same rule holds below: the deploy state machine is one loop over six
+same rule holds below: the deploy state machine is one loop over seven
 ordered rows; the Secret scheme is "unique name, write first, reference
-exactly"; GC is one label-select with two filters (annotation, age). Where
+exactly"; GC is one label-select with two filters (annotation, same-clock
+age). Where
 a richer property would have demanded machinery — Leases, controllers,
 ownerReferences, a management channel — the spec either found a
 name-and-timestamp argument that makes the machinery unnecessary or
@@ -501,8 +502,9 @@ observation; on any conflict, *re-enter from step 1* rather than fail:
 | no instance | create, then verify startup (below) | first deploy / after GC |
 | terminated (Succeeded/Failed) | delete residue, wait for disappearance, re-enter (→ create) | the **normal restart path**: how a user revives a reaped or shut-down agent |
 | live and **started** (harness container running) | **strict no-op; return existing `agent_id`** | Start must never silently kill a live agent mid-turn; "already running" is the honest answer, consistent with I3 |
-| exists but **never started** — fatal startup condition (`ImagePullBackOff`, `ErrImagePull`, `CreateContainerConfigError`, `Unschedulable`) or startup age beyond bound | delete, wait for disappearance, re-enter (→ create) | a pod whose harness never ran is not a live agent: nothing can be killed mid-turn, auto-stop cannot bound it (I5's reaper lives in the harness), and no-op'ing it would return a permanently inert instance as success on every future Start |
-| exists, starting, within bound (scheduling, pulling) | poll until started or the operation deadline expires, then the corresponding row | a slow-but-valid startup must not be fought by a concurrent deploy deleting it |
+| exists but **never started**, provably non-recoverable — referenced Secret confirmed absent, or invalid image reference | delete, wait for disappearance, re-enter (→ create) | a pod whose harness never ran is not a live agent: nothing can be killed mid-turn (I3), it never held the identity (I4), auto-stop cannot bound it (I5's reaper lives in the harness), and no-op'ing it would return a permanently inert instance as success on every future Start. "Provably" means the provider verified the referenced object's absence or the spec-level defect itself — never a reason string alone |
+| exists but **never started**, encountered by a *later* deploy past the startup bound — pod's server `creationTimestamp` older than the operation deadline (same-clock rule, §K8s GC) | delete, wait for disappearance, re-enter (→ create) | its own deploy's startup budget is exhausted; whatever it was waiting for did not come. Age, measured on the apiserver's clock, is the fatality discriminator that reason strings cannot be |
+| exists, **never started**, within bound — self-healable startup states: `Unschedulable` (scale-from-zero autoscaling), image pull / `ImagePullBackOff`, transient `CreateContainerConfigError` | observe until started or the operation deadline expires, then report the latest redacted condition | these states routinely self-heal — an autoscaler provisions the node, the pull retries, the kubelet re-resolves the Secret (it retries a never-created container regardless of `restartPolicy`). Immediate delete/recreate would thrash on transient registry or capacity delays and defeat the cold-start budget |
 
 **Startup is part of create — phase is not readiness.** `Pending` (and even
 `Running` at the pod level) does not mean the harness started: a pod can sit
@@ -516,6 +518,16 @@ error carrying the actionable condition (the container waiting `reason` /
 pod condition), not a generic timeout. "Live" in the no-op row above means
 **started**, for the same reason — this is the lesson ephemeral-runner
 controllers learned upstream (inspect container state, not pod phase).
+Classification MUST combine container state, pod conditions,
+referenced-object existence, and pod age — **reason strings alone are not a
+stable fatality taxonomy**. In particular, `Unschedulable` is not fatal: a
+scale-from-zero pod reports it while the autoscaler provisions capacity,
+and the kubelet retries a container that never got a container status
+regardless of `restartPolicy: Never` (`ShouldContainerBeRestarted` returns
+true for a nil status *before* the restart-policy check —
+`kubelet/container/helpers.go`), which is exactly why a briefly-missing
+Secret self-heals. `restartPolicy: Never` suppresses restarting a container
+that ran and died; it says nothing about one that never started.
 A consequence to state plainly: once success includes container start, the
 600s operation deadline **is** the cold-start budget — image pull on a
 fresh node, scale-from-zero scheduling, all of it. Deadline expiry on a
@@ -894,7 +906,9 @@ gate, GC composes with per-attempt Secrets into a legal interleaving that
 strands a deploy: attempt A creates Secret A; concurrent attempt B runs its
 preflight GC *before A creates its pod*, sees Secret A unreferenced, and
 deletes it as an "orphan"; A's pod is then accepted referencing a missing
-Secret and sits in `CreateContainerConfigError` forever. Unique Secret
+Secret and sits in `CreateContainerConfigError` until a later deploy
+repairs it by delete-recreate (§Deploy State Machine never-started rows) —
+a stranded deploy either way. Unique Secret
 names made payload↔Secret atomic *at the pod-spec boundary*, but
 Secret-create→pod-create is not atomic against an independent GC pass —
 the standard controller lesson that observations may be stale and
@@ -905,20 +919,46 @@ immediate cleanup of **its own** Secret is exempt — ownership, not age, is
 its safety argument. (A Lease per agent identity would also close this
 race; the age gate achieves the same with no extra machinery.)
 
-**Alternative considered — `ownerReferences`, rejected for v1.** Kubernetes'
+**Same-clock rule (normative).** The age comparison has two operands and
+both MUST come from the apiserver's clock. `creationTimestamp` is
+server-assigned; the comparison instant MUST be derived from the HTTP
+`Date` response header on the very list/get call the GC pass performs
+(RFC 9110 §6.6.1 — origin-server message-origination time), never from the
+provider's local `now()`. The provider runs on a user's desktop, and a
+local clock fast by more than the margin doesn't *race* — it
+deterministically computes every in-flight Secret as expired and deletes
+them all, silently, on every pass, reopening exactly the interleaving the
+gate exists to close. With both operands from one clock, skew cancels.
+(`kube`'s `Client::send` returns the raw `http::Response` with headers, so
+this costs one header read, not a departure from the typed API.) If the
+`Date` header is absent or unparseable, the provider MUST **skip
+orphan-Secret GC for that pass** — never fall back to local time. A
+deferred cleanup is free; a wrong deletion is not.
+
+**Alternative considered — `ownerReferences`, omitted in v1.** Kubernetes'
 native GC (a Secret owned by its attempt's Pod is deleted when the owner is
-verified absent) would replace the orphan sweep with apiserver machinery —
-but an ownerReference needs the owner's UID, which exists only after pod
-create, so the ordering must flip to Pod-first-then-Secret. That flip makes
-`CreateContainerConfigError` a *normal transient on every healthy deploy* —
-the exact state §Deploy State Machine classifies as fatal-never-started —
-so a concurrent deploy would delete a healthy in-flight attempt between its
-pod create and Secret create, and the fatal/transient discriminator would
-need its own age bound: the same timer, relocated to a worse place.
-Patching the ownerReference after pod create avoids the flip but leaves a
-crash window (Secret created, patch never ran) that still needs the
-age-gated sweep as backstop. The age gate composes with Secret-first
-ordering and the startup classification; ownerReferences fight both.
+verified absent) cannot *replace* the age gate: an ownerReference needs the
+owner's UID, which exists only after pod create, so primary reliance on it
+would flip the ordering to Pod-first-then-Secret. The reason that flip
+loses is **diagnostics, not repairability**: a never-started winner is
+recoverable (the kubelet retries a config-failed container indefinitely,
+and the amended no-op rule lets a later deploy delete-and-recreate it with
+its own payload), but Pod-first routes *every healthy deploy* through
+`CreateContainerConfigError` — the exact condition the startup classifier
+treats as an actionable failure signal — so the classifier could no longer
+believe that reason without waiting out the deadline, on every deploy.
+That trades away normative diagnostics for a cleanup the age gate already
+provides. A *supplementary* post-create attachment (patch the Secret with
+the winning pod's UID; Secret metadata stays patchable when `immutable` and
+`data` are untouched) is sound but adds no required property: the pre-pod
+crash window still needs the age-gated sweep as backstop, so v1 omits it
+under the complexity budget. Any future implementation that adds it MUST
+set `blockOwnerDeletion: false` explicitly (true requires `update` on
+`pods/finalizers` — an RBAC verb nothing else here needs — and a Secret
+should never delay its pod's deletion), MUST keep owner and dependent in
+the same namespace (a cross-namespace owner is treated as *absent*, turning
+the safety net into an immediate-delete instruction), and MUST treat
+attachment failure as non-fatal cleanup, never a deploy error.
 
 Running GC first
 gives concurrency and Secret ownership one unambiguous order: reconcile
@@ -974,8 +1014,10 @@ A provider is conforming iff:
 4. `deploy` implements the reconciliation loop (I4): identity derived from
    the nsec before any mutation, candidates verified by full-identity
    annotation before any action, live (= **started**, §Deploy State
-   Machine) → strict no-op (zero mutation), never-started fatal states →
-   delete-recreate, success only on confirmed container start,
+   Machine) → strict no-op (zero mutation), never-started states
+   classified by evidence not reason strings (provably-broken →
+   delete-recreate, self-healable → observe within bound, past-bound →
+   delete-recreate), success only on confirmed container start,
    conflicts converge by re-entry, delete-not-found is success.
 5. The deployed harness invocation enables an inactivity bound (I5) and the
    substrate does not resurrect terminated instances.
@@ -994,11 +1036,19 @@ deploys, a deletion-marked pod, terminal restart, an annotation-mismatch
 collision, and SIGTERM→presence-offline for items 5–6. Two families of
 cases are mandatory because they were the review-found failure modes:
 **startup discrimination** (slow-but-valid scheduling → poll-then-succeed;
-`Unschedulable`, image-pull failure, and missing-Secret
-`CreateContainerConfigError` → delete-recreate or actionable error, never
-silent success or no-op) and the **GC/attempt interleaving** (attempt B's
+`Unschedulable` during scale-from-zero → observed until the autoscaler
+provisions capacity, then success — never immediate delete-recreate;
+referenced Secret *confirmed absent* → delete-recreate or actionable error,
+never silent success or no-op; a **never-started winner is repairable** —
+pod exists, Secret absent, container never started: a later deploy MUST
+delete-and-recreate rather than no-op, the test that pins started-not-phase
+as the no-op criterion) and the **GC/attempt interleaving** (attempt B's
 preflight GC running between attempt A's Secret create and pod create MUST
-NOT delete Secret A — the §K8s GC age gate under test). A model checker is
+NOT delete Secret A — the §K8s GC age gate under test; provider death after
+Secret create → the age gate protects, then a later GC reaps; and a
+**provider local clock fast beyond the margin** MUST NOT delete an
+in-flight Secret — cheap with a fake clock, and the same-clock rule's
+skip-on-absent-`Date` arm is exercised by stripping the header). A model checker is
 the wrong tool here: the failure modes found in review were wrong
 *abstractions of Kubernetes* (a nonexistent `Terminating` phase, non-atomic
 delete, phase-as-readiness, non-atomic Secret→pod against GC), which a
