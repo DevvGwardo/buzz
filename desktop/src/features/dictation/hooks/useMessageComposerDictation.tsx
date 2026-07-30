@@ -44,6 +44,7 @@ export function useMessageComposerDictation({
 
   return {
     ...dictation,
+    canStopFromSend: isRecording || isStarting,
     prepareToSubmit,
   };
 }
