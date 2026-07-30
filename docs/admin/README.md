@@ -52,6 +52,24 @@ and re-prompted. Attachment bytes are fetched through the authenticated API and
 rendered from object URLs, because `<img src>` and `<a href>` cannot carry an
 `Authorization` header.
 
+Every admin-host response that carries the dashboard itself — the SPA document
+on each admin route, the hashed `/assets/*` bundle, and admin-host `404`s — is
+served with a Content Security Policy response header, `ADMIN_CSP` in
+`crates/buzz-relay/src/router.rs`:
+
+```text
+default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'
+```
+
+It blocks inline and third-party script and restricts every network destination
+to the same origin, which closes the direct paths an injected script would use
+to exfiltrate the `sessionStorage` token. `blob:` is permitted for images only,
+for attachment previews. It is a response header rather than a `<meta>` tag because
+`frame-ancestors` is ignored in meta — that directive is the dashboard's
+authoritative frame protection, superseding the `X-Frame-Options: DENY` the JSON
+API sends. The policy applies to the admin host only; the public web bundle
+keeps its own headers.
+
 The exact admin `Host` and matching browser `Origin` are still required, but
 they are defense-in-depth behind the credential, not the access control. HTTPS
 and a private ingress remain required: the token is a bearer credential in
