@@ -32,7 +32,7 @@ use crate::acp::{
     extract_model_config_options, extract_model_state, model_in_catalog,
     resolve_model_switch_method, AcpClient, AcpError, McpServer, ModelSwitchMethod, StopReason,
 };
-use crate::config::{DedupMode, PermissionMode};
+use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
 use crate::queue::{
     CancelReason, ContextMessage, ConversationContext, FlushBatch, PromptChannelInfo,
@@ -309,10 +309,13 @@ pub enum ControlSignal {
 /// for that — only a function parameter pass-through.
 ///
 /// If `active_run_id` is `None` at write time (no `session/update` seen yet
-/// — e.g. agents that never emit run-id metadata), the steer cannot form a
-/// valid `expectedRunId` and the read loop acks
-/// [`SteerError::ExpectedRunIdMissing`]. The main loop maps this to the
-/// "Err-before-pending" bucket: no withhold/mark was established at
+/// — e.g. agents that never emit run-id metadata), the goose-native method
+/// cannot form a valid `expectedRunId`, and the read loop falls back to the
+/// cross-adapter `_session/steering` method when the agent advertised
+/// `_meta.steering.supported` at `initialize`. That method takes no run id, so
+/// no freshness concern applies to it. When neither transport is available the
+/// read loop acks [`SteerError::ExpectedRunIdMissing`]. The main loop maps that
+/// to the "Err-before-pending" bucket: no withhold/mark was established at
 /// `pool::send_steer` time because the request was rejected before any
 /// write, so the watcher only needs to release nothing and fall back to the
 /// universal `ControlSignal::Steer` cancel+merge path.
@@ -326,7 +329,8 @@ pub struct SteerRequest {
     pub ack_tx: tokio::sync::oneshot::Sender<SteerAck>,
 }
 
-/// Why a goose-native steer failed.
+/// Why a mid-turn steer failed, on either transport
+/// (`_goose/unstable/session/steer` or `_session/steering`).
 ///
 /// String and integer fields are intentionally `Debug`-only — read by
 /// `tracing` macros in the main loop's `PoolEvent::SteerAck` arm via
@@ -349,14 +353,28 @@ pub enum SteerError {
     /// Transport-level failure: write error, read EOF, JSON-RPC framing
     /// violation, etc. The string carries the underlying `AcpError`'s display.
     Transport(String),
-    /// At steer-write time `AcpClient::active_run_id` was `None`, so the
-    /// read loop couldn't form a valid `expectedRunId`. The read loop drops
-    /// the request without writing anything; the main loop should release
-    /// any withheld event and fall back to the universal cancel+merge
+    /// At steer-write time neither steer transport was available: no
+    /// `expectedRunId` (`AcpClient::active_run_id` was `None`, so the
+    /// goose-native method could not be formed) and the agent did not
+    /// advertise the cross-adapter `_session/steering` extension. The read
+    /// loop drops the request without writing anything; the main loop should
+    /// release any withheld event and fall back to the universal cancel+merge
     /// `ControlSignal::Steer` path. This is in the same "Err-before-pending"
     /// bucket as `Transport` write failures: no in-process state was
     /// established, so no in-process cleanup is needed.
     ExpectedRunIdMissing,
+    /// A `_session/steering` request returned a JSON-RPC *success* whose
+    /// `outcome` was not one of the two recognized delivery outcomes
+    /// (`injected`, `startedNewTurn`) — including `failed` (codex-acp) and a
+    /// missing `outcome` entirely. `outcome` carries what the agent actually
+    /// reported, for logs.
+    ///
+    /// The steer did NOT land, so the main loop must release the withheld
+    /// event and fire the cancel+merge fallback — exactly like a write that
+    /// never happened. Treating an unrecognized success as delivery would
+    /// drop the user's message: codex-acp answers unrecognized extension
+    /// methods with a bare `{}` success rather than `-32601`.
+    OutcomeRejected { outcome: String },
     /// The read loop never got to dispatch the steer because the prompt
     /// completed first. Delivery state for the underlying message is
     /// unknown after prompt completion — the main loop must treat this as
@@ -369,7 +387,7 @@ pub enum SteerError {
     PromptCompleted,
 }
 
-/// Outcome of a goose-native steer, sent from the read loop back to the
+/// Outcome of a mid-turn steer, sent from the read loop back to the
 /// main loop's ack watcher.
 #[derive(Debug)]
 pub enum SteerAck {
@@ -490,6 +508,9 @@ pub struct PromptContext {
     pub turn_liveness_interval: Duration,
     pub dedup_mode: DedupMode,
     pub system_prompt: Option<String>,
+    /// Sanitized title for each new ACP session, sent as `_meta.sessionTitle`
+    /// on `session/new`. Never part of the prompt.
+    pub session_title: Option<String>,
     pub team_instructions: Option<String>,
     pub heartbeat_prompt: Option<String>,
     /// Base prompt content, or `None` if `--no-base-prompt` was passed.
@@ -795,6 +816,49 @@ const CONTROL_CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// Timeout for permission-mode requests (`session/set_config_option` with `configId: "mode"`).
 const PERMISSION_MODE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Placeholder [`fetch_channel_info`] substitutes when a channel's metadata
+/// event carries no `name` tag. Not a real channel name — consumers that need
+/// an identifying name must treat it as absent.
+const UNKNOWN_CHANNEL_NAME: &str = "unknown";
+
+/// Channel-derived inputs for a new session — `(is_dm, title_channel)` — from
+/// **one** metadata resolve.
+///
+/// Both new-session consumers need the same lookup: the canvas block skips DMs
+/// (and fails closed when the channel type can't be determined), and the
+/// session title is qualified with the channel name. Resolving once is
+/// load-bearing rather than tidy: [`ChannelInfoResolver`] caches only `Some`,
+/// so two calls against an unresolvable channel pay the whole
+/// [`fetch_channel_info`] retry sequence twice — two `CONTEXT_FETCH_TIMEOUT`
+/// attempts plus `CONTEXT_FETCH_RETRY_DELAY` each, in front of `session/new`,
+/// precisely when the relay is already degraded.
+///
+/// `title_channel` is `None` whenever the channel can't usefully identify the
+/// session: an unresolved channel, a DM (no meaningful name), or the literal
+/// `"unknown"` that [`fetch_channel_info`] substitutes for a metadata event
+/// with no `name` tag. Composing that sentinel would title every unnamed
+/// channel identically (`Agent · #unknown`) — reintroducing the collision the
+/// suffix exists to remove, while naming a channel something it isn't. The
+/// startup cache already refuses `channel_type == "unknown"` for the same
+/// reason.
+///
+/// Renames do not retitle live sessions, and a **channel** rename is stickier
+/// than an agent rename: `invalidate_channel` drops the session but not the
+/// resolver's cached entry, so a renamed channel keeps its old suffix until the
+/// process restarts. An agent rename lands on the next spawn (the desktop
+/// restart badge covers it — see `spawn_config_hash`).
+async fn resolve_new_session_channel_context(
+    channel_info: &ChannelInfoResolver,
+    channel_id: Uuid,
+) -> (bool, Option<String>) {
+    let Some(info) = channel_info.resolve(channel_id).await else {
+        return (true, None);
+    };
+    let is_dm = info.channel_type == "dm";
+    let title_channel = (!is_dm && info.name != UNKNOWN_CHANNEL_NAME).then_some(info.name);
+    (is_dm, title_channel)
+}
+
 /// Create a new ACP session via `session_new_full()`, populate model capabilities
 /// on the agent (first session only), and apply `desired_model` if set.
 ///
@@ -806,6 +870,7 @@ async fn create_session_and_apply_model(
     ctx: &PromptContext,
     agent_core: Option<&str>,
     agent_canvas: Option<&str>,
+    channel_name: Option<&str>,
 ) -> Result<String, AcpError> {
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
@@ -825,6 +890,11 @@ async fn create_session_and_apply_model(
         agent_canvas,
     );
 
+    let session_title = ctx
+        .session_title
+        .as_deref()
+        .map(|agent_name| compose_session_title(agent_name, channel_name));
+
     let resp = agent
         .acp
         .session_new_full(
@@ -835,6 +905,7 @@ async fn create_session_and_apply_model(
                 agent.protocol_version,
                 combined_system_prompt.as_deref(),
             ),
+            session_title.as_deref(),
         )
         .await?;
 
@@ -1427,18 +1498,20 @@ pub async fn run_prompt_task(
     // prevents a stale revision A surviving a failed create and being re-used by
     // the next attempt after the canvas was cleared.
     let mut pending_canvas: Option<(Uuid, String)> = None;
+    // Channel name for the session title, from the same single resolve the
+    // canvas DM check uses — see `resolve_new_session_channel_context`.
+    let mut title_channel: Option<String> = None;
     if let PromptSource::Channel(cid) = &source {
         let is_new_channel_session = !agent.state.sessions.contains_key(cid);
-        if is_new_channel_session && !agent.state.canvas_sections.contains_key(cid) {
-            // Resolve DM status: prefer the startup cache, lazy-fetch as fallback.
-            // Unknown → treat as DM (fail-closed).
-            let is_dm = ctx
-                .channel_info
-                .resolve(*cid)
-                .await
-                .map(|ci| ci.channel_type == "dm")
-                .unwrap_or(true);
-            if !is_dm {
+        let needs_canvas = is_new_channel_session && !agent.state.canvas_sections.contains_key(cid);
+        let needs_title = is_new_channel_session && ctx.session_title.is_some();
+        if needs_canvas || needs_title {
+            let (is_dm, resolved_channel) =
+                resolve_new_session_channel_context(&ctx.channel_info, *cid).await;
+            title_channel = resolved_channel;
+            // A confirmed DM never receives a canvas section; an undeterminable
+            // channel type fails closed as a DM for the same reason.
+            if needs_canvas && !is_dm {
                 if let Some(section) = fetch_canvas_section(*cid, &ctx.rest_client).await {
                     pending_canvas = Some((*cid, section));
                 }
@@ -1470,12 +1543,16 @@ pub async fn run_prompt_task(
             if let Some(sid) = agent.state.sessions.get(cid) {
                 (sid.clone(), false)
             } else {
-                // Create new session with model application.
+                // The title is channel-qualified (`Agent · #channel`) so one
+                // agent in several channels doesn't produce identical session
+                // rows; `title_channel` comes from the single resolve above and
+                // is `None` for DM, unresolved, and unnamed channels.
                 match create_session_and_apply_model(
                     &mut agent,
                     &ctx,
                     agent_core.as_deref(),
                     agent_canvas.as_deref(),
+                    title_channel.as_deref(),
                 )
                 .await
                 {
@@ -1523,7 +1600,7 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
-                match create_session_and_apply_model(&mut agent, &ctx, None, None).await {
+                match create_session_and_apply_model(&mut agent, &ctx, None, None, None).await {
                     Ok(sid) => {
                         tracing::info!(
                             target: "pool::session",
@@ -1819,6 +1896,18 @@ pub async fn run_prompt_task(
             .collect(),
         None => prompt_sections.iter().map(String::as_str).collect(),
     };
+
+    // Turn start, labelled exactly as `log_stop_reason` labels the end, so a
+    // log reads as start/stop pairs. Purely observational: an unpaired start is
+    // the only durable evidence that a turn was entered and never returned, and
+    // without it a stalled agent and an agent nobody woke leave identical logs —
+    // zero completions either way, so anything reading them afterwards has to
+    // guess which happened.
+    tracing::info!(
+        target: "pool::prompt",
+        "turn starting for {}",
+        prompt_label(&source)
+    );
 
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
@@ -2268,7 +2357,7 @@ pub(crate) async fn fetch_channel_info(
                 }
                 let channel_type = crate::relay::channel_type_from_tags(tags);
                 Some(PromptChannelInfo {
-                    name: name.unwrap_or("unknown").to_string(),
+                    name: name.unwrap_or(UNKNOWN_CHANNEL_NAME).to_string(),
                     channel_type,
                 })
             }
@@ -3054,12 +3143,19 @@ fn classify_control_cancel_failure(
     }
 }
 
-/// Log a stop reason at the appropriate tracing level.
-fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
-    let label = match source {
+/// How a turn's source is named in the `pool::prompt` log lines.
+///
+/// Shared by the turn-start and turn-stop lines so a log can be read as pairs.
+fn prompt_label(source: &PromptSource) -> String {
+    match source {
         PromptSource::Channel(cid) => format!("channel {cid}"),
         PromptSource::Heartbeat => "heartbeat".to_string(),
-    };
+    }
+}
+
+/// Log a stop reason at the appropriate tracing level.
+fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
+    let label = prompt_label(source);
     match stop_reason {
         StopReason::EndTurn => {
             tracing::info!(target: "pool::prompt", "turn complete for {label}: end_turn");
@@ -3313,33 +3409,35 @@ fn acp_stop_to_core(r: &StopReason) -> buzz_core::agent_turn_metric::StopReason 
     }
 }
 
-/// Best-effort: build and publish a `kind:44200` NIP-AM agent turn metric event.
+/// Build the `(turn, cumulative)` `TokenCounts` pair for a NIP-AM kind-44200
+/// payload from a completed `TurnUsage`.
 ///
-/// Does nothing when `usage` is `None` (goose emitted no usage notification
-/// for this turn) or when `owner_pubkey` is unconfigured (no NIP-AO identity).
-/// Errors are logged at WARN and never surface to the caller — metric
-/// publishing must never fail a turn.
-async fn publish_agent_turn_metric(
-    ctx: &PromptContext,
-    usage: Option<crate::usage::TurnUsage>,
-    channel_id: Option<uuid::Uuid>,
-    session_id: &str,
-    turn_id: &str,
-    stop_reason: Option<buzz_core::agent_turn_metric::StopReason>,
+/// Extracted as a pure function so the mapping logic can be tested independently
+/// of relay/crypto infrastructure. `publish_agent_turn_metric` is the only
+/// production caller.
+///
+/// - `turn` is `None` when `delta_reliable` is false; otherwise it carries the
+///   per-turn i/o/total/cost deltas for this turn.
+/// - `cumulative` always carries the session-aggregate i/o/cost totals.
+///   `total_tokens` is `Some` only when the session accumulated a genuine
+///   provider-reported total on every turn — never derived from i/o sums
+///   (NIP-AM MUST NOT).
+pub(crate) fn build_turn_metric_counts(
+    usage: &crate::usage::TurnUsage,
+) -> (
+    Option<buzz_core::agent_turn_metric::TokenCounts>,
+    Option<buzz_core::agent_turn_metric::TokenCounts>,
 ) {
-    use buzz_core::agent_turn_metric::{AgentTurnMetricPayload, TokenCounts};
-    use nostr::{EventBuilder, Kind, Tag};
-
-    let (usage, owner_pk) = match (usage, ctx.agent_owner_pubkey.as_ref()) {
-        (Some(u), Some(pk)) => (u, pk),
-        _ => return,
-    };
+    use buzz_core::agent_turn_metric::TokenCounts;
 
     let turn_counts = if usage.delta_reliable {
         Some(TokenCounts {
             input_tokens: usage.turn_input_tokens,
             output_tokens: usage.turn_output_tokens,
-            total_tokens: None,
+            // Field-local: present only when both the previous and current
+            // cumulative totals were available and monotonic. Never derived
+            // from input+output.
+            total_tokens: usage.turn_total_tokens,
             cost_usd: usage.turn_cost_usd,
             cache_read_tokens: None,
             cache_write_tokens: None,
@@ -3354,11 +3452,40 @@ async fn publish_agent_turn_metric(
     let cumulative_counts = Some(TokenCounts {
         input_tokens: Some(usage.cumulative_input_tokens),
         output_tokens: Some(usage.cumulative_output_tokens),
-        total_tokens: None,
+        // Present when every turn in the session reported a genuine provider
+        // total. None when the session has never emitted one or any turn lacked
+        // one. Never derived from input+output (NIP-AM MUST NOT).
+        total_tokens: usage.cumulative_total_tokens,
         cost_usd: usage.cumulative_cost_usd,
         cache_read_tokens: None,
         cache_write_tokens: None,
     });
+    (turn_counts, cumulative_counts)
+}
+
+/// Best-effort: build and publish a `kind:44200` NIP-AM agent turn metric event.
+///
+/// Does nothing when `usage` is `None` (goose emitted no usage notification
+/// for this turn) or when `owner_pubkey` is unconfigured (no NIP-AO identity).
+/// Errors are logged at WARN and never surface to the caller — metric
+/// publishing must never fail a turn.
+async fn publish_agent_turn_metric(
+    ctx: &PromptContext,
+    usage: Option<crate::usage::TurnUsage>,
+    channel_id: Option<uuid::Uuid>,
+    session_id: &str,
+    turn_id: &str,
+    stop_reason: Option<buzz_core::agent_turn_metric::StopReason>,
+) {
+    use buzz_core::agent_turn_metric::AgentTurnMetricPayload;
+    use nostr::{EventBuilder, Kind, Tag};
+
+    let (usage, owner_pk) = match (usage, ctx.agent_owner_pubkey.as_ref()) {
+        (Some(u), Some(pk)) => (u, pk),
+        _ => return,
+    };
+
+    let (turn_counts, cumulative_counts) = build_turn_metric_counts(&usage);
     let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let payload = AgentTurnMetricPayload {
         harness: ctx.harness_name.clone(),
@@ -3781,6 +3908,9 @@ mod tests {
 
     #[test]
     fn test_framed_system_prompt_both_present_carries_both_headers() {
+        // Also the regression guard against #2372: the session title travels
+        // out of band in `_meta.sessionTitle`, so this exact-bytes assertion is
+        // what pins the framing against a `[Session]` section reappearing here.
         let framed = framed_system_prompt("/", Some("base text"), Some("persona text"))
             .expect("both present yields Some");
         assert_eq!(framed, "[Base]\nbase text\n\n[System]\npersona text");
@@ -5139,9 +5269,11 @@ mod tests {
             delta_reliable: true,
             turn_input_tokens: Some(100),
             turn_output_tokens: Some(50),
+            turn_total_tokens: None,
             turn_cost_usd: None,
             cumulative_input_tokens: 100,
             cumulative_output_tokens: 50,
+            cumulative_total_tokens: None,
             cumulative_cost_usd: None,
             model: None,
         };
@@ -5171,9 +5303,11 @@ mod tests {
             delta_reliable: true,
             turn_input_tokens: Some(200),
             turn_output_tokens: Some(80),
+            turn_total_tokens: None,
             turn_cost_usd: Some(0.001),
             cumulative_input_tokens: 200,
             cumulative_output_tokens: 80,
+            cumulative_total_tokens: None,
             cumulative_cost_usd: Some(0.001),
             model: None,
         };
@@ -5204,9 +5338,11 @@ mod tests {
             delta_reliable: true,
             turn_input_tokens: Some(50),
             turn_output_tokens: Some(20),
+            turn_total_tokens: None,
             turn_cost_usd: None,
             cumulative_input_tokens: 150,
             cumulative_output_tokens: 70,
+            cumulative_total_tokens: None,
             cumulative_cost_usd: None,
             model: None,
         };
@@ -5237,9 +5373,11 @@ mod tests {
             delta_reliable: false, // first turn from buzz-agent
             turn_input_tokens: None,
             turn_output_tokens: None,
+            turn_total_tokens: None,
             turn_cost_usd: None,
             cumulative_input_tokens: 400,
             cumulative_output_tokens: 100,
+            cumulative_total_tokens: None,
             cumulative_cost_usd: None,
             model: None,
         };
@@ -5253,6 +5391,110 @@ mod tests {
             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
         )
         .await;
+    }
+
+    /// `build_turn_metric_counts` maps exact turn and cumulative totals from
+    /// `TurnUsage` to the corresponding `TokenCounts.total_tokens` fields.
+    /// Reverting the production fields at the call site to `None` would break
+    /// this test; the test constrains the real code path.
+    #[test]
+    fn test_build_turn_metric_counts_exact_totals_map_through() {
+        let usage = crate::usage::TurnUsage {
+            session_id: "sess-total".to_string(),
+            turn_seq: 2,
+            delta_reliable: true,
+            turn_input_tokens: Some(100),
+            turn_output_tokens: Some(30),
+            turn_total_tokens: Some(130), // genuine per-turn total
+            turn_cost_usd: None,
+            cumulative_input_tokens: 500,
+            cumulative_output_tokens: 120,
+            cumulative_total_tokens: Some(620), // genuine cumulative total
+            cumulative_cost_usd: None,
+            model: None,
+        };
+
+        let (turn, cumulative) = crate::pool::build_turn_metric_counts(&usage);
+
+        // Serialise to JSON — this is what ultimately goes on the wire.
+        let turn_json = serde_json::to_value(turn.as_ref().expect("turn counts present")).unwrap();
+        let cum_json =
+            serde_json::to_value(cumulative.as_ref().expect("cumulative counts present")).unwrap();
+
+        // Per-turn total must be the genuine provider-reported value.
+        assert_eq!(
+            turn_json["totalTokens"],
+            serde_json::json!(130),
+            "per-turn total must map to TokenCounts.totalTokens in wire JSON"
+        );
+        assert_eq!(turn_json["inputTokens"], serde_json::json!(100));
+        assert_eq!(turn_json["outputTokens"], serde_json::json!(30));
+
+        // Cumulative total must be the genuine session total.
+        assert_eq!(
+            cum_json["totalTokens"],
+            serde_json::json!(620),
+            "cumulative total must map to TokenCounts.totalTokens in wire JSON"
+        );
+        assert_eq!(cum_json["inputTokens"], serde_json::json!(500));
+        assert_eq!(cum_json["outputTokens"], serde_json::json!(120));
+    }
+
+    /// When totals are absent, `build_turn_metric_counts` must produce null
+    /// `total_tokens` — never a derived input+output sum (NIP-AM MUST NOT).
+    /// Reverting the production fields to hardcoded `None` would leave this test
+    /// passing but input/output would disagree, making the null-path detectable.
+    #[test]
+    fn test_build_turn_metric_counts_null_totals_never_derived() {
+        let usage = crate::usage::TurnUsage {
+            session_id: "sess-nototal".to_string(),
+            turn_seq: 1,
+            delta_reliable: true,
+            turn_input_tokens: Some(200),
+            turn_output_tokens: Some(60),
+            turn_total_tokens: None, // provider did not supply a total
+            turn_cost_usd: None,
+            cumulative_input_tokens: 200,
+            cumulative_output_tokens: 60,
+            cumulative_total_tokens: None, // session has no total
+            cumulative_cost_usd: None,
+            model: None,
+        };
+
+        let (turn, cumulative) = crate::pool::build_turn_metric_counts(&usage);
+
+        let turn_json = serde_json::to_value(turn.as_ref().expect("turn counts present")).unwrap();
+        let cum_json =
+            serde_json::to_value(cumulative.as_ref().expect("cumulative counts present")).unwrap();
+
+        // total_tokens must be null in the wire JSON.
+        assert!(
+            turn_json["totalTokens"].is_null(),
+            "absent turn total must serialize as null — not derived from in+out"
+        );
+        assert!(
+            cum_json["totalTokens"].is_null(),
+            "absent cumulative total must serialize as null — not derived from in+out"
+        );
+
+        // Input/output must still carry their real values.
+        assert_eq!(
+            turn_json["inputTokens"],
+            serde_json::json!(200),
+            "inputTokens must be present even when total is absent"
+        );
+        assert_eq!(
+            turn_json["outputTokens"],
+            serde_json::json!(60),
+            "outputTokens must be present even when total is absent"
+        );
+
+        // The null total must not equal the input+output sum — it must be genuinely null.
+        let derived_sum = serde_json::json!(200u64 + 60u64);
+        assert_ne!(
+            turn_json["totalTokens"], derived_sum,
+            "total_tokens must never equal input+output when provider omitted it"
+        );
     }
 
     fn make_prompt_context_no_owner() -> PromptContext {
@@ -5280,6 +5522,7 @@ mod tests {
             turn_liveness_interval: Duration::ZERO,
             dedup_mode: DedupMode::Drop,
             system_prompt: None,
+            session_title: None,
             team_instructions: None,
             heartbeat_prompt: None,
             base_prompt: None,
@@ -5616,5 +5859,143 @@ mod tests {
             !section.contains("+00:00"),
             "timestamp must not use +00:00 offset"
         );
+    }
+
+    // ── new-session channel context (one resolve, two consumers) ─────────────
+
+    /// A [`ChannelInfoResolver`] whose lazy REST fallback is served by a local
+    /// HTTP server, plus a counter of the requests that actually reached it.
+    /// Counting real requests is the point: the composition tests are pure and
+    /// cannot see duplicated I/O.
+    async fn counting_resolver(
+        response: serde_json::Value,
+    ) -> (
+        ChannelInfoResolver,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let body = response.to_string();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0; 8192];
+                let _ = socket.read(&mut buf).await;
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = crate::relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        (
+            ChannelInfoResolver::new(std::collections::HashMap::new(), rest),
+            requests,
+            server,
+        )
+    }
+
+    fn channel_metadata_response(id: Uuid, tags: &[[&str; 2]]) -> serde_json::Value {
+        let mut event_tags = vec![json!(["d", id.to_string()])];
+        event_tags.extend(tags.iter().map(|[k, v]| json!([k, v])));
+        json!([{ "tags": event_tags }])
+    }
+
+    /// A normal channel yields a non-DM (canvas allowed) and its name for the
+    /// title suffix — and the second consumer reads it from cache, not the wire.
+    #[tokio::test]
+    async fn test_new_session_channel_context_qualifies_a_normal_channel() {
+        use std::sync::atomic::Ordering;
+
+        let id = Uuid::new_v4();
+        let response = channel_metadata_response(id, &[["name", "buzz-dev"], ["t", "stream"]]);
+        let (resolver, requests, server) = counting_resolver(response).await;
+
+        let (is_dm, title_channel) = resolve_new_session_channel_context(&resolver, id).await;
+        assert!(!is_dm, "a stream channel is not a DM");
+        assert_eq!(title_channel.as_deref(), Some("buzz-dev"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let (_, again) = resolve_new_session_channel_context(&resolver, id).await;
+        assert_eq!(again.as_deref(), Some("buzz-dev"));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a resolved channel is cached — no second lookup"
+        );
+        server.abort();
+    }
+
+    /// A DM carries no useful name, so it gets the bare agent title (and no
+    /// canvas section).
+    #[tokio::test]
+    async fn test_new_session_channel_context_leaves_a_dm_unqualified() {
+        let id = Uuid::new_v4();
+        let response = channel_metadata_response(id, &[["name", "DM"], ["t", "dm"]]);
+        let (resolver, _requests, server) = counting_resolver(response).await;
+
+        let (is_dm, title_channel) = resolve_new_session_channel_context(&resolver, id).await;
+        assert!(is_dm);
+        assert_eq!(
+            title_channel, None,
+            "a DM name must never reach the session title"
+        );
+        server.abort();
+    }
+
+    /// The `"unknown"` placeholder `fetch_channel_info` substitutes for a
+    /// metadata event with no `name` tag is not a channel name: qualifying with
+    /// it would title every unnamed channel `Agent · #unknown`.
+    #[tokio::test]
+    async fn test_new_session_channel_context_treats_the_unknown_name_as_absent() {
+        let id = Uuid::new_v4();
+        let response = channel_metadata_response(id, &[["t", "stream"]]);
+        let (resolver, _requests, server) = counting_resolver(response).await;
+
+        let (is_dm, title_channel) = resolve_new_session_channel_context(&resolver, id).await;
+        assert!(!is_dm, "a nameless stream channel is still not a DM");
+        assert_eq!(
+            title_channel, None,
+            "the `unknown` placeholder must yield a bare title"
+        );
+        server.abort();
+    }
+
+    /// An unresolvable channel yields the bare title, fails closed as a DM, and
+    /// costs exactly ONE `fetch_channel_info` sequence — two attempts, because
+    /// `fetch_with_retry` retries once. `resolve()` caches only `Some`, so a
+    /// second resolve for the title would double this in front of `session/new`,
+    /// exactly when the relay is already degraded.
+    #[tokio::test]
+    async fn test_new_session_channel_context_attempts_an_unresolved_channel_once() {
+        use std::sync::atomic::Ordering;
+
+        let (resolver, requests, server) = counting_resolver(json!([])).await;
+
+        let (is_dm, title_channel) =
+            resolve_new_session_channel_context(&resolver, Uuid::new_v4()).await;
+        assert!(is_dm, "an undeterminable channel type must fail closed");
+        assert_eq!(title_channel, None, "unresolved channels get a bare title");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "one fetch_channel_info sequence (initial attempt + single retry)"
+        );
+        server.abort();
     }
 }

@@ -43,6 +43,10 @@ import {
   PullRequestTabsList,
 } from "./ProjectWorkspaceTabList";
 import { ProjectPullRequestFilesChangedPanel } from "./ProjectPullRequestFilesChangedPanel";
+import {
+  PROJECT_DETAIL_PANEL_CLASS,
+  PROJECT_DETAIL_PANEL_MESSAGE_CLASS,
+} from "./projectPanelStyles";
 import { CreatePullRequestDialog } from "./CreatePullRequestDialog";
 import {
   CreateIssueDialog,
@@ -308,7 +312,7 @@ export function WorkspaceTabs({
         ) : null}
       </div>
       {selectedPullRequest ? (
-        <div className="overflow-hidden rounded-xl border border-border/60 bg-card">
+        <div className={PROJECT_DETAIL_PANEL_CLASS} data-project-detail-panel>
           {/* Two full-height columns: the meta rail runs all the way to the
               top of the card, alongside the header and tabs. */}
           <div className="grid xl:grid-cols-[minmax(0,1fr)_18rem]">
@@ -414,7 +418,8 @@ export function WorkspaceTabs({
       </TabsContent>
 
       <TabsContent
-        className="m-0 overflow-hidden rounded-xl border border-border/60 bg-card"
+        className={`m-0 ${PROJECT_DETAIL_PANEL_CLASS}`}
+        data-project-detail-panel
         value="prs"
       >
         <WorkItemListHeader
@@ -442,7 +447,8 @@ export function WorkspaceTabs({
       </TabsContent>
 
       <TabsContent
-        className="m-0 overflow-hidden rounded-xl border border-border/60 bg-card"
+        className={`m-0 ${PROJECT_DETAIL_PANEL_CLASS}`}
+        data-project-detail-panel
         value="issues"
       >
         <WorkItemListHeader
@@ -463,7 +469,10 @@ export function WorkspaceTabs({
       <TabsContent className="m-0" value="files">
         {repoSource === "local" && !localSnapshot && !localSnapshotLoading ? (
           <div className="mb-3">
-            <div className="rounded-xl border border-border/60 bg-card p-4 text-sm text-muted-foreground">
+            <div
+              className={PROJECT_DETAIL_PANEL_MESSAGE_CLASS}
+              data-project-detail-panel
+            >
               No local checkout found.
             </div>
           </div>

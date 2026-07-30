@@ -991,6 +991,7 @@ dependencies = [
 name = "buzz-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "hex",
  "hmac 0.13.0",
@@ -1009,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "buzz-desktop"
-version = "0.4.26"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1046,7 +1047,9 @@ dependencies = [
  "neteq",
  "nostr",
  "notify-rust",
+ "objc2",
  "objc2-app-kit",
+ "objc2-foundation",
  "opus",
  "plist",
  "png 0.18.1",
