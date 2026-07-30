@@ -1,22 +1,21 @@
 # A5h -- solo gpt-5.6-terra at reasoning effort `high`, served direct from OpenAI.
 #
-# Terra is a new model tier for this study, and it lands in an unusually useful
-# place: its rate card is *exactly* the midpoint of the two the study already
-# prices, on every axis.
+# Terra is a third model tier for this study, which turns the price/performance
+# curve from a line into a shape. If A1 (0.545) and A2 (0.843) bracket it, where
+# terra falls says whether the tier return is roughly linear in price or whether
+# one of the two steps carries nearly all of it.
 #
 #            input   cached   output
-#   luna      1.00     0.10     6.00     (1x)
-#   terra     2.50     0.25    15.00     (2.5x luna, 0.5x sol)
-#   sol       5.00     0.50    30.00     (5x)
+#   luna      0.20     0.02     1.20     (1x)
+#   terra     2.00     0.20    12.00     (10x luna, 0.4x sol)
+#   sol       5.00     0.50    30.00     (25x luna)
 #
-# That is worth more than an extra datapoint. The whole thesis is a *ratio*
-# argument -- "a team of cheap models may burn 5x the input and still cost the
-# same as one expensive model" (doc 02 §2) -- and until now the ratio had only
-# its endpoints measured. Terra makes the price/performance curve three points
-# instead of two, which is the difference between a line and a shape. If A1
-# (0.545) and A2 (0.843) bracket it, where terra falls says whether the tier
-# return is roughly linear in price or whether one of the two steps carries
-# nearly all of it.
+# WHEN THIS CELL RAN, terra's card was the exact midpoint of the other two on
+# every axis -- luna 1.00/0.10/6.00, terra 2.50/0.25/15.00, sol 5.00/0.50/30.00
+# -- and the original text here leaned on that symmetry. The 2026-07-30 drop
+# ended it: luna fell 80% and terra 20%, so the tiers are still ordered the same
+# way but the gaps are now very uneven. The measurement is unchanged; only the
+# overlay moved. Use the current numbers above for any ratio argument.
 #
 # NOTE ON THE PRICE TABLE: terra also publishes a **cache-write** rate of
 # $2.50/Mtok, i.e. 1.25x its input rate. The manifest schema has no field for
@@ -28,9 +27,10 @@
 # This is also the first hard confirmation of doc 02 §7.5's open question about
 # whether cache writes carry a surcharge on this slate. They do.
 #
-# There is no terra-at-medium cell, so this manifest measures a *tier*, not an
-# effort delta -- read it against A1/A2 (tier axis), not as terra's own
-# medium-vs-high comparison, which does not exist. See doc 02 §3.2.
+# The effort axis for terra lives in tb-solo-terra-medium.yaml (A5m), which is
+# this file with `thinking_effort: medium` and nothing else changed. Read A5m ->
+# A5h as the effort delta and either against A1/A2 as the tier axis. See doc 02
+# §3.2.
 schema_version: "1"
 condition: tb-solo-terra-high
 roster:
