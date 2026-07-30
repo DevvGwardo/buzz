@@ -17,23 +17,26 @@ import { Card } from "@/shared/ui/card";
 import { SectionHeader } from "@/shared/ui/PageHeader";
 import { Progress } from "@/shared/ui/progress";
 import { Skeleton } from "@/shared/ui/skeleton";
-import { Tabs, TabsList, TabsTrigger } from "@/shared/ui/tabs";
 import { useAgentUsageSeries } from "../hooks";
 import {
   bigintRatio,
+  DEFAULT_USAGE_RANGE,
   deriveDisplayTotal,
+  describeRange,
   formatCoverageDate,
   formatTokenCountCompact,
   sortAgentsByDisplayTotal,
   sumKnownBucketTotals,
-  type UsageWindowDays,
+  type UsageRange,
 } from "../lib/agentUsage";
 import { AgentUsageDailyBars } from "./AgentUsageDailyBars";
+import { AgentUsageRangeTabs } from "./AgentUsageRangeTabs";
 
 /**
  * Compact "Usage" section on the Agents page: local NIP-AM usage totals for
- * the last 7 or 30 days, broken down per agent, with a click-through to the
- * per-agent focused view in the profile panel (M4/A9/A13, frozen Rev 3 plan).
+ * the selected window (1d/7d/30d preset or a custom date range), broken down
+ * per agent, with a click-through to the per-agent focused view in the
+ * profile panel (M4/A9/A13, frozen Rev 3 plan).
  */
 export function AgentUsageSection({
   onOpenAgentProfile,
@@ -43,8 +46,8 @@ export function AgentUsageSection({
     options?: ProfilePanelOpenOptions,
   ) => void;
 }) {
-  const [days, setDays] = React.useState<UsageWindowDays>(7);
-  const query = useAgentUsageSeries({ days });
+  const [range, setRange] = React.useState<UsageRange>(DEFAULT_USAGE_RANGE);
+  const query = useAgentUsageSeries({ range });
   const { onOpenSettings } = useAppShell();
 
   const agents = React.useMemo(
@@ -63,19 +66,11 @@ export function AgentUsageSection({
     <section className="relative space-y-4" data-testid="agents-usage-section">
       <SectionHeader
         action={
-          <Tabs
-            onValueChange={(value) => setDays(value === "30" ? 30 : 7)}
-            value={String(days)}
-          >
-            <TabsList>
-              <TabsTrigger data-testid="agent-usage-window-7" value="7">
-                7d
-              </TabsTrigger>
-              <TabsTrigger data-testid="agent-usage-window-30" value="30">
-                30d
-              </TabsTrigger>
-            </TabsList>
-          </Tabs>
+          <AgentUsageRangeTabs
+            onRangeChange={setRange}
+            range={range}
+            testIdPrefix="agent-usage-window"
+          />
         }
         description="Locally archived, agent-reported usage."
         title="Usage"
@@ -100,8 +95,8 @@ export function AgentUsageSection({
       ) : query.data ? (
         <AgentUsageCard
           agents={agents}
-          days={days}
           onOpenAgentProfile={onOpenAgentProfile}
+          range={range}
           onOpenSettings={onOpenSettings}
           profiles={usersBatchQuery.data?.profiles}
           series={query.data}
@@ -124,20 +119,20 @@ function AgentUsageSkeleton() {
 
 function AgentUsageCard({
   agents,
-  days,
   onOpenAgentProfile,
   onOpenSettings,
   profiles,
+  range,
   series,
 }: {
   agents: AgentUsage[];
-  days: UsageWindowDays;
   onOpenAgentProfile: (
     pubkey: string,
     options?: ProfilePanelOpenOptions,
   ) => void;
   onOpenSettings: ((section: "local-archive") => void) | null;
   profiles: UserProfileLookup | undefined;
+  range: UsageRange;
   series: AgentUsageSeries;
 }) {
   const hasRows = agents.length > 0;
@@ -223,7 +218,6 @@ function AgentUsageCard({
           {agents.map((agent) => (
             <AgentUsageRow
               agent={agent}
-              days={days}
               key={agent.agentPubkey}
               label={resolveUserLabel({ profiles, pubkey: agent.agentPubkey })}
               maxDisplayValue={maxDisplayValue}
@@ -231,6 +225,7 @@ function AgentUsageCard({
               profileAvatarUrl={
                 profiles?.[agent.agentPubkey]?.avatarUrl ?? null
               }
+              range={range}
             />
           ))}
         </div>
@@ -242,8 +237,8 @@ function AgentUsageCard({
           {collectionOff
             ? "Turn on collection to start tracking agent usage."
             : hasInvalidOnlyInWindow
-              ? `Usage was collected in the last ${days} days but could not be counted — reports with unreadable timestamps or missing session totals are excluded.`
-              : `No locally archived usage in the last ${days} days. Usage appears after an agent completes a usage-reporting turn.`}
+              ? `Usage was collected in ${describeRange(range)} but could not be counted — reports with unreadable timestamps or missing session totals are excluded.`
+              : `No locally archived usage in ${describeRange(range)}. Usage appears after an agent completes a usage-reporting turn.`}
         </p>
       )}
     </Card>
@@ -252,14 +247,13 @@ function AgentUsageCard({
 
 function AgentUsageRow({
   agent,
-  days,
   label,
   maxDisplayValue,
   onOpenAgentProfile,
   profileAvatarUrl,
+  range,
 }: {
   agent: AgentUsage;
-  days: UsageWindowDays;
   label: string;
   maxDisplayValue: bigint;
   onOpenAgentProfile: (
@@ -267,6 +261,7 @@ function AgentUsageRow({
     options?: ProfilePanelOpenOptions,
   ) => void;
   profileAvatarUrl: string | null;
+  range: UsageRange;
 }) {
   const dt = deriveDisplayTotal(agent.usage);
 
@@ -279,7 +274,7 @@ function AgentUsageRow({
 
   return (
     <button
-      aria-label={`Open ${label} usage for the last ${days} days`}
+      aria-label={`Open ${label} usage for ${describeRange(range)}`}
       className="flex w-full items-center gap-3 rounded-2xl bg-muted/20 px-4 py-3 text-left transition-colors hover:bg-muted/40"
       data-testid={`agent-usage-row-${agent.agentPubkey}`}
       onClick={() => onOpenAgentProfile(agent.agentPubkey, { view: "usage" })}

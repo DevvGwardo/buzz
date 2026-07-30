@@ -21,8 +21,10 @@ use super::metric_store::AgentMetricIndexRow;
 
 /// Request for [`compute_series`]'s caller. `bucket_boundaries` are exact
 /// local-midnight Unix-second boundaries built by the frontend (inclusive
-/// start / exclusive end per adjacent pair): 8 entries = 7 buckets, 31
-/// entries = 30 buckets.
+/// start / exclusive end per adjacent pair): N entries = N - 1 buckets, so
+/// 2 entries = 1 bucket (`1d`), 8 = 7 buckets, 31 = 30 buckets, and an
+/// arbitrary custom range falls anywhere in between up to
+/// [`MAX_BOUNDARIES`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentUsageSeriesRequest {
@@ -35,6 +37,17 @@ pub struct AgentUsageSeriesRequest {
 /// historical calendar skips) while still rejecting arbitrary bins.
 const MAX_INTERVAL_SECS: i64 = 48 * 3600;
 
+/// Largest boundary count a request may carry: 367 boundaries = 366 daily
+/// buckets = one leap year, the product ceiling on the custom date-range
+/// picker. Bounds the SQLite window scan and keeps the rendered bar chart
+/// legible; the frontend clamps the picker to the same span so a user never
+/// reaches this check, which stays as fail-closed defense in depth.
+const MAX_BOUNDARIES: usize = 367;
+
+/// Smallest boundary count that describes a real window: 2 boundaries =
+/// 1 bucket, the `1d` case.
+const MIN_BOUNDARIES: usize = 2;
+
 /// Validate a request per the frozen contract + A9 (drops the 23–25h band
 /// for a `> 0 && <= 48h` sanity band) and A13 pubkey normalization.
 ///
@@ -42,9 +55,9 @@ const MAX_INTERVAL_SECS: i64 = 48 * 3600;
 /// agent pubkey, if one was supplied.
 pub(super) fn validate_request(req: &AgentUsageSeriesRequest) -> Result<Option<String>, String> {
     let n = req.bucket_boundaries.len();
-    if n != 8 && n != 31 {
+    if !(MIN_BOUNDARIES..=MAX_BOUNDARIES).contains(&n) {
         return Err(format!(
-            "bucket_boundaries must have exactly 8 or 31 entries, got {n}"
+            "bucket_boundaries must have between {MIN_BOUNDARIES} and {MAX_BOUNDARIES} entries, got {n}"
         ));
     }
 

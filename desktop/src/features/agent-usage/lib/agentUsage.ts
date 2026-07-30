@@ -18,7 +18,26 @@ import type {
 
 // ── Local-day boundary construction (M5, A9) ─────────────────────────────────
 
-export type UsageWindowDays = 7 | 30;
+export type UsageWindowDays = number;
+
+/**
+ * A selected usage window. Preset ranges are a trailing day count ending
+ * today; a custom range is an explicit inclusive local-date pair chosen in
+ * the picker.
+ */
+export type UsageRange =
+  | { kind: "preset"; days: 1 | 7 | 30 }
+  | { kind: "custom"; startDate: string; endDate: string };
+
+export const DEFAULT_USAGE_RANGE: UsageRange = { kind: "preset", days: 7 };
+
+/**
+ * Largest number of daily buckets a range may cover — one leap year. Mirrors
+ * `MAX_BOUNDARIES = 367` (bucket count + 1) in
+ * `desktop/src-tauri/src/archive/agent_usage.rs`. The picker clamps to this
+ * so the backend's fail-closed arity check is never the UX error path.
+ */
+export const MAX_RANGE_DAYS = 366;
 
 const DISTINCT_MIDNIGHT_MAX_STEP = 3;
 
@@ -108,6 +127,178 @@ export function msUntilNextLocalMidnight(
   const nextMidnight = new Date(referenceNow);
   nextMidnight.setHours(24, 0, 0, 0);
   return nextMidnight.getTime() - referenceNow.getTime();
+}
+
+/**
+ * Local midnight opening the civil day named by a `YYYY-MM-DD` string.
+ * Parsed field-wise into the local zone — never `new Date("YYYY-MM-DD")`,
+ * which JS parses as *UTC* midnight and so lands on the previous civil day
+ * for every negative-offset zone.
+ *
+ * Returns `null` for a malformed string or a field triple that isn't a real
+ * calendar date (e.g. `2026-02-30`), which `Date` would silently roll forward.
+ */
+export function parseLocalDate(value: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (match === null) return null;
+  const [year, month, day] = [
+    Number(match[1]),
+    Number(match[2]),
+    Number(match[3]),
+  ];
+  const parsed = new Date(year, month - 1, day);
+  parsed.setHours(0, 0, 0, 0);
+  // Reject a rolled-forward nonexistent date. A civil date genuinely skipped
+  // by a date-line move still normalizes to a different day-of-month, so it
+  // is rejected here too rather than silently querying the wrong day.
+  if (
+    parsed.getFullYear() !== year ||
+    parsed.getMonth() !== month - 1 ||
+    parsed.getDate() !== day
+  ) {
+    return null;
+  }
+  return parsed;
+}
+
+/** Local `YYYY-MM-DD` for a date, for round-tripping through the picker's `<input type="date">`. */
+export function formatLocalDate(date: Date): string {
+  const year = String(date.getFullYear()).padStart(4, "0");
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * Number of distinct local civil days in the inclusive `[startDate, endDate]`
+ * range, or `null` if either date is malformed or the range is inverted.
+ * Counts by walking distinct local midnights, so it agrees exactly with the
+ * boundary count {@link buildRangeBoundaries} produces across DST and skipped
+ * civil dates. Stops counting past {@link MAX_RANGE_DAYS} so an absurd range
+ * can't spin — callers treat an over-cap result as a validation failure.
+ */
+export function countRangeDays(
+  startDate: string,
+  endDate: string,
+): number | null {
+  const start = parseLocalDate(startDate);
+  const end = parseLocalDate(endDate);
+  if (start === null || end === null) return null;
+  if (start.getTime() > end.getTime()) return null;
+
+  let days = 1;
+  let cursor = start;
+  while (cursor.getTime() < end.getTime()) {
+    cursor = nextDistinctLocalMidnight(cursor);
+    days += 1;
+    if (days > MAX_RANGE_DAYS) return days;
+  }
+  return days;
+}
+
+/**
+ * Validation result for a custom range, carrying the human-facing reason so
+ * the picker can surface it instead of letting a rejected request surface a
+ * raw Rust error string.
+ */
+export type RangeValidation =
+  | { ok: true; days: number }
+  | { ok: false; message: string };
+
+/** Validate a custom range against the picker's contract: real dates, ordered, within one year. */
+export function validateCustomRange(
+  startDate: string,
+  endDate: string,
+): RangeValidation {
+  const start = parseLocalDate(startDate);
+  const end = parseLocalDate(endDate);
+  if (start === null || end === null) {
+    return { ok: false, message: "Enter both a start and an end date." };
+  }
+  if (start.getTime() > end.getTime()) {
+    return { ok: false, message: "Start date must be on or before end date." };
+  }
+  const days = countRangeDays(startDate, endDate);
+  if (days === null) {
+    return { ok: false, message: "Enter both a start and an end date." };
+  }
+  if (days > MAX_RANGE_DAYS) {
+    return {
+      ok: false,
+      message: `Pick a range of ${MAX_RANGE_DAYS} days or fewer.`,
+    };
+  }
+  return { ok: true, days };
+}
+
+/**
+ * Local-midnight boundaries covering the inclusive civil-day range
+ * `[startDate, endDate]` — `days + 1` entries, ending at the midnight that
+ * closes `endDate`. Walks distinct local midnights exactly like
+ * {@link buildLocalDayBoundaries}, so DST transitions, 30-minute-offset
+ * zones, and skipped civil dates behave identically.
+ *
+ * Returns `[]` for a range that fails {@link validateCustomRange}, so a
+ * malformed or over-cap range yields no query rather than a rejected one.
+ */
+export function buildCustomDayBoundaries(
+  startDate: string,
+  endDate: string,
+): number[] {
+  const validation = validateCustomRange(startDate, endDate);
+  if (!validation.ok) return [];
+
+  const start = parseLocalDate(startDate);
+  const end = parseLocalDate(endDate);
+  if (start === null || end === null) return [];
+
+  const midnights: Date[] = [start];
+  let cursor = start;
+  while (cursor.getTime() < end.getTime()) {
+    cursor = nextDistinctLocalMidnight(cursor);
+    midnights.push(cursor);
+  }
+  // Close the final civil day so the last bucket is end-exclusive.
+  midnights.push(nextDistinctLocalMidnight(cursor));
+
+  return midnights.map((d) => Math.floor(d.getTime() / 1_000));
+}
+
+/**
+ * Boundaries for any {@link UsageRange}. The single entry point the query
+ * layer uses, so presets and custom ranges cannot diverge in how civil days
+ * are constructed.
+ */
+export function buildRangeBoundaries(
+  range: UsageRange,
+  referenceNow: Date = new Date(),
+): number[] {
+  return range.kind === "preset"
+    ? buildLocalDayBoundaries(range.days, referenceNow)
+    : buildCustomDayBoundaries(range.startDate, range.endDate);
+}
+
+/**
+ * Human-facing label for the window, used in empty-state and a11y copy.
+ * Phrased to read after "for" — "for the last 7 days", "for Jan 1, 2026 –
+ * Feb 1, 2026" — so both range kinds fit the same sentence.
+ */
+export function describeRange(range: UsageRange): string {
+  if (range.kind === "preset") {
+    return range.days === 1 ? "the last day" : `the last ${range.days} days`;
+  }
+  return `${formatRangeEndpoint(range.startDate)} – ${formatRangeEndpoint(range.endDate)}`;
+}
+
+/** Short, year-bearing display for a custom endpoint; falls back to the raw string if unparseable. */
+function formatRangeEndpoint(value: string): string {
+  const parsed = parseLocalDate(value);
+  if (parsed === null) return value;
+  return parsed.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
 }
 
 // ── Bigint-safe token parsing/formatting ─────────────────────────────────────

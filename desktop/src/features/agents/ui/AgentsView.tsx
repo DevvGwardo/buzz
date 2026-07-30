@@ -272,12 +272,6 @@ export function AgentsView() {
               }}
             />
 
-            <AgentUsageSection
-              onOpenAgentProfile={(pubkey, options) => {
-                openProfilePanel?.(pubkey, options);
-              }}
-            />
-
             <TeamsSection
               error={
                 teamActions.teamsQuery.error instanceof Error
@@ -301,6 +295,12 @@ export function AgentsView() {
               }}
               personas={personas.libraryPersonas}
               teams={teamActions.teams}
+            />
+
+            <AgentUsageSection
+              onOpenAgentProfile={(pubkey, options) => {
+                openProfilePanel?.(pubkey, options);
+              }}
             />
           </div>
         </div>

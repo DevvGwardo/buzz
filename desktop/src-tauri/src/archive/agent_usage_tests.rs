@@ -701,16 +701,27 @@ fn req(boundaries: Vec<i64>, agent_pubkey: Option<String>) -> AgentUsageSeriesRe
 }
 
 #[test]
-fn validate_request_accepts_8_and_31_boundaries() {
+fn validate_request_accepts_boundary_counts_across_the_supported_range() {
+    // 2 boundaries = the `1d` single-bucket case.
+    assert!(validate_request(&req(vec![0, DAY], None)).is_ok());
     assert!(validate_request(&req(boundaries_7(), None)).is_ok());
     let b31: Vec<i64> = (0..=30).map(|i| i * DAY).collect();
     assert!(validate_request(&req(b31, None)).is_ok());
+    // 367 boundaries = 366 daily buckets = one leap year, the ceiling.
+    let b367: Vec<i64> = (0..=366).map(|i| i * DAY).collect();
+    assert_eq!(b367.len(), 367);
+    assert!(validate_request(&req(b367, None)).is_ok());
 }
 
 #[test]
-fn validate_request_rejects_wrong_boundary_count() {
-    let bad: Vec<i64> = (0..=5).map(|i| i * DAY).collect();
-    assert!(validate_request(&req(bad, None)).is_err());
+fn validate_request_rejects_boundary_count_outside_the_supported_range() {
+    // A single boundary describes no bucket at all.
+    assert!(validate_request(&req(vec![0], None)).is_err());
+    assert!(validate_request(&req(vec![], None)).is_err());
+    // 368 boundaries = 367 buckets, one past the one-leap-year ceiling.
+    let b368: Vec<i64> = (0..=367).map(|i| i * DAY).collect();
+    assert_eq!(b368.len(), 368);
+    assert!(validate_request(&req(b368, None)).is_err());
 }
 
 #[test]

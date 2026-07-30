@@ -730,7 +730,7 @@ fn agent_usage_series(
     let end = *request
         .bucket_boundaries
         .last()
-        .expect("validate_request already rejected fewer than 8 boundaries");
+        .expect("validate_request already rejected fewer than 2 boundaries");
 
     let window_rows = metric_store::load_window_valid_rows(
         conn,

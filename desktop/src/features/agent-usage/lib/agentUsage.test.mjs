@@ -3,20 +3,28 @@ import test from "node:test";
 
 import {
   bigintRatio,
+  buildCustomDayBoundaries,
   buildLocalDayBoundaries,
+  buildRangeBoundaries,
+  countRangeDays,
+  describeRange,
   deriveDisplayTotal,
   deriveUsageIngressTrailing,
   formatCoverageDate,
   formatEstimatedCostUsd,
+  formatLocalDate,
   formatTokenCountCompact,
   formatTokenCountExact,
   isPartialField,
   isUnknownField,
+  MAX_RANGE_DAYS,
   msUntilNextLocalMidnight,
+  parseLocalDate,
   parseTokenCount,
   sortAgentsByDisplayTotal,
   sortModelsByDisplayTotal,
   sumKnownBucketTotals,
+  validateCustomRange,
 } from "./agentUsage.ts";
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -838,4 +846,215 @@ test("deriveUsageIngressTrailing returns 'No recent data' when all usage fields 
     agents: [agentUsage("a", null)],
   });
   assert.equal(deriveUsageIngressTrailing(series), "No recent data");
+});
+
+// ── Custom-range parsing, validation, and boundary construction ──────────────
+
+test("parseLocalDate resolves a YYYY-MM-DD string to local midnight, not UTC midnight", () => {
+  withTz("America/New_York", () => {
+    const parsed = parseLocalDate("2026-03-15");
+    assert.notEqual(parsed, null);
+    // `new Date("2026-03-15")` is UTC midnight, which is Mar 14 20:00 in
+    // New York — the field-wise parse must land on Mar 15 locally instead.
+    assert.equal(parsed.getFullYear(), 2026);
+    assert.equal(parsed.getMonth(), 2);
+    assert.equal(parsed.getDate(), 15);
+    assert.equal(parsed.getHours(), 0);
+    assert.notEqual(parsed.getTime(), new Date("2026-03-15").getTime());
+  });
+});
+
+test("parseLocalDate rejects a nonexistent calendar date instead of rolling it forward", () => {
+  // `new Date(2026, 1, 30)` silently normalizes to Mar 2 — querying the
+  // wrong civil day. The guard must reject it outright.
+  assert.equal(parseLocalDate("2026-02-30"), null);
+  assert.equal(parseLocalDate("2026-13-01"), null);
+  assert.equal(parseLocalDate("2026-00-10"), null);
+});
+
+test("parseLocalDate rejects malformed input", () => {
+  for (const value of [
+    "",
+    "2026-3-15",
+    "15/03/2026",
+    "2026-03-15T00:00",
+    "x",
+  ]) {
+    assert.equal(parseLocalDate(value), null, `expected null for ${value}`);
+  }
+});
+
+test("parseLocalDate accepts a leap day in a leap year and rejects it otherwise", () => {
+  assert.notEqual(parseLocalDate("2024-02-29"), null);
+  assert.equal(parseLocalDate("2026-02-29"), null);
+});
+
+test("formatLocalDate round-trips through parseLocalDate", () => {
+  withTz("America/New_York", () => {
+    for (const value of ["2026-01-01", "2026-03-08", "2026-12-31"]) {
+      assert.equal(formatLocalDate(parseLocalDate(value)), value);
+    }
+  });
+});
+
+test("countRangeDays counts an inclusive single-day range as one day", () => {
+  assert.equal(countRangeDays("2026-05-04", "2026-05-04"), 1);
+});
+
+test("countRangeDays counts civil days, not 24-hour spans, across a DST transition", () => {
+  withTz("America/New_York", () => {
+    // Mar 8 2026 is spring-forward: the span is 23h short of 3 * 24h but is
+    // still 3 civil days.
+    assert.equal(countRangeDays("2026-03-07", "2026-03-09"), 3);
+  });
+});
+
+test("countRangeDays returns null for an inverted or malformed range", () => {
+  assert.equal(countRangeDays("2026-05-10", "2026-05-01"), null);
+  assert.equal(countRangeDays("nope", "2026-05-01"), null);
+  assert.equal(countRangeDays("2026-05-01", "2026-02-30"), null);
+});
+
+test("countRangeDays stops counting past the cap instead of walking an absurd range", () => {
+  const days = countRangeDays("1900-01-01", "2100-01-01");
+  assert.ok(days > MAX_RANGE_DAYS, "over-cap range reports over-cap");
+});
+
+test("validateCustomRange accepts a range exactly at the maximum length", () => {
+  // 2024 is a leap year: Jan 1 – Dec 31 inclusive is 366 civil days.
+  const result = validateCustomRange("2024-01-01", "2024-12-31");
+  assert.deepEqual(result, { ok: true, days: MAX_RANGE_DAYS });
+});
+
+test("validateCustomRange rejects a range one day past the maximum with a length message", () => {
+  const result = validateCustomRange("2024-01-01", "2025-01-01");
+  assert.equal(result.ok, false);
+  assert.match(result.message, /366 days or fewer/);
+});
+
+test("validateCustomRange rejects an inverted range with an ordering message", () => {
+  const result = validateCustomRange("2026-05-10", "2026-05-01");
+  assert.equal(result.ok, false);
+  assert.match(result.message, /on or before/);
+});
+
+test("validateCustomRange rejects a missing or malformed endpoint", () => {
+  for (const [start, end] of [
+    ["", "2026-05-01"],
+    ["2026-05-01", ""],
+    ["2026-02-30", "2026-05-01"],
+  ]) {
+    const result = validateCustomRange(start, end);
+    assert.equal(result.ok, false);
+    assert.match(result.message, /start and an end date/);
+  }
+});
+
+test("buildCustomDayBoundaries returns days+1 strictly increasing boundaries closing the final day", () => {
+  withTz("America/New_York", () => {
+    const boundaries = buildCustomDayBoundaries("2026-05-01", "2026-05-03");
+    assert.equal(boundaries.length, 4);
+    assertStrictlyIncreasing(boundaries);
+    assert.equal(
+      boundaries[0],
+      Math.floor(new Date(2026, 4, 1).getTime() / 1_000),
+    );
+    assert.equal(
+      boundaries.at(-1),
+      Math.floor(new Date(2026, 4, 4).getTime() / 1_000),
+      "final boundary opens the day after the requested end date",
+    );
+  });
+});
+
+test("buildCustomDayBoundaries returns exactly 2 boundaries for a single-day range", () => {
+  withTz("America/New_York", () => {
+    const boundaries = buildCustomDayBoundaries("2026-05-04", "2026-05-04");
+    assert.equal(boundaries.length, 2);
+    assertStrictlyIncreasing(boundaries);
+  });
+});
+
+test("buildCustomDayBoundaries stays strictly increasing across a spring-forward DST transition", () => {
+  withTz("America/New_York", () => {
+    const boundaries = buildCustomDayBoundaries("2026-03-06", "2026-03-10");
+    assert.equal(boundaries.length, 6);
+    assertStrictlyIncreasing(boundaries);
+  });
+});
+
+test("buildCustomDayBoundaries emits no duplicate boundary across a skipped civil date", () => {
+  withTz("Pacific/Apia", () => {
+    // 2011-12-30 does not exist in Apia (date-line move). The walk must
+    // produce distinct midnights rather than a duplicated boundary.
+    const boundaries = buildCustomDayBoundaries("2011-12-28", "2011-12-31");
+    assertStrictlyIncreasing(boundaries);
+    assert.equal(new Set(boundaries).size, boundaries.length);
+  });
+});
+
+test("buildCustomDayBoundaries produces the maximum boundary count at the cap", () => {
+  withTz("America/New_York", () => {
+    const boundaries = buildCustomDayBoundaries("2024-01-01", "2024-12-31");
+    assert.equal(boundaries.length, MAX_RANGE_DAYS + 1);
+    assertStrictlyIncreasing(boundaries);
+  });
+});
+
+test("buildCustomDayBoundaries returns no boundaries for a range the picker rejects", () => {
+  assert.deepEqual(buildCustomDayBoundaries("2026-05-10", "2026-05-01"), []);
+  assert.deepEqual(buildCustomDayBoundaries("2024-01-01", "2025-01-01"), []);
+  assert.deepEqual(buildCustomDayBoundaries("", ""), []);
+});
+
+test("buildRangeBoundaries matches buildLocalDayBoundaries for every preset", () => {
+  const now = new Date(2026, 5, 15, 12, 0, 0);
+  for (const days of [1, 7, 30]) {
+    assert.deepEqual(
+      buildRangeBoundaries({ kind: "preset", days }, now),
+      buildLocalDayBoundaries(days, now),
+      `preset ${days}d must not diverge from the shared day walk`,
+    );
+  }
+});
+
+test("buildRangeBoundaries yields 2 boundaries for the 1-day preset", () => {
+  const now = new Date(2026, 5, 15, 12, 0, 0);
+  const boundaries = buildRangeBoundaries({ kind: "preset", days: 1 }, now);
+  assert.equal(boundaries.length, 2);
+  assert.equal(
+    boundaries[0],
+    Math.floor(new Date(2026, 5, 15).getTime() / 1_000),
+  );
+  assert.equal(
+    boundaries[1],
+    Math.floor(new Date(2026, 5, 16).getTime() / 1_000),
+  );
+});
+
+test("buildRangeBoundaries delegates custom ranges to the custom-day walk", () => {
+  assert.deepEqual(
+    buildRangeBoundaries({
+      kind: "custom",
+      startDate: "2026-05-01",
+      endDate: "2026-05-03",
+    }),
+    buildCustomDayBoundaries("2026-05-01", "2026-05-03"),
+  );
+});
+
+test("describeRange renders singular copy for the 1-day preset", () => {
+  assert.equal(describeRange({ kind: "preset", days: 1 }), "the last day");
+  assert.equal(describeRange({ kind: "preset", days: 7 }), "the last 7 days");
+  assert.equal(describeRange({ kind: "preset", days: 30 }), "the last 30 days");
+});
+
+test("describeRange renders a custom range as a readable date span", () => {
+  const described = describeRange({
+    kind: "custom",
+    startDate: "2026-05-01",
+    endDate: "2026-05-03",
+  });
+  assert.match(described, /2026/);
+  assert.match(described, /–/);
 });

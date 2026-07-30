@@ -186,7 +186,7 @@ test("shows a loading skeleton while the usage series is in flight", async ({
   await expect(page.getByTestId("agent-usage-skeleton")).toHaveCount(0);
 });
 
-test("renders ranked agent rows and switches between the 7d and 30d windows", async ({
+test("renders ranked agent rows and switches between the 1d, 7d, and 30d presets", async ({
   page,
 }) => {
   await installMockBridge(page);
@@ -232,11 +232,20 @@ test("renders ranked agent rows and switches between the 7d and 30d windows", as
   await expect(row).toContainText("1.5K");
   await expect(row).toContainText("Token Bot");
 
-  await page.getByTestId("agent-usage-window-30").click();
-  await expect(page.getByTestId("agent-usage-window-30")).toHaveAttribute(
+  await expect(page.getByTestId("agent-usage-window-7")).toHaveAttribute(
     "data-state",
     "active",
   );
+
+  for (const preset of ["30", "1"]) {
+    await page.getByTestId(`agent-usage-window-${preset}`).click();
+    await expect(
+      page.getByTestId(`agent-usage-window-${preset}`),
+    ).toHaveAttribute("data-state", "active");
+    // Switching presets must never blank the card — the query re-runs against
+    // a new boundary set but the seeded series is returned for every window.
+    await expect(page.getByTestId("agent-usage-card")).toBeVisible();
+  }
 });
 
 test("clicking an agent row opens the profile panel's Usage focused view", async ({
@@ -587,7 +596,7 @@ test("a historical author with 30d-only archived evidence gets a valid empty 7d 
 
   const outsideWindow = page.getByTestId("agent-usage-focused-outside-window");
   await expect(outsideWindow).toBeVisible();
-  await expect(outsideWindow).toContainText("Try the 30-day window.");
+  await expect(outsideWindow).toContainText("Try a wider window.");
 
   // Eligible via archived evidence alone (no ownership) — never bounced.
   await expectHashSearchParam(page, "profileView", "usage");
@@ -844,7 +853,7 @@ test("overview and focused view distinguish invalid-only windows from ordinary e
 }) => {
   // An invalid-only window: invalidReportCount > 0, zero valid agents/buckets.
   // The overview must NOT say "No locally archived usage in the last N days"
-  // and the focused view must NOT show "Try the 30-day window" — both would
+  // and the focused view must NOT show the outside-window hint — both would
   // mislabel in-window-but-uncountable evidence as absent.
   await installMockBridge(page);
   await openAgentsView(page);
@@ -902,7 +911,7 @@ test("overview and focused view distinguish invalid-only windows from ordinary e
     timeout: 10_000,
   });
 
-  // Focused view must show the invalid-only state, NOT "Try the 30-day window".
+  // Focused view must show the invalid-only state, NOT the outside-window hint.
   await expect(
     page.getByTestId("agent-usage-focused-invalid-only"),
   ).toBeVisible();
@@ -1111,4 +1120,331 @@ test("overview row shows Partial badge and ingress shows partial marker when I/O
   const ingressRow = page.getByTestId(`user-profile-view-usage-${agentPubkey}`);
   await expect(ingressRow).toBeVisible();
   await expect(ingressRow).toContainText("Partial");
+});
+
+// ── Task C: date x-axis, on-bar values, hover tooltip ────────────────────────
+
+test("each daily bar labels its date on the x-axis and its token total on the bar", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await openAgentsView(page);
+
+  const agentPubkey = await addGenericAgent(page, "general", "Axis Bot");
+
+  const knownStart = 1_700_000_000;
+  const unknownStart = knownStart + 86_400;
+
+  await page.evaluate(
+    ({ series }) => {
+      const testWindow = window as Window & {
+        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
+      };
+      testWindow.__BUZZ_E2E__ ??= {};
+      testWindow.__BUZZ_E2E__.mock ??= {};
+      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
+    },
+    {
+      series: mockUsageSeries({
+        agents: [mockAgentUsage(agentPubkey, { buckets: [] })],
+        buckets: [
+          {
+            start: knownStart,
+            end: knownStart + 86_400,
+            usage: reportedUsage({
+              inputTokens: "1000",
+              outputTokens: "500",
+              totalTokens: "1500",
+            }),
+            reportCount: 1,
+            hasUnknownUsage: false,
+          },
+          {
+            start: unknownStart,
+            end: unknownStart + 86_400,
+            usage: reportedUsage({ totalTokens: null }),
+            reportCount: 1,
+            hasUnknownUsage: true,
+          },
+        ],
+      }),
+    },
+  );
+
+  await page.getByTestId("open-agents-view").click();
+  await expect(page.getByTestId("agent-usage-overall-bars")).toBeVisible();
+
+  // The x-axis tick is the bucket's DATE, rendered in the browser's locale —
+  // asserted against the same `toLocaleDateString` call the component makes,
+  // so the expectation is timezone/locale-independent.
+  const expectedDate = await page.evaluate(
+    (start) =>
+      new Date(start * 1000).toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+      }),
+    knownStart,
+  );
+  const dateTick = page.getByTestId(`agent-usage-daily-bar-date-${knownStart}`);
+  await expect(dateTick).toBeVisible();
+  await expect(dateTick).toHaveText(expectedDate);
+  // The date must NOT be the token total — the pre-fix chart labeled the axis
+  // with the value, which is the bug this asserts against.
+  await expect(dateTick).not.toContainText("1.5K");
+
+  // The token total renders directly ON the bar.
+  const valueLabel = page.getByTestId(
+    `agent-usage-daily-bar-value-${knownStart}`,
+  );
+  await expect(valueLabel).toBeVisible();
+  await expect(valueLabel).toHaveText("1.5K");
+
+  // An uncountable day shows an em-dash on the bar, never a zero.
+  const unknownValue = page.getByTestId(
+    `agent-usage-daily-bar-value-${unknownStart}`,
+  );
+  await expect(unknownValue).toHaveText("—");
+});
+
+test("hovering a daily bar reveals a tooltip with the total, input, and output breakdown", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await openAgentsView(page);
+
+  const agentPubkey = await addGenericAgent(page, "general", "Tooltip Bot");
+
+  const bucketStart = 1_700_000_000;
+  await page.evaluate(
+    ({ series }) => {
+      const testWindow = window as Window & {
+        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
+      };
+      testWindow.__BUZZ_E2E__ ??= {};
+      testWindow.__BUZZ_E2E__.mock ??= {};
+      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
+    },
+    {
+      series: mockUsageSeries({
+        agents: [mockAgentUsage(agentPubkey, { buckets: [] })],
+        buckets: [
+          {
+            start: bucketStart,
+            end: bucketStart + 86_400,
+            usage: reportedUsage({
+              inputTokens: "1200",
+              outputTokens: "300",
+              totalTokens: "1500",
+            }),
+            reportCount: 1,
+            hasUnknownUsage: false,
+          },
+        ],
+      }),
+    },
+  );
+
+  await page.getByTestId("open-agents-view").click();
+  await expect(page.getByTestId("agent-usage-overall-bars")).toBeVisible();
+
+  await page.getByTestId(`agent-usage-daily-bar-${bucketStart}`).hover();
+
+  // Exact grouped values — the split must be legible without opening the
+  // focused view, which is the whole point of the tooltip.
+  const tooltip = page
+    .getByTestId(`agent-usage-daily-bar-tooltip-${bucketStart}`)
+    .first();
+  await expect(tooltip).toBeVisible({ timeout: 10_000 });
+  await expect(tooltip).toContainText("Total: 1,500");
+  await expect(tooltip).toContainText("Input: 1,200");
+  await expect(tooltip).toContainText("Output: 300");
+});
+
+test("a bar tooltip reports an unknown field as unknown rather than zero", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await openAgentsView(page);
+
+  const agentPubkey = await addGenericAgent(page, "general", "Halfknown Bot");
+
+  const bucketStart = 1_700_000_000;
+  await page.evaluate(
+    ({ series }) => {
+      const testWindow = window as Window & {
+        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
+      };
+      testWindow.__BUZZ_E2E__ ??= {};
+      testWindow.__BUZZ_E2E__.mock ??= {};
+      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
+    },
+    {
+      series: mockUsageSeries({
+        agents: [mockAgentUsage(agentPubkey, { buckets: [] })],
+        buckets: [
+          {
+            start: bucketStart,
+            end: bucketStart + 86_400,
+            // Output is genuinely unreported: it must read "unknown", and the
+            // total must stay unknown rather than being derived from input.
+            usage: reportedUsage({
+              inputTokens: "1200",
+              outputTokens: null,
+              totalTokens: null,
+            }),
+            reportCount: 1,
+            hasUnknownUsage: true,
+          },
+        ],
+      }),
+    },
+  );
+
+  await page.getByTestId("open-agents-view").click();
+  await expect(page.getByTestId("agent-usage-overall-bars")).toBeVisible();
+
+  await page.getByTestId(`agent-usage-daily-bar-${bucketStart}`).hover();
+
+  const tooltip = page
+    .getByTestId(`agent-usage-daily-bar-tooltip-${bucketStart}`)
+    .first();
+  await expect(tooltip).toBeVisible({ timeout: 10_000 });
+  await expect(tooltip).toContainText("Total: unknown");
+  await expect(tooltip).toContainText("Input: 1,200");
+  await expect(tooltip).toContainText("Output: unknown");
+  await expect(tooltip).not.toContainText("Output: 0");
+});
+
+// ── Task D: custom date-range picker ─────────────────────────────────────────
+
+test("the custom range picker applies an arbitrary date span and labels it in the empty state", async ({
+  page,
+}) => {
+  await installMockBridge(page, { agentUsageSeries: mockUsageSeries() });
+  await openAgentsView(page);
+
+  await page.getByTestId("agent-usage-window-custom").click();
+  await expect(
+    page.getByTestId("agent-usage-window-custom-popover"),
+  ).toBeVisible();
+
+  await page.getByTestId("agent-usage-window-custom-start").fill("2026-01-05");
+  await page.getByTestId("agent-usage-window-custom-end").fill("2026-01-09");
+  await expect(
+    page.getByTestId("agent-usage-window-custom-summary"),
+  ).toContainText("5 days selected");
+
+  await page.getByTestId("agent-usage-window-custom-apply").click();
+  await expect(
+    page.getByTestId("agent-usage-window-custom-popover"),
+  ).toHaveCount(0);
+
+  // The custom tab is now the active window, and the empty-state copy names
+  // the applied span instead of "the last N days".
+  await expect(page.getByTestId("agent-usage-window-custom")).toHaveAttribute(
+    "data-state",
+    "active",
+  );
+  const empty = page.getByTestId("agent-usage-empty");
+  await expect(empty).toBeVisible();
+  await expect(empty).toContainText("2026");
+  await expect(empty).not.toContainText("the last 7 days");
+});
+
+test("the custom range picker blocks an inverted range and a span over one year", async ({
+  page,
+}) => {
+  await installMockBridge(page, { agentUsageSeries: mockUsageSeries() });
+  await openAgentsView(page);
+
+  await page.getByTestId("agent-usage-window-custom").click();
+  const apply = page.getByTestId("agent-usage-window-custom-apply");
+  const error = page.getByTestId("agent-usage-window-custom-error");
+
+  await page.getByTestId("agent-usage-window-custom-start").fill("2026-03-10");
+  await page.getByTestId("agent-usage-window-custom-end").fill("2026-03-01");
+  await expect(error).toContainText("on or before");
+  await expect(apply).toBeDisabled();
+
+  // 2024-01-01 → 2025-01-01 is 367 civil days: one past the cap the backend's
+  // boundary arity admits, so the picker must refuse it locally rather than
+  // letting the request surface a Rust error.
+  await page.getByTestId("agent-usage-window-custom-start").fill("2024-01-01");
+  await page.getByTestId("agent-usage-window-custom-end").fill("2025-01-01");
+  await expect(error).toContainText("366 days or fewer");
+  await expect(apply).toBeDisabled();
+
+  // Pulling the end back to the cap clears the error and enables Apply.
+  await page.getByTestId("agent-usage-window-custom-end").fill("2024-12-31");
+  await expect(
+    page.getByTestId("agent-usage-window-custom-summary"),
+  ).toContainText("366 days selected");
+  await expect(apply).toBeEnabled();
+});
+
+test("the focused view exposes its own independent range selector", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await openAgentsView(page);
+
+  const agentPubkey = await addGenericAgent(page, "general", "Focused Bot");
+
+  await page.evaluate(
+    ({ series }) => {
+      const testWindow = window as Window & {
+        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
+      };
+      testWindow.__BUZZ_E2E__ ??= {};
+      testWindow.__BUZZ_E2E__.mock ??= {};
+      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
+    },
+    { series: mockUsageSeries({ agents: [mockAgentUsage(agentPubkey)] }) },
+  );
+
+  await page.getByTestId("open-agents-view").click();
+  await page.getByTestId(`agent-usage-row-${agentPubkey}`).click();
+  await expect(page.getByTestId("agent-usage-focused-view")).toBeVisible();
+
+  await page.getByTestId("agent-usage-focused-window-1").click();
+  await expect(
+    page.getByTestId("agent-usage-focused-window-1"),
+  ).toHaveAttribute("data-state", "active");
+
+  // The overview's own selector is unaffected — the two windows are
+  // deliberately independent.
+  await expect(page.getByTestId("agent-usage-window-7")).toHaveAttribute(
+    "data-state",
+    "active",
+  );
+});
+
+// ── Nav order: the Usage section sits at the bottom of the Agents page ───────
+
+test("the usage section renders below the agents and teams sections", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await openAgentsView(page);
+
+  const order = await page.evaluate(() => {
+    const testIds = [
+      "agents-library-personas",
+      "agents-library-teams",
+      "agents-usage-section",
+    ];
+    return testIds.map((testId) => {
+      const element = document.querySelector(`[data-testid="${testId}"]`);
+      return element === null
+        ? null
+        : element.getBoundingClientRect().top + window.scrollY;
+    });
+  });
+
+  const [personasTop, teamsTop, usageTop] = order;
+  expect(personasTop).not.toBeNull();
+  expect(teamsTop).not.toBeNull();
+  expect(usageTop).not.toBeNull();
+  expect(usageTop as number).toBeGreaterThan(personasTop as number);
+  expect(usageTop as number).toBeGreaterThan(teamsTop as number);
 });

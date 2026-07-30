@@ -6,6 +6,9 @@
  *   2. Focused usage subview in the agent profile panel (expanded)
  *   3. Multi-day bars chart with varied data (known, partial, unknown, empty days)
  *   4. Empty state when collection is on but nothing has been archived yet
+ *   5. Bar hover tooltip showing the total/input/output breakdown
+ *   6. Custom date-range picker popover
+ *   7. Agents page with the Usage section last in the nav order
  */
 
 import { expect, test } from "@playwright/test";
@@ -440,5 +443,111 @@ test.describe("agent usage screenshots", () => {
     const card = page.getByTestId("agent-usage-card");
     await waitForAnimations(page);
     await card.screenshot({ path: `${SHOTS}/04-empty-state.png` });
+  });
+
+  // ── Shot 5: Bar hover tooltip with the total/input/output breakdown ───────
+  test("05-bar-hover-tooltip", async ({ page }) => {
+    await installMockBridge(page);
+    await openAgentsView(page);
+
+    const agentPubkey = await addGenericAgent(page, "Tooltip Bot");
+
+    const base = 1_700_000_000;
+    const days = [900, 1200, 450, 1800, 600, 1100, 750];
+    await page.evaluate(
+      ({ series }) => {
+        const w = window as Window & {
+          __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
+        };
+        w.__BUZZ_E2E__ ??= {};
+        w.__BUZZ_E2E__.mock ??= {};
+        w.__BUZZ_E2E__.mock.agentUsageSeries = series;
+      },
+      {
+        series: mockUsageSeries({
+          agents: [
+            mockAgentUsage(agentPubkey, {
+              usage: reportedUsage({
+                totalTokens: "6800",
+                inputTokens: "5100",
+                outputTokens: "1700",
+              }),
+            }),
+          ],
+          buckets: days.map((tokens, i) => ({
+            start: base + i * 86_400,
+            end: base + (i + 1) * 86_400,
+            usage: reportedUsage({
+              totalTokens: String(tokens),
+              inputTokens: String(Math.round(tokens * 0.75)),
+              outputTokens: String(tokens - Math.round(tokens * 0.75)),
+            }),
+            reportCount: 1,
+            hasUnknownUsage: false,
+          })),
+          coverage: {
+            firstArchivedAt: base,
+            firstReportedAt: base,
+            hasUnknownUsage: false,
+            invalidReportCount: 0,
+            lastArchivedAt: base + 6 * 86_400,
+            lastReportedAt: base + 6 * 86_400,
+            reportCount: 7,
+          },
+        }),
+      },
+    );
+
+    await page.getByTestId("open-agents-view").click();
+    await expect(page.getByTestId("agent-usage-overall-bars")).toBeVisible();
+
+    const hoveredStart = base + 3 * 86_400;
+    await page.getByTestId(`agent-usage-daily-bar-${hoveredStart}`).hover();
+    await expect(
+      page.getByTestId(`agent-usage-daily-bar-tooltip-${hoveredStart}`).first(),
+    ).toBeVisible({ timeout: 10_000 });
+
+    await waitForAnimations(page);
+    // Full-page shot: the tooltip is portalled outside the card element.
+    await page.screenshot({ path: `${SHOTS}/05-bar-hover-tooltip.png` });
+  });
+
+  // ── Shot 6: Custom date-range picker popover ──────────────────────────────
+  test("06-custom-range-picker", async ({ page }) => {
+    await installMockBridge(page, { agentUsageSeries: mockUsageSeries() });
+    await openAgentsView(page);
+
+    await page.getByTestId("agent-usage-window-custom").click();
+    await expect(
+      page.getByTestId("agent-usage-window-custom-popover"),
+    ).toBeVisible();
+    await page
+      .getByTestId("agent-usage-window-custom-start")
+      .fill("2026-01-05");
+    await page.getByTestId("agent-usage-window-custom-end").fill("2026-01-19");
+    await expect(
+      page.getByTestId("agent-usage-window-custom-summary"),
+    ).toBeVisible();
+
+    await waitForAnimations(page);
+    // Full-page shot: the popover is portalled outside the card element.
+    await page.screenshot({ path: `${SHOTS}/06-custom-range-picker.png` });
+  });
+
+  // ── Shot 7: Usage section positioned last on the Agents page ──────────────
+  test("07-usage-section-last-in-nav", async ({ page }) => {
+    await installMockBridge(page);
+    await openAgentsView(page);
+
+    await addGenericAgent(page, "Order Bot");
+    await page.getByTestId("open-agents-view").click();
+    await expect(page.getByTestId("agents-usage-section")).toBeVisible();
+
+    await page.getByTestId("agents-usage-section").scrollIntoViewIfNeeded();
+    await waitForAnimations(page);
+    await page.screenshot({
+      path: `${SHOTS}/07-usage-section-last-in-nav.png`,
+      fullPage: true,
+    });
   });
 });

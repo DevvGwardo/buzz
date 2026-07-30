@@ -11,10 +11,11 @@ import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 import { Skeleton } from "@/shared/ui/skeleton";
-import { Tabs, TabsList, TabsTrigger } from "@/shared/ui/tabs";
 import { useAgentUsageSeries } from "../hooks";
 import {
+  DEFAULT_USAGE_RANGE,
   deriveDisplayTotal,
+  describeRange,
   formatCoverageDate,
   formatEstimatedCostUsd,
   formatTokenCountCompact,
@@ -24,13 +25,14 @@ import {
   parseTokenCount,
   sortModelsByDisplayTotal,
   type DisplayTotal,
-  type UsageWindowDays,
+  type UsageRange,
 } from "../lib/agentUsage";
 import { AgentUsageDailyBars } from "./AgentUsageDailyBars";
+import { AgentUsageRangeTabs } from "./AgentUsageRangeTabs";
 
 /**
  * Per-agent Usage focused subview, rendered from the profile panel when
- * `view === 'usage'` (M4/A9/A13, frozen Rev 3 plan). Owns its own 7d/30d
+ * `view === 'usage'` (M4/A9/A13, frozen Rev 3 plan). Owns its own window
  * selector and author-filtered query — independent of the Agents overview.
  *
  * A13 fail-closed: eligibility is ownership (`canViewUsage`) OR archived
@@ -48,8 +50,8 @@ export function AgentUsageFocusedView({
   canViewUsage: boolean;
   onIneligible: () => void;
 }) {
-  const [days, setDays] = React.useState<UsageWindowDays>(7);
-  const query = useAgentUsageSeries({ agentPubkey, days });
+  const [range, setRange] = React.useState<UsageRange>(DEFAULT_USAGE_RANGE);
+  const query = useAgentUsageSeries({ agentPubkey, range });
   const { onOpenSettings } = useAppShell();
 
   React.useEffect(() => {
@@ -59,19 +61,11 @@ export function AgentUsageFocusedView({
 
   return (
     <div className="space-y-4 pt-4" data-testid="agent-usage-focused-view">
-      <Tabs
-        onValueChange={(value) => setDays(value === "30" ? 30 : 7)}
-        value={String(days)}
-      >
-        <TabsList>
-          <TabsTrigger data-testid="agent-usage-focused-window-7" value="7">
-            7d
-          </TabsTrigger>
-          <TabsTrigger data-testid="agent-usage-focused-window-30" value="30">
-            30d
-          </TabsTrigger>
-        </TabsList>
-      </Tabs>
+      <AgentUsageRangeTabs
+        onRangeChange={setRange}
+        range={range}
+        testIdPrefix="agent-usage-focused-window"
+      />
 
       {query.isLoading ? (
         <AgentUsageFocusedSkeleton />
@@ -91,8 +85,8 @@ export function AgentUsageFocusedView({
         </Alert>
       ) : query.data ? (
         <AgentUsageFocusedContent
-          days={days}
           onOpenSettings={onOpenSettings}
+          range={range}
           series={query.data}
         />
       ) : null}
@@ -111,12 +105,12 @@ function AgentUsageFocusedSkeleton() {
 }
 
 function AgentUsageFocusedContent({
-  days,
   onOpenSettings,
+  range,
   series,
 }: {
-  days: UsageWindowDays;
   onOpenSettings: ((section: "local-archive") => void) | null;
+  range: UsageRange;
   series: AgentUsageSeries;
 }) {
   const agent = series.agents[0];
@@ -145,7 +139,7 @@ function AgentUsageFocusedContent({
         className="text-sm text-muted-foreground"
         data-testid="agent-usage-focused-empty"
       >
-        No locally archived usage in the last {days} days. Usage appears after
+        No locally archived usage in {describeRange(range)}. Usage appears after
         this agent completes a usage-reporting turn.
       </p>
     );
@@ -181,16 +175,16 @@ function AgentUsageFocusedContent({
           className="text-sm text-muted-foreground"
           data-testid="agent-usage-focused-outside-window"
         >
-          No locally archived usage in the last {days} days, but this agent has
-          reported usage previously. Try the 30-day window.
+          No locally archived usage in {describeRange(range)}, but this agent
+          has reported usage previously. Try a wider window.
         </p>
       ) : hasInvalidOnlyInWindow ? (
         <p
           className="text-sm text-muted-foreground"
           data-testid="agent-usage-focused-invalid-only"
         >
-          Usage was collected in the last {days} days but could not be counted —
-          reports with unreadable timestamps or missing session totals are
+          Usage was collected in {describeRange(range)} but could not be counted
+          — reports with unreadable timestamps or missing session totals are
           excluded and are not assigned to any day.
         </p>
       ) : null}

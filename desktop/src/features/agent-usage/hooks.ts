@@ -7,10 +7,11 @@ import {
   type AgentUsageSeries,
 } from "@/shared/api/tauriArchive";
 import {
-  buildLocalDayBoundaries,
+  buildRangeBoundaries,
+  DEFAULT_USAGE_RANGE,
   deriveUsageIngressTrailing,
   msUntilNextLocalMidnight,
-  type UsageWindowDays,
+  type UsageRange,
 } from "./lib/agentUsage";
 
 /** Root query key for the whole `agent-usage` family — invalidated en masse on any agent-metric change (M4/A13). */
@@ -32,15 +33,19 @@ export function agentUsageQueryKey(
 }
 
 /**
- * Local-day boundaries for the given window that recompute automatically at
+ * Local-day boundaries for the given range that recompute automatically at
  * every local midnight (M4) — no `setInterval` (which would drift across
  * DST), just a single scheduled `setTimeout` that reschedules itself each
  * time it fires. Split out of {@link useAgentUsageSeries} so the rollover
  * mechanics are testable without a `QueryClientProvider`.
+ *
+ * A custom range is anchored to explicit dates, so midnight rollover leaves
+ * it unchanged; the timer still runs so a later switch back to a preset is
+ * immediately correct.
  */
-export function useLocalDayBoundaries(days: UsageWindowDays): number[] {
+export function useLocalDayBoundaries(range: UsageRange): number[] {
   // Bumped once per local midnight so `boundaries` below recomputes even
-  // though `days` hasn't changed.
+  // though `range` hasn't changed.
   const [rolloverTick, setRolloverTick] = React.useState(0);
 
   // `rolloverTick` is the only intended dependency: each fire reschedules
@@ -54,13 +59,23 @@ export function useLocalDayBoundaries(days: UsageWindowDays): number[] {
     return () => clearTimeout(timeoutId);
   }, [rolloverTick]);
 
-  // `rolloverTick` intentionally forces a recompute at local midnight even
-  // though it carries no boundary data itself.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: rolloverTick drives recompute, not boundary data
+  // Depend on the range's fields rather than the object so a caller passing a
+  // fresh literal each render doesn't rebuild boundaries (and refetch) every
+  // time. `rolloverTick` intentionally forces a recompute at local midnight
+  // even though it carries no boundary data itself.
+  const rangeKey = serializeRange(range);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: rangeKey stands in for `range`; rolloverTick drives recompute, not boundary data
   return React.useMemo(
-    () => buildLocalDayBoundaries(days),
-    [days, rolloverTick],
+    () => buildRangeBoundaries(range),
+    [rangeKey, rolloverTick],
   );
+}
+
+/** Stable string identity for a range, for memo/query keys. */
+function serializeRange(range: UsageRange): string {
+  return range.kind === "preset"
+    ? `preset:${range.days}`
+    : `custom:${range.startDate}:${range.endDate}`;
 }
 
 /**
@@ -69,18 +84,21 @@ export function useLocalDayBoundaries(days: UsageWindowDays): number[] {
  * polling) and invalidates on `onAgentMetricsChanged` — new archived
  * metrics, or a kind-44200 subscription toggle — instead of a refetch
  * interval.
+ *
+ * An invalid custom range produces no boundaries; the query stays disabled
+ * rather than issuing a request the backend would reject.
  */
 export function useAgentUsageSeries({
   agentPubkey,
-  days,
+  range,
   enabled = true,
 }: {
   agentPubkey?: string;
-  days: UsageWindowDays;
+  range: UsageRange;
   enabled?: boolean;
 }) {
   const queryClient = useQueryClient();
-  const boundaries = useLocalDayBoundaries(days);
+  const boundaries = useLocalDayBoundaries(range);
 
   React.useEffect(
     () =>
@@ -96,7 +114,7 @@ export function useAgentUsageSeries({
     queryKey: agentUsageQueryKey(boundaries, agentPubkey),
     queryFn: () =>
       getAgentUsageSeries({ bucketBoundaries: boundaries, agentPubkey }),
-    enabled,
+    enabled: enabled && boundaries.length >= 2,
     staleTime: 60_000,
     gcTime: 5 * 60_000,
   });
@@ -118,7 +136,7 @@ export function useUsageIngress(
 ): string | undefined {
   const query = useAgentUsageSeries({
     agentPubkey: agentPubkey ?? undefined,
-    days: 7,
+    range: DEFAULT_USAGE_RANGE,
     enabled,
   });
   return query.data ? deriveUsageIngressTrailing(query.data) : undefined;

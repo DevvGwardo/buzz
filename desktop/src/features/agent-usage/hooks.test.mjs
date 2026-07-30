@@ -160,11 +160,13 @@ import { createRoot } from "react-dom/client";
 
 import { useLocalDayBoundaries } from "./hooks.ts";
 
-function Harness({ days, onBoundaries }) {
-  const boundaries = useLocalDayBoundaries(days);
+function Harness({ onBoundaries, range }) {
+  const boundaries = useLocalDayBoundaries(range);
   onBoundaries(boundaries);
   return null;
 }
+
+const SEVEN_DAY_RANGE = { kind: "preset", days: 7 };
 
 test("useLocalDayBoundaries reschedules across two local-midnight rollovers, rebuilding boundaries each time", async () => {
   // One minute before local midnight, so the first scheduled `setTimeout`
@@ -184,7 +186,9 @@ test("useLocalDayBoundaries reschedules across two local-midnight rollovers, reb
 
     const root = createRoot(document.createElement("div"));
     await act(async () => {
-      root.render(React.createElement(Harness, { days: 7, onBoundaries }));
+      root.render(
+        React.createElement(Harness, { onBoundaries, range: SEVEN_DAY_RANGE }),
+      );
     });
 
     assert.equal(latest.length, 8, "7-day window yields 8 boundaries");
@@ -257,7 +261,9 @@ test("useLocalDayBoundaries clears its scheduled timeout on unmount (no post-unm
 
     const root = createRoot(document.createElement("div"));
     await act(async () => {
-      root.render(React.createElement(Harness, { days: 7, onBoundaries }));
+      root.render(
+        React.createElement(Harness, { onBoundaries, range: SEVEN_DAY_RANGE }),
+      );
     });
     const countAtUnmount = renderCount;
 
@@ -279,5 +285,125 @@ test("useLocalDayBoundaries clears its scheduled timeout on unmount (no post-unm
     );
   } finally {
     mock.timers.reset();
+  }
+});
+
+test("useLocalDayBoundaries returns the same boundary array when re-rendered with an equal range literal", async () => {
+  const captured = [];
+  const onBoundaries = (boundaries) => {
+    captured.push(boundaries);
+  };
+
+  const root = createRoot(document.createElement("div"));
+  try {
+    await act(async () => {
+      // A fresh object literal each render — the memo must key on the range's
+      // fields, not its identity, or every render would refetch.
+      root.render(
+        React.createElement(Harness, {
+          onBoundaries,
+          range: { kind: "preset", days: 7 },
+        }),
+      );
+    });
+    await act(async () => {
+      root.render(
+        React.createElement(Harness, {
+          onBoundaries,
+          range: { kind: "preset", days: 7 },
+        }),
+      );
+    });
+
+    assert.ok(captured.length >= 2, "component rendered at least twice");
+    assert.equal(
+      captured.at(-1),
+      captured[0],
+      "an equal range literal must reuse the memoized boundary array",
+    );
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+  }
+});
+
+test("useLocalDayBoundaries rebuilds when the range changes to a custom range", async () => {
+  let latest = null;
+  const onBoundaries = (boundaries) => {
+    latest = boundaries;
+  };
+
+  const root = createRoot(document.createElement("div"));
+  try {
+    await act(async () => {
+      root.render(
+        React.createElement(Harness, {
+          onBoundaries,
+          range: SEVEN_DAY_RANGE,
+        }),
+      );
+    });
+    assert.equal(latest.length, 8);
+
+    await act(async () => {
+      root.render(
+        React.createElement(Harness, {
+          onBoundaries,
+          range: {
+            kind: "custom",
+            startDate: "2026-01-01",
+            endDate: "2026-01-03",
+          },
+        }),
+      );
+    });
+
+    assert.equal(
+      latest.length,
+      4,
+      "a 3-day custom range yields 4 boundaries closing the final day",
+    );
+    assert.equal(
+      latest[0],
+      Math.floor(new Date(2026, 0, 1).getTime() / 1_000),
+      "first boundary opens the requested start date in local time",
+    );
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
+  }
+});
+
+test("useLocalDayBoundaries returns no boundaries for an invalid custom range", async () => {
+  let latest = null;
+  const onBoundaries = (boundaries) => {
+    latest = boundaries;
+  };
+
+  const root = createRoot(document.createElement("div"));
+  try {
+    await act(async () => {
+      root.render(
+        React.createElement(Harness, {
+          onBoundaries,
+          // Inverted range — `useAgentUsageSeries` gates its query on
+          // `boundaries.length >= 2`, so this must issue no request rather
+          // than one the backend would reject.
+          range: {
+            kind: "custom",
+            startDate: "2026-03-10",
+            endDate: "2026-03-01",
+          },
+        }),
+      );
+    });
+
+    assert.deepEqual(latest, []);
+  } finally {
+    await act(async () => {
+      root.unmount();
+    });
   }
 });
