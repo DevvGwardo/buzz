@@ -82,6 +82,14 @@ roster:
       thinking_effort: high
 
 prices:
+  # Repriced 2026-07-30: terra 2.5/0.25/15.0 -> 2.00/0.20/12.00 (-20%).
+  # Sol, Opus 5, Sonnet and Haiku did not move. This changes the
+  # condition hash, so a cell that ran before this date carries the old
+  # hash and the old rates in its receipts -- that mismatch is expected,
+  # not corruption. Restate a completed cell's cost with
+  # benchmark-runs/tools/reprice.py, which re-prices the measured tokens
+  # at a new sheet. Never edit a receipt: the tokens are the
+  # measurement, the price sheet is only an overlay on them.
   # Both rows are load-bearing: this is a mixed-model cell, so the headline
   # $/solved-task depends on the split between the seats as well as on the
   # totals. Same figures every other sol and terra cell in the study carries --
@@ -92,9 +100,9 @@ prices:
     output_per_million_usd: 30.0
     cache_read_rate: 0.0
   gpt-5.6-terra:
-    input_per_million_usd: 2.5
-    cached_input_per_million_usd: 0.25
-    output_per_million_usd: 15.0
+    input_per_million_usd: 2.0
+    cached_input_per_million_usd: 0.2
+    output_per_million_usd: 12.0
     # Fallback only; the direct OpenAI Responses route reports the real split
     # and the harness prefers it. See tb-solo-luna-high.yaml.
     cache_read_rate: 0.0
