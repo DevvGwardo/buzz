@@ -166,3 +166,210 @@ test("attachments are fetched with the token and rendered from blob urls", async
     expect(request.authorization).toBe(`Bearer ${TOKEN}`);
   }
 });
+
+interface ObjectUrlLog {
+  created: string[];
+  revoked: string[];
+}
+
+declare global {
+  interface Window {
+    objectUrlLog: ObjectUrlLog;
+    clearedCount: number;
+  }
+}
+
+/// Records every object URL the SPA creates and revokes, so a test can prove a
+/// blob handed to the DOM is released rather than merely replaced.
+async function instrumentObjectUrls(page: Page) {
+  await page.addInitScript(() => {
+    const log: ObjectUrlLog = { created: [], revoked: [] };
+    window.objectUrlLog = log;
+    const create = URL.createObjectURL.bind(URL);
+    const revoke = URL.revokeObjectURL.bind(URL);
+    URL.createObjectURL = (source: Blob | MediaSource) => {
+      const url = create(source);
+      log.created.push(url);
+      return url;
+    };
+    URL.revokeObjectURL = (url: string) => {
+      log.revoked.push(url);
+      revoke(url);
+    };
+  });
+}
+
+const FEEDBACK_ID = "feedback-with-attachments";
+const IMAGE_HASH = "a".repeat(64);
+const FILE_HASH = "b".repeat(64);
+
+/// A feedback detail carrying one image and one non-image attachment.
+async function routeFeedbackDetail(page: Page) {
+  const host = "design.buzz.xyz";
+  await page.route(`**/api/admin/v1/feedback?**`, (route) =>
+    route.fulfill({ contentType: "application/json", body: "[]" }),
+  );
+  await page.route(`**/api/admin/v1/feedback/${FEEDBACK_ID}`, (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: FEEDBACK_ID,
+        communityId: "one",
+        communityHost: host,
+        eventId: "31".repeat(32),
+        submitterPubkey: "21".repeat(32),
+        category: "bug",
+        body: "Composer froze.",
+        tags: [
+          [
+            "imeta",
+            `url https://${host}/media/${IMAGE_HASH}.png`,
+            "m image/png",
+            `x ${IMAGE_HASH}`,
+            "filename screenshot.png",
+          ],
+          [
+            "imeta",
+            `url https://${host}/media/${FILE_HASH}.txt`,
+            "m text/plain",
+            `x ${FILE_HASH}`,
+            "filename diagnostics.txt",
+          ],
+        ],
+        eventCreatedAt: "2026-07-17T17:25:00Z",
+        receivedAt: "2026-07-17T17:30:00Z",
+      }),
+    }),
+  );
+}
+
+test("attachment object urls are revoked when the view is left", async ({
+  page,
+}) => {
+  await seedToken(page);
+  await instrumentObjectUrls(page);
+  await routeFeedbackDetail(page);
+  await page.route(
+    `**/api/admin/v1/feedback/${FEEDBACK_ID}/attachments/**`,
+    (route) =>
+      route.fulfill({ contentType: "application/octet-stream", body: "bytes" }),
+  );
+
+  await page.goto(`/feedback/${FEEDBACK_ID}`);
+  const imageUrl = await page
+    .getByRole("img", { name: "screenshot.png" })
+    .getAttribute("src");
+  const fileUrl = await page
+    .getByRole("link", { name: /diagnostics.txt/ })
+    .getAttribute("href");
+  expect(imageUrl).toMatch(/^blob:/);
+  expect(fileUrl).toMatch(/^blob:/);
+  expect(await page.evaluate(() => window.objectUrlLog.revoked)).toEqual([]);
+
+  await page.getByRole("link", { name: "Back to feedback" }).click();
+  await expect(page.getByRole("heading", { name: "Feedback" })).toBeVisible();
+
+  await expect
+    .poll(() => page.evaluate(() => window.objectUrlLog.revoked))
+    .toEqual(expect.arrayContaining([imageUrl, fileUrl]));
+});
+
+test("an attachment that arrives after the view is left is revoked immediately", async ({
+  page,
+}) => {
+  await seedToken(page);
+  await instrumentObjectUrls(page);
+  await routeFeedbackDetail(page);
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(
+    `**/api/admin/v1/feedback/${FEEDBACK_ID}/attachments/**`,
+    async (route) => {
+      await held;
+      await route.fulfill({
+        contentType: "application/octet-stream",
+        body: "bytes",
+      });
+    },
+  );
+
+  await page.goto(`/feedback/${FEEDBACK_ID}`);
+  // Both fetches are held, so no blob exists yet.
+  await expect(page.getByText("Loading…")).toBeVisible();
+  expect(await page.evaluate(() => window.objectUrlLog.created)).toEqual([]);
+
+  // Leave before either fetch resolves, then let both complete.
+  await page.getByRole("link", { name: "Back to feedback" }).click();
+  await expect(page.getByRole("heading", { name: "Feedback" })).toBeVisible();
+  release();
+
+  await expect
+    .poll(() => page.evaluate(() => window.objectUrlLog.revoked.length))
+    .toBe(2);
+  const log = await page.evaluate(() => window.objectUrlLog);
+  expect(log.revoked.sort()).toEqual(log.created.sort());
+  // Nothing was ever handed to the DOM: the blobs outlived their view.
+  await expect(page.getByRole("img", { name: "screenshot.png" })).toHaveCount(
+    0,
+  );
+});
+
+test("concurrent rejected requests re-prompt exactly once", async ({
+  page,
+}) => {
+  await seedToken(page, "f".repeat(64));
+  await routeFeedbackDetail(page);
+  // Counts how many rejections reached the centralized clearing path, so the
+  // test can distinguish "two 401s collapsed into one prompt" from "only one
+  // request ever failed".
+  await page.addInitScript(() => {
+    let cleared = 0;
+    const remove = sessionStorage.removeItem.bind(sessionStorage);
+    sessionStorage.removeItem = (key: string) => {
+      cleared += 1;
+      remove(key);
+    };
+    Object.defineProperty(window, "clearedCount", { get: () => cleared });
+  });
+
+  // Both attachment requests are held until the second arrives, so the two
+  // 401s are in flight at the same time.
+  let secondArrived = () => {};
+  const bothInFlight = new Promise<void>((resolve) => {
+    secondArrived = resolve;
+  });
+  let pending = 2;
+  await page.route(
+    `**/api/admin/v1/feedback/${FEEDBACK_ID}/attachments/**`,
+    async (route) => {
+      pending -= 1;
+      if (pending === 0) secondArrived();
+      await bothInFlight;
+      await route.fulfill({
+        status: 401,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: { code: "unauthorized", message: "rejected" },
+        }),
+      });
+    },
+  );
+
+  await page.goto(`/feedback/${FEEDBACK_ID}`);
+  await expect(
+    page.getByRole("heading", { name: "Admin token required" }),
+  ).toHaveCount(1);
+  await expect(page.getByText("That token was rejected.")).toBeVisible();
+  expect(
+    await page.evaluate((key) => sessionStorage.getItem(key), STORAGE_KEY),
+  ).toBeNull();
+  expect(pending).toBe(0);
+  await expect
+    .poll(() => page.evaluate(() => window.clearedCount))
+    .toBeGreaterThanOrEqual(2);
+  await expect(
+    page.getByRole("heading", { name: "Admin token required" }),
+  ).toHaveCount(1);
+});
