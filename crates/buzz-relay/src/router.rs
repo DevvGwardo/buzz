@@ -162,7 +162,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 let admin_host = api::admin::is_admin_host(&state, req.headers());
                 if admin_host {
                     if let (Some(index), Some(files)) = (admin_index, admin_files) {
-                        if path.starts_with("/assets/") {
+                        if is_admin_static_path(path) {
                             return files
                                 .oneshot(req)
                                 .await
@@ -214,6 +214,14 @@ fn is_admin_spa_path(path: &str) -> bool {
         || path.starts_with("/reports/")
         || path == "/feedback"
         || path.starts_with("/feedback/")
+}
+
+/// Files served from the admin bundle directory verbatim. `/assets/*` is the
+/// hashed Vite output; `/favicon.svg` is the one root-level file the bundle
+/// emits and the document links. Everything else on the admin host is a 404 —
+/// the directory is not browsable.
+fn is_admin_static_path(path: &str) -> bool {
+    path.starts_with("/assets/") || path == "/favicon.svg"
 }
 
 fn is_invite_landing_path(path: &str) -> bool {
@@ -559,11 +567,13 @@ mod tests {
         Arc::new(state)
     }
 
-    /// A minimal built SPA: an index document and one hashed asset.
+    /// A minimal built SPA: an index document, one hashed asset, and the
+    /// root-level favicon Vite copies out of `public/`.
     fn write_bundle(dir: &std::path::Path) {
         std::fs::create_dir_all(dir.join("assets")).expect("assets dir");
         std::fs::write(dir.join("index.html"), "<!doctype html>").expect("index.html");
         std::fs::write(dir.join("assets/app.js"), "export {};").expect("bundle asset");
+        std::fs::write(dir.join("favicon.svg"), "<svg/>").expect("favicon");
     }
 
     async fn spa_response(
@@ -591,7 +601,13 @@ mod tests {
         write_bundle(web_dir.path());
         let state = spa_state(admin_dir.path(), web_dir.path()).await;
 
-        for path in ["/", "/reports", "/feedback/abc", "/assets/app.js"] {
+        for path in [
+            "/",
+            "/reports",
+            "/feedback/abc",
+            "/assets/app.js",
+            "/favicon.svg",
+        ] {
             let response = spa_response(state.clone(), "admin.example", path).await;
             assert_eq!(
                 response
@@ -601,6 +617,25 @@ mod tests {
                 Some(ADMIN_CSP),
                 "{path} must carry the admin CSP"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_admin_host_serves_the_favicon_the_document_links() {
+        let admin_dir = tempfile::tempdir().expect("admin bundle dir");
+        let web_dir = tempfile::tempdir().expect("public bundle dir");
+        write_bundle(admin_dir.path());
+        write_bundle(web_dir.path());
+        let state = spa_state(admin_dir.path(), web_dir.path()).await;
+
+        let response = spa_response(state.clone(), "admin.example", "/favicon.svg").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The bundle directory is not browsable: only the assets Vite emits at
+        // the root are reachable, never arbitrary files beside them.
+        for path in ["/index.html", "/nope.svg"] {
+            let response = spa_response(state.clone(), "admin.example", path).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
     }
 

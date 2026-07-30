@@ -61,10 +61,12 @@ served with a Content Security Policy response header, `ADMIN_CSP` in
 default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'
 ```
 
-It blocks inline and third-party script and restricts every network destination
-to the same origin, which closes the direct paths an injected script would use
-to exfiltrate the `sessionStorage` token. `blob:` is permitted for images only,
-for attachment previews. It is a response header rather than a `<meta>` tag because
+It blocks inline and third-party script and restricts subresource and request
+destinations to the same origin, which closes the direct paths an injected
+script would use to exfiltrate the `sessionStorage` token. It does not
+constrain top-level navigation, so it is a containment layer, not a substitute
+for keeping script off the origin. `blob:` is permitted for images only, for
+attachment previews. It is a response header rather than a `<meta>` tag because
 `frame-ancestors` is ignored in meta — that directive is the dashboard's
 authoritative frame protection, superseding the `X-Frame-Options: DENY` the JSON
 API sends. The policy applies to the admin host only; the public web bundle
