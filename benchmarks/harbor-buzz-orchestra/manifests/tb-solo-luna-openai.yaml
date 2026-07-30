@@ -27,6 +27,24 @@
 # about the Databricks gateway rather than about reasoning -- and a much less
 # interesting one to have gotten wrong in print.
 #
+# ANSWERED 2026-07-29. It landed at 0.568, i.e. on the A1 end. Paired McNemar on
+# the shared task set:
+#
+#   route alone   A1  -> A1r    -0.023   discordant  8:10   p = 0.815   NULL
+#   effort alone  A1r -> A1h    -0.170   discordant  2:17   p = 0.001
+#   joint         A1  -> A1h    -0.195   discordant  1:18   p = 0.000
+#
+# The two parts sum to -0.193 against a joint -0.195, so the decomposition is
+# additive and the effort claim survives essentially whole. The route is inert
+# in cost and tokens too, which is the stronger version of the result: over 87
+# shared tasks A1 spent $7.90 / 24.9M input and A1r spent $7.96 / 25.5M -- under
+# 3% apart on every column. A1h spent $24.63 / 103.8M for its +0.170.
+#
+# Keep this cell in the matrix rather than folding it into A1. It is cheap, it
+# is the only thing standing between "high effort is worth 3.1x cost" and "we
+# changed two variables and guessed which one mattered", and if the gateway ever
+# starts degrading output it is the tripwire that would show it.
+#
 # Byte-identical to tb-solo-luna-high except for the condition name and the
 # absent `generation` block. In particular the persona hash, the price sheet, the
 # trial budget and the environment overrides are all held, because every one of

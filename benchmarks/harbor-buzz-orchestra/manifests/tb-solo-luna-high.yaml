@@ -20,6 +20,14 @@
 # effect is small, but "expected small" is not "measured zero" and the honest
 # framing in the post is a joint one.
 #
+# RESOLVED 2026-07-29 -- it is now measured zero, so the post can say "effort"
+# rather than "effort plus route". tb-solo-luna-openai (A1r) holds effort at the
+# default and moves only the route: route alone is -0.023 at p = 0.815 (8:10
+# discordant, a null) while effort alone is -0.170 at p = 0.001 (2:17). The two
+# sum to -0.193 against the joint -0.195. Route was inert in cost and tokens as
+# well, within 3% on every column. Do not delete A1r; it is what licenses the
+# single-variable framing here.
+#
 # The within-wave comparisons are clean, because all four effort-wave cells sit
 # on this same route: A1h vs A5h (luna vs terra at high) and A1h vs B1h (solo vs
 # pair at high) vary exactly one thing each.
