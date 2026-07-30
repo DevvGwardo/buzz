@@ -106,6 +106,22 @@ the `respond_to` gate, merged `env_vars`, and a `backend` discriminator:
 The protocol maintains five invariants. Each is stated with the mechanism
 that enforces it and the boundary beyond which it does not hold.
 
+A design obligation governs the whole list: **the complexity budget is
+spent in this document, not in the code**. Every guarantee here was chosen
+because its enforcing mechanism is one small, boring thing — a refusal at
+payload construction (I1), a key-shape validator (I2), an ephemeral event
+the agent already publishes (I3), a deterministic name plus one annotation
+compare (I4), a timer that fires an existing shutdown channel (I5). The
+same rule holds below: the deploy state machine is one loop over six
+ordered rows; the Secret scheme is "unique name, write first, reference
+exactly"; GC is one label-select with two filters (annotation, age). Where
+a richer property would have demanded machinery — Leases, controllers,
+ownerReferences, a management channel — the spec either found a
+name-and-timestamp argument that makes the machinery unnecessary or
+dropped the property and said so (§Non-Goals, M1). A conforming
+implementation that is not small is evidence of a spec bug; report it as
+one.
+
 - **(I1) Identity fail-closed.** No deploy request is ever emitted with an
   empty or missing private key. Enforced at payload construction: if keyring
   hydration left the nsec empty, `build_deploy_payload` refuses (mirroring
