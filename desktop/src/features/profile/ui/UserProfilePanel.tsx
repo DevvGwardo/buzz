@@ -397,14 +397,22 @@ export function UserProfilePanel({
     onOpenDm,
   });
 
-  // Always open the instance-edit dialog, even for definition-backed agents.
-  // The dialog surfaces instance-level settings (including the resume-on-restart
-  // toggle) and already provides an "edit linked definition" escape hatch via
-  // `onEditLinkedPersona`. Routing to the definition dialog here blocks access
-  // to instance settings for any agent created via the create flow.
+  // Open the instance-edit dialog when a managed instance exists; otherwise
+  // fall back to the definition editor for profiles that have a persona but
+  // no running (or stopped) instance yet. The instance dialog already handles
+  // linked agents correctly (inherited values, "edit linked definition" escape
+  // via `onEditLinkedPersona`), so the only case that still routes to the
+  // definition dialog is a definition-only profile where there is nothing to
+  // instance-edit yet.
   const handleEditAgent = React.useCallback(() => {
-    setEditAgentOpen(true);
-  }, []);
+    if (managedAgent) {
+      setEditAgentOpen(true);
+      return;
+    }
+    if (resolvedPersona) {
+      setPersonaDialogState(editPersonaDialogState(resolvedPersona));
+    }
+  }, [managedAgent, resolvedPersona]);
 
   const { deleteManagedAgentRecord, deleteManagedAgentsForPersona } =
     useProfileAgentDeletion({
