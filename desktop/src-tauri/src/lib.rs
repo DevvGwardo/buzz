@@ -4,6 +4,7 @@ mod archive;
 mod builderlab;
 mod commands;
 mod deep_link;
+mod dictation;
 mod event_sync;
 mod events;
 mod huddle;
@@ -885,6 +886,10 @@ pub fn run() {
             list_audio_output_devices,
             set_audio_output_device,
             get_audio_output_device,
+            dictation::start_dictation,
+            dictation::stop_dictation,
+            dictation::push_dictation_audio,
+            dictation::get_dictation_status,
             start_pairing,
             confirm_pairing_sas,
             cancel_pairing,

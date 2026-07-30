@@ -41,6 +41,24 @@ const AUDIO_QUEUE_DEPTH: usize = 50;
 /// Prevents OOM if VAD stays in speech mode (noisy environment).
 const MAX_SPEECH_SAMPLES: usize = 16_000 * 30;
 
+/// Dictation waits slightly longer for a natural pause before flushing.
+const DICTATION_SILENCE_FLUSH_FRAMES: usize = 25;
+
+/// Emit a partial dictation result after two seconds of uninterrupted speech.
+const DICTATION_PARTIAL_FLUSH_SAMPLES: usize = 16_000 * 2;
+
+struct SttPipelineConfig {
+    model_dir: PathBuf,
+    silence_flush_frames: usize,
+    max_speech_samples: usize,
+    partial_flush_samples: Option<usize>,
+    tts_active: Arc<AtomicBool>,
+    tts_synthesizing: Arc<AtomicBool>,
+    tts_cancel: Option<Arc<AtomicBool>>,
+    ptt_active: Option<Arc<AtomicBool>>,
+    flush_on_shutdown: bool,
+}
+
 /// Handle to the running STT pipeline.
 ///
 /// Not Clone — wrap in `Arc` to share across threads.
@@ -93,30 +111,47 @@ impl SttPipeline {
         tts_cancel: Option<Arc<AtomicBool>>,
         ptt_active: Option<Arc<AtomicBool>>,
     ) -> Result<(Self, tokio_mpsc::Receiver<String>), String> {
+        Self::new_with_config(SttPipelineConfig {
+            model_dir,
+            silence_flush_frames: SILENCE_FLUSH_FRAMES,
+            max_speech_samples: MAX_SPEECH_SAMPLES,
+            partial_flush_samples: None,
+            tts_active,
+            tts_synthesizing,
+            tts_cancel,
+            ptt_active,
+            flush_on_shutdown: false,
+        })
+    }
+
+    /// Spawn an offline STT pipeline for message-composer dictation.
+    pub(crate) fn new_dictation(
+        model_dir: PathBuf,
+    ) -> Result<(Self, tokio_mpsc::Receiver<String>), String> {
+        Self::new_with_config(SttPipelineConfig {
+            model_dir,
+            silence_flush_frames: DICTATION_SILENCE_FLUSH_FRAMES,
+            max_speech_samples: MAX_SPEECH_SAMPLES,
+            partial_flush_samples: Some(DICTATION_PARTIAL_FLUSH_SAMPLES),
+            tts_active: Arc::new(AtomicBool::new(false)),
+            tts_synthesizing: Arc::new(AtomicBool::new(false)),
+            tts_cancel: None,
+            ptt_active: None,
+            flush_on_shutdown: true,
+        })
+    }
+
+    fn new_with_config(
+        config: SttPipelineConfig,
+    ) -> Result<(Self, tokio_mpsc::Receiver<String>), String> {
         let (audio_tx, audio_rx) = mpsc::sync_channel::<Vec<u8>>(AUDIO_QUEUE_DEPTH);
         let (text_tx, text_rx) = tokio_mpsc::channel::<String>(64);
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let shutdown_worker = Arc::clone(&shutdown);
-        let tts_cancel_worker = tts_cancel.as_ref().map(Arc::clone);
-        let ptt_active_worker = ptt_active.as_ref().map(Arc::clone);
-        let tts_activity = TtsActivity {
-            active: tts_active,
-            synthesizing: tts_synthesizing,
-        };
         let handle = thread::Builder::new()
             .name("stt-worker".into())
-            .spawn(move || {
-                stt_worker(
-                    model_dir,
-                    audio_rx,
-                    text_tx,
-                    shutdown_worker,
-                    tts_activity,
-                    tts_cancel_worker,
-                    ptt_active_worker,
-                )
-            })
+            .spawn(move || stt_worker(config, audio_rx, text_tx, shutdown_worker))
             .map_err(|e| format!("failed to spawn stt-worker thread: {e}"))?;
 
         let pipeline = Self {
@@ -219,13 +254,10 @@ struct TtsActivity {
 }
 
 fn stt_worker(
-    model_dir: PathBuf,
+    config: SttPipelineConfig,
     audio_rx: Receiver<Vec<u8>>,
     text_tx: tokio_mpsc::Sender<String>,
     shutdown: Arc<AtomicBool>,
-    tts_activity: TtsActivity,
-    tts_cancel: Option<Arc<AtomicBool>>,
-    ptt_active: Option<Arc<AtomicBool>>,
 ) {
     // ── 1. Initialise rubato resampler (48 kHz → 16 kHz, mono) ───────────────
     use rubato::{Fft, FixedSync, Resampler};
@@ -252,12 +284,12 @@ fn stt_worker(
     // in k2-fsa/sherpa-onnx.)
     use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
 
-    let tokens_path = model_dir.join("tokens.txt");
-    let model_path = model_dir.join("model.int8.onnx");
+    let tokens_path = config.model_dir.join("tokens.txt");
+    let model_path = config.model_dir.join("model.int8.onnx");
     if !tokens_path.exists() || !model_path.exists() {
         eprintln!(
             "buzz-desktop: STT model not found at {} — STT disabled",
-            model_dir.display()
+            config.model_dir.display()
         );
         drain_until_shutdown(audio_rx, &shutdown);
         return;
@@ -298,7 +330,12 @@ fn stt_worker(
 
     // ── 5. Main loop ──────────────────────────────────────────────────────────
     let mut tts_was_active = false;
-    let mut ptt_was_active = ptt_active
+    let tts_activity = TtsActivity {
+        active: config.tts_active,
+        synthesizing: config.tts_synthesizing,
+    };
+    let mut ptt_was_active = config
+        .ptt_active
         .as_ref()
         .is_some_and(|p| p.load(Ordering::Acquire));
     loop {
@@ -320,7 +357,7 @@ fn stt_worker(
         // The worklet stops sending frames when PTT is inactive, so the normal
         // silence-accumulation flush path never runs. We must flush here on the
         // active→inactive edge to avoid buffering speech across PTT presses.
-        if let Some(ref ptt) = ptt_active {
+        if let Some(ref ptt) = config.ptt_active {
             let ptt_now = ptt.load(Ordering::Acquire);
             if ptt_was_active && !ptt_now && in_speech && !speech_buf.is_empty() {
                 flush_to_stt(&speech_buf, &recognizer, &text_tx);
@@ -365,17 +402,20 @@ fn stt_worker(
                     &text_tx,
                     &tts_activity.active,
                     &tts_activity.synthesizing,
-                    tts_cancel.as_deref(),
+                    config.tts_cancel.as_deref(),
                     &mut tts_stopped_at,
-                    ptt_active.as_ref(),
+                    config.ptt_active.as_ref(),
+                    config.silence_flush_frames,
+                    config.max_speech_samples,
+                    config.partial_flush_samples,
                 );
             }
         }
     }
 
-    // No final flush — leave_huddle/end_huddle emit lifecycle events before
-    // the STT worker exits, so a final flush would post a kind:9 message AFTER
-    // the user has "left." Losing the last partial utterance is acceptable.
+    if config.flush_on_shutdown && !speech_buf.is_empty() {
+        flush_to_stt(&speech_buf, &recognizer, &text_tx);
+    }
 }
 
 /// Resample a mono 48 kHz chunk to 16 kHz using rubato.
@@ -431,6 +471,9 @@ fn process_16k_samples(
     tts_cancel: Option<&AtomicBool>,
     tts_stopped_at: &mut Option<std::time::Instant>,
     ptt_active: Option<&Arc<AtomicBool>>,
+    silence_flush_frames: usize,
+    max_speech_samples: usize,
+    partial_flush_samples: Option<usize>,
 ) {
     leftover.extend_from_slice(samples);
 
@@ -524,7 +567,9 @@ fn process_16k_samples(
             speech_buf.extend_from_slice(&frame);
 
             // OOM guard: flush and reset if the buffer exceeds 30 s of audio.
-            if speech_buf.len() >= MAX_SPEECH_SAMPLES {
+            if speech_buf.len() >= max_speech_samples
+                || partial_flush_samples.is_some_and(|limit| speech_buf.len() >= limit)
+            {
                 flush_to_stt(speech_buf, recognizer, text_tx);
                 speech_buf.clear();
                 *silence_frames = 0;
@@ -539,7 +584,7 @@ fn process_16k_samples(
             // key-hold as one utterance. The PTT release edge in the main
             // loop handles the flush. In VAD mode, flush after the silence
             // threshold so each natural pause becomes a separate message.
-            if ptt_active.is_none() && *silence_frames >= SILENCE_FLUSH_FRAMES {
+            if ptt_active.is_none() && *silence_frames >= silence_flush_frames {
                 // End of utterance — transcribe.
                 flush_to_stt(speech_buf, recognizer, text_tx);
                 speech_buf.clear();
