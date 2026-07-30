@@ -45,9 +45,10 @@ export async function request<T>(path: string): Promise<T> {
 }
 
 /// Probe whether the relay requires a bearer token. Issues one unauthenticated
-/// request and returns `true` if the relay accepted it (insecure_no_auth mode)
-/// or `false` if a 401 came back (token mode). Used by the App shell to skip
-/// the token prompt for deployments that rely on network-layer access control.
+/// request and returns `true` if auth is required (token prompt should be shown)
+/// or `false` if the relay returned 200 (insecure_no_auth mode, no token needed).
+/// Used by the App shell to skip the token prompt for deployments that rely on
+/// network-layer access control.
 export async function probeAuthRequired(): Promise<boolean> {
   try {
     const response = await fetch(`${PREFIX}/reports`, {
