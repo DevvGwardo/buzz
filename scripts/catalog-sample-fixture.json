@@ -1,0 +1,63 @@
+{
+  "_comment": "Sanitized catalog-sample fixture for differential harness (plan v4 §Oracle). Deterministic, no live discovery, no private endpoint names. Generated once from pinned manifest input.",
+  "_generated_from": "scripts/model-capabilities.json",
+  "_pinned_at": "phase1-initial",
+  "endpoints": [
+    {
+      "name": "databricks-gpt-5-5",
+      "note": "DATABRICKS_V2_KNOWN_MODELS entry; gpt5-5 family; openai-responses route"
+    },
+    {
+      "name": "databricks-gpt-5-4-mini",
+      "note": "exact record; models.dev override: low|medium|high (not family rule none+xhigh)"
+    },
+    {
+      "name": "databricks-gpt-5-4-nano",
+      "note": "exact record; models.dev override: low|medium|high"
+    },
+    {
+      "name": "databricks-gpt-5-6-sol",
+      "note": "exact record; models.dev override: full none+low+medium+high+xhigh+max; route materialized from gpt5-6 family (openai-responses)"
+    },
+    {
+      "name": "databricks-claude-opus-4-7",
+      "note": "DATABRICKS_V2_KNOWN_MODELS entry; anthropic adaptive xhigh-capable; anthropic-messages route"
+    },
+    {
+      "name": "goose-claude-fable-5",
+      "note": "goose- prefix stripped; claude-fable-5 → anthropic adaptive xhigh-capable; anthropic-messages"
+    },
+    {
+      "name": "goose-claude-sonnet-5-20260101",
+      "note": "goose- prefix stripped; claude-sonnet-5 family; anthropic adaptive xhigh-capable"
+    },
+    {
+      "name": "goose-opus-5",
+      "note": "'opus' segment → anthropic-messages route; effort: fallback (prefix-stripped alias 'opus-5' not recognized Claude family)"
+    },
+    {
+      "name": "consolidated-llama",
+      "note": "segment test: 'sol' is substring of 'consolidated', NOT a segment → mlflow-chat"
+    },
+    {
+      "name": "terraform-coder",
+      "note": "segment test: 'terra' is prefix of 'terraform', NOT a segment → mlflow-chat"
+    },
+    {
+      "name": "corpus-reranker",
+      "note": "segment test: 'opus' is NOT a segment of 'corpus-reranker' → mlflow-chat"
+    },
+    {
+      "name": "octopus-model",
+      "note": "segment test: 'opus' is NOT a segment of 'octopus-model' → mlflow-chat"
+    },
+    {
+      "name": "llama-3-70b",
+      "note": "concrete non-Claude non-GPT → mlflow-chat; effort: all-except-max"
+    },
+    {
+      "name": "",
+      "note": "blank model → route-unknown; all 7 efforts; default medium"
+    }
+  ]
+}

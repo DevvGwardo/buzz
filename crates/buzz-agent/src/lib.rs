@@ -5,6 +5,7 @@ mod builtin;
 pub mod catalog;
 pub mod config;
 pub(crate) mod databricks_model_names;
+pub mod generated_model_capabilities;
 mod handoff;
 mod hints;
 mod llm;
