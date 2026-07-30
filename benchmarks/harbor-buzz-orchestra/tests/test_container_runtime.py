@@ -141,6 +141,18 @@ class Environment:
         pass
 
 
+# The /proc probe names the forwarder binary too, so "does this command mention
+# FORWARDER" no longer distinguishes a launch from a lookup. Key on the
+# backgrounding suffix, which only the launch has.
+FORWARDER_LAUNCH = "& echo $!"
+
+
+def _is_forwarder_launch(command):
+    from harbor_buzz_orchestra.container_runtime import FORWARDER
+
+    return FORWARDER in command and FORWARDER_LAUNCH in command
+
+
 def test_maps_credentials_exactly_and_rejects_role_mismatch(tmp_path):
     manifest = write_manifest(tmp_path)
     credentials = (
@@ -357,7 +369,7 @@ async def test_forwarder_bridges_the_canonical_relay_address(tmp_path):
     )
     environment = Environment(
         responses={
-            FORWARDER: ExecResult(stdout="99\n", stderr="", return_code=0),
+            FORWARDER_LAUNCH: ExecResult(stdout="99\n", stderr="", return_code=0),
             "cat ": ExecResult(
                 stdout="forwarding 127.0.0.1:3600 -> host.docker.internal:3600",
                 stderr="",
@@ -367,7 +379,7 @@ async def test_forwarder_bridges_the_canonical_relay_address(tmp_path):
     )
     agent = await rt._start_forwarder(environment, trial)
     assert agent is not None and agent.pid == 99
-    launch = next(cmd for cmd, _ in environment.commands if FORWARDER in cmd)
+    launch = next(cmd for cmd, _ in environment.commands if _is_forwarder_launch(cmd))
     # Listens on the canonical loopback (host-header bound), targets the gateway.
     assert "127.0.0.1:3600" in launch
     assert "host.docker.internal:3600" in launch
@@ -1318,3 +1330,193 @@ def test_team_table_shows_the_manifest_role_not_the_kind(tmp_path):
     assert "| impl-1 | implementer |" in composed
     assert "| critic-1 | critic |" in composed
     assert "| bare-1 | worker |" in composed
+
+
+def _forwarder_runtime(tmp_path):
+    """A runtime wired to a fake forwarder binary and a gateway."""
+    binary = tmp_path / "relay-forwarder"
+    binary.write_text("ELF")
+    return runtime(
+        tmp_path,
+        relay_gateway="host.docker.internal:3600",
+        forwarder_binary=str(binary),
+    )
+
+
+def _forwarder_trial():
+    return TrialHandle(
+        run_id="run",
+        trial_id="trial",
+        manifest_hash="hash",
+        relay_ws_url="ws://localhost:3600",
+        channel_id="channel",
+        credentials=(),
+        user=user_credential(),
+    )
+
+
+class _BindsAfter(Environment):
+    """Reports EADDRINUSE for the first `failures` launches, then succeeds.
+
+    Models the real race: `_stop_agents` TERMs the previous forwarder without
+    waiting, so an immediate relaunch loses the socket until the old process
+    finishes exiting.
+    """
+
+    def __init__(self, failures):
+        super().__init__()
+        self.remaining = failures
+        self.launches = 0
+        self._log = ""
+
+    async def exec(self, command, env=None, **kwargs):
+        from harbor_buzz_orchestra.container_runtime import FORWARDER
+
+        self.commands.append((command, env))
+        if command.startswith(": >"):
+            self._log = ""
+            return ExecResult(stdout="", stderr="", return_code=0)
+        if _is_forwarder_launch(command):
+            self.launches += 1
+            if self.remaining > 0:
+                self.remaining -= 1
+                self._log = 'Error: Os { code: 98, kind: AddrInUse }'
+            else:
+                self._log = "forwarding 127.0.0.1:3600 -> host.docker.internal:3600"
+            return ExecResult(stdout="99\n", stderr="", return_code=0)
+        if command.startswith("cat "):
+            return ExecResult(stdout=self._log, stderr="", return_code=0)
+        return ExecResult(stdout="", stderr="", return_code=0)
+
+
+async def test_forwarder_retries_when_the_port_is_still_held(tmp_path, monkeypatch):
+    rt = _forwarder_runtime(tmp_path)
+    monkeypatch.setattr(type(rt), "FORWARDER_BIND_BACKOFF_S", 0.0)
+    environment = _BindsAfter(failures=2)
+
+    agent = await rt._start_forwarder(environment, _forwarder_trial())
+
+    assert agent is not None and agent.pid == 99
+    assert environment.launches == 3, "should relaunch once per failed bind"
+
+
+async def test_forwarder_gives_up_after_the_attempt_budget(tmp_path, monkeypatch):
+    rt = _forwarder_runtime(tmp_path)
+    monkeypatch.setattr(type(rt), "FORWARDER_BIND_BACKOFF_S", 0.0)
+    environment = _BindsAfter(failures=999)
+
+    with pytest.raises(RuntimeLaunchError, match="could not bind"):
+        await rt._start_forwarder(environment, _forwarder_trial())
+
+    assert environment.launches == type(rt).FORWARDER_BIND_ATTEMPTS
+
+
+async def test_forwarder_does_not_retry_other_failures(tmp_path, monkeypatch):
+    """Only EADDRINUSE is transient; a silent forwarder is a real fault."""
+    from harbor_buzz_orchestra.container_runtime import FORWARDER
+
+    rt = _forwarder_runtime(tmp_path)
+    monkeypatch.setattr(type(rt), "readiness_timeout_seconds", 0.0, raising=False)
+    rt.readiness_timeout_seconds = 0.0
+    environment = Environment(
+        responses={
+            FORWARDER_LAUNCH: ExecResult(stdout="99\n", stderr="", return_code=0),
+            "cat ": ExecResult(stdout="", stderr="", return_code=0),
+        }
+    )
+    with pytest.raises(RuntimeLaunchError, match="did not report readiness"):
+        await rt._start_forwarder(environment, _forwarder_trial())
+
+    launches = sum(1 for cmd, _ in environment.commands if _is_forwarder_launch(cmd))
+    assert launches == 1, "a non-AddrInUse failure must stay fatal on attempt 1"
+
+
+class _HasLiveForwarder(Environment):
+    """A container where a forwarder from an earlier phase is still running."""
+
+    def __init__(self, pid=4242):
+        super().__init__()
+        self.pid = pid
+
+    async def exec(self, command, env=None, **kwargs):
+        from harbor_buzz_orchestra.container_runtime import _forwarder_probe
+
+        self.commands.append((command, env))
+        if command == _forwarder_probe():
+            return ExecResult(stdout=f"{self.pid}\n", stderr="", return_code=0)
+        return ExecResult(stdout="", stderr="", return_code=0)
+
+
+async def test_forwarder_from_an_earlier_phase_is_adopted(tmp_path):
+    """continue_until_timeout re-runs the agent; the bridge must be reused.
+
+    Rebinding is not merely wasteful, it is impossible: the forwarder binds
+    without SO_REUSEADDR, so its accepted sockets hold the port in TIME_WAIT
+    for 60s after it exits.
+    """
+    from harbor_buzz_orchestra.container_runtime import FORWARDER
+
+    rt = _forwarder_runtime(tmp_path)
+    environment = _HasLiveForwarder(pid=4242)
+
+    agent = await rt._start_forwarder(environment, _forwarder_trial())
+
+    assert agent is not None and agent.pid == 4242
+    launches = sum(1 for cmd, _ in environment.commands if _is_forwarder_launch(cmd))
+    assert launches == 0, "must adopt the running forwarder, not launch another"
+
+
+async def test_teardown_spares_the_forwarder(tmp_path):
+    """The per-phase sweep kills the agent stack but leaves the bridge up."""
+    rt = _forwarder_runtime(tmp_path)
+    environment = Environment()
+    agents = [
+        _Agent(credential("solo-1", "orchestrator", "m"), 11, "out.log", "err.log")
+    ]
+    await rt._stop_agents(environment, agents)
+
+    sweeps = [cmd for cmd, _ in environment.commands if "/proc/" in cmd]
+    assert sweeps, "expected a teardown sweep"
+    for sweep in sweeps:
+        assert "! grep -aq relay-forwarder" in sweep, (
+            "sweep must exclude the forwarder or the next phase cannot bind"
+        )
+
+
+def test_forwarder_probe_ignores_shells_that_merely_name_the_forwarder(tmp_path):
+    """Regression: the probe used to report the PID of the shell running it.
+
+    A substring search over /proc/*/cmdline matches the probe's own `sh -c ...`,
+    because the search term is the forwarder path and the probe command contains
+    it. `_start_forwarder` then adopts a PID that exits the moment the probe
+    returns, and the readiness check reports "agent processes exited early:
+    ['relay-forwarder']" on a container that never started one — which is how
+    this cost two smoke runs. Process 200 below is that shell.
+    """
+    import subprocess
+
+    from harbor_buzz_orchestra.container_runtime import (
+        FORWARDER,
+        _forwarder_probe,
+    )
+
+    proc = tmp_path / "proc"
+    (proc / "100").mkdir(parents=True)
+    (proc / "100" / "cmdline").write_bytes(
+        b"\0".join([FORWARDER.encode(), b"127.0.0.1:3600", b"10.0.0.1:3000"]) + b"\0"
+    )
+    (proc / "200").mkdir()
+    (proc / "200" / "cmdline").write_bytes(
+        b"\0".join([b"sh", b"-c", _forwarder_probe().encode()]) + b"\0"
+    )
+
+    out = subprocess.run(
+        ["sh", "-c", _forwarder_probe(str(proc))],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert out.stdout.split() == ["100"], (
+        f"probe must match argv[0] only, got {out.stdout!r}"
+    )

@@ -94,6 +94,31 @@ REMOTE_LOGS = f"{REMOTE_ROOT}/logs"
 # canonical loopback address and bridges the byte stream to the gateway.
 FORWARDER = f"{REMOTE_BIN}/relay-forwarder"
 FORWARDER_LOG = f"{REMOTE_LOGS}/relay-forwarder.log"
+
+
+def _forwarder_probe(proc: str = "/proc") -> str:
+    """Shell that prints the PID of every running forwarder, one per line.
+
+    Read from /proc for the same reason the teardown sweep does: pkill is not
+    guaranteed to exist in a task image, /proc is.
+
+    Compare argv[0] exactly rather than grepping the whole cmdline. The shell
+    that runs this probe carries the forwarder's path in *its own* cmdline, so a
+    substring search matches the probe itself and hands back a PID that is
+    already gone by the time the caller looks at it — which the readiness check
+    then reports as "the forwarder exited early" on a container that never had
+    one. Taking only the first NUL-delimited field sidesteps that: argv[0] of
+    the probe is the shell, of its helpers `tr` and `head`.
+
+    `proc` exists so tests can point the probe at a fixture tree; production
+    always uses the real /proc.
+    """
+    return (
+        f"for d in {proc}/[0-9]*; do "
+        "a=$(tr '\\0' '\\n' < \"$d/cmdline\" 2>/dev/null | head -1); "
+        f"[ \"$a\" = {shlex.quote(FORWARDER)} ] "
+        f"&& echo \"${{d#{proc}/}}\"; done; true"
+    )
 # Trust anchors the agent uses to reach its model provider over TLS.
 #
 # buzz-agent links reqwest's `rustls` feature, which loads roots via
@@ -227,6 +252,14 @@ class _Agent:
 
 class BuzzContainerRuntime:
     """Launch one production Buzz agent stack per identity in the container."""
+
+    # Bounds the EADDRINUSE retry in _start_forwarder. Linear backoff, so the
+    # attempts below wait 1+2+3+4+5 = 15s in total before giving up. That is
+    # sized for "the outgoing forwarder has not finished handling SIGTERM yet",
+    # which is a sub-second event; anything still holding the port after 15s is
+    # a real fault and should surface as one rather than stalling the trial.
+    FORWARDER_BIND_ATTEMPTS = 6
+    FORWARDER_BIND_BACKOFF_S = 1.0
 
     def __init__(
         self,
@@ -544,6 +577,21 @@ class BuzzContainerRuntime:
         status = (result.stdout or "").strip().splitlines()
         return status[-1] if status else "unavailable"
 
+    @staticmethod
+    async def _live_forwarder_pid(environment: BaseEnvironment) -> int | None:
+        """PID of a forwarder already running in this container, if any."""
+        probe = _forwarder_probe()
+        try:
+            result = await environment.exec(probe)
+        except Exception:  # noqa: BLE001 - probing must never fail a launch
+            return None
+        for line in (result.stdout or "").split():
+            try:
+                return int(line)
+            except ValueError:
+                continue
+        return None
+
     async def _start_forwarder(
         self, environment: BaseEnvironment, trial: TrialHandle
     ) -> _Agent | None:
@@ -573,33 +621,69 @@ class BuzzContainerRuntime:
             f"{shlex.quote(self.relay_gateway)} </dev/null "
             f">{shlex.quote(log)} 2>&1 & echo $!"
         )
-        result = await environment.exec(command)
-        try:
-            pid = int((result.stdout or "").strip().splitlines()[-1])
-        except (ValueError, IndexError) as error:
-            raise RuntimeLaunchError(
-                f"cannot launch relay forwarder: {result.stderr or result.stdout}"
-            ) from error
-        forwarder = _Agent(
-            AgentCredential(
-                agent_id="relay-forwarder", role="infra",
-                nostr_secret_key="", nostr_pubkey="", nostr_auth_tag="",
-                llm_endpoint="", llm_api_key="",
-            ),
-            pid, log, log,
-        )
-        deadline = asyncio.get_running_loop().time() + self.readiness_timeout_seconds
-        while True:
-            probe = await environment.exec(f"cat {shlex.quote(log)} 2>/dev/null")
-            if "forwarding" in (probe.stdout or ""):
-                return forwarder
-            await self._raise_for_dead_agents(environment, [forwarder])
-            if asyncio.get_running_loop().time() >= deadline:
+        # A forwarder from an earlier phase of this same trial is deliberately
+        # kept alive by `_stop_agents`, so adopt it rather than rebinding a port
+        # it still owns. This is the normal path for every phase after the first
+        # under continue_until_timeout, and never taken on a single-run trial.
+        existing = await self._live_forwarder_pid(environment)
+        if existing is not None:
+            return _Agent(
+                AgentCredential(
+                    agent_id="relay-forwarder", role="infra",
+                    nostr_secret_key="", nostr_pubkey="", nostr_auth_tag="",
+                    llm_endpoint="", llm_api_key="",
+                ),
+                existing, log, log,
+            )
+
+        # Retry on EADDRINUSE anyway, as a guard for the cases adoption cannot
+        # cover -- chiefly a forwarder that died mid-trial leaving its accepted
+        # sockets in TIME_WAIT. Only the bind is retried; any other startup
+        # failure stays fatal on the first attempt.
+        last_error = ""
+        for attempt in range(self.FORWARDER_BIND_ATTEMPTS):
+            # Truncate first: a stale AddrInUse from the previous attempt would
+            # otherwise be read back as this attempt's failure, forever.
+            await environment.exec(f": > {shlex.quote(log)}")
+            result = await environment.exec(command)
+            try:
+                pid = int((result.stdout or "").strip().splitlines()[-1])
+            except (ValueError, IndexError) as error:
                 raise RuntimeLaunchError(
-                    "relay forwarder did not report readiness; "
-                    f"see {log} in the trial artifacts"
-                )
-            await asyncio.sleep(self.poll_seconds)
+                    f"cannot launch relay forwarder: {result.stderr or result.stdout}"
+                ) from error
+            forwarder = _Agent(
+                AgentCredential(
+                    agent_id="relay-forwarder", role="infra",
+                    nostr_secret_key="", nostr_pubkey="", nostr_auth_tag="",
+                    llm_endpoint="", llm_api_key="",
+                ),
+                pid, log, log,
+            )
+            deadline = (
+                asyncio.get_running_loop().time() + self.readiness_timeout_seconds
+            )
+            while True:
+                probe = await environment.exec(f"cat {shlex.quote(log)} 2>/dev/null")
+                output = probe.stdout or ""
+                if "forwarding" in output:
+                    return forwarder
+                if "AddrInUse" in output:
+                    last_error = output.strip()
+                    break  # port still held by the outgoing forwarder; retry
+                await self._raise_for_dead_agents(environment, [forwarder])
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise RuntimeLaunchError(
+                        "relay forwarder did not report readiness; "
+                        f"see {log} in the trial artifacts"
+                    )
+                await asyncio.sleep(self.poll_seconds)
+            await asyncio.sleep(self.FORWARDER_BIND_BACKOFF_S * (attempt + 1))
+
+        raise RuntimeLaunchError(
+            f"relay forwarder could not bind {listen} after "
+            f"{self.FORWARDER_BIND_ATTEMPTS} attempts: {last_error}"
+        )
 
     @staticmethod
     def _ws_authority(relay_ws_url: str) -> str:
@@ -1009,9 +1093,21 @@ class BuzzContainerRuntime:
             return
         # Match by cmdline prefix via /proc: pkill/procps is not guaranteed
         # to exist in task images, the /proc filesystem is.
+        #
+        # The relay forwarder is deliberately spared. It is a stateless TCP
+        # bridge, not an agent -- it holds no conversation and nothing about it
+        # is per-phase, so tearing it down only to rebuild it is pure work.
+        # Worse, it is work that cannot succeed: the forwarder binds with
+        # std's TcpListener::bind and therefore without SO_REUSEADDR, so the
+        # sockets it accepted from the agents sit in TIME_WAIT for 60s after it
+        # dies and any rebind of the same port fails with EADDRINUSE. That is
+        # invisible while a trial runs the agent once, and fatal the moment
+        # LHTB's continue_until_timeout runs it twice. Leaving it up costs
+        # nothing: the container is destroyed at the end of the trial.
         sweep = (
             "for d in /proc/[0-9]*; do "
             f"grep -aq {REMOTE_BIN} \"$d/cmdline\" 2>/dev/null "
+            "&& ! grep -aq relay-forwarder \"$d/cmdline\" 2>/dev/null "
             "&& kill -TERM \"${d#/proc/}\" 2>/dev/null; done; true"
         )
         try:
