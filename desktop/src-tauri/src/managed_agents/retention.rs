@@ -117,6 +117,14 @@ pub struct RetainedEvent {
     pub created_at: i64,
     pub raw_event: String,
     pub pending_sync: bool,
+    /// Whether the boot barrier has withheld this row from publication.
+    ///
+    /// Set by [`set_publish_blocked`] when the decision pass determines the
+    /// row must not go out (no-baseline park, head present but unverifiable,
+    /// or conflict parked for the user). The flush loop re-reads this field
+    /// immediately before submit — a row gated after its snapshot was taken
+    /// is suppressed here, not at the SQL snapshot boundary alone.
+    pub publish_blocked: bool,
     /// NIP-01 id of this row's own event, the second half of the ordering key.
     ///
     /// NIP-33 resolves an equal-`created_at` collision by lowest event id, so a
@@ -179,6 +187,9 @@ impl RetainedEvent {
             raw_event: event.as_json(),
             event_id: Some(event.id.to_hex()),
             pending_sync,
+            // Newly constructed rows start unblocked; the boot barrier sets
+            // this via `set_publish_blocked` when it decides suppression.
+            publish_blocked: false,
         }
     }
 }
@@ -322,7 +333,8 @@ pub enum InboundOutcome {
     /// The coordinate carries a pending local edit, so the inbound event is
     /// not resolved here at any timestamp. The retained row, its content, and
     /// its `pending_sync` flag are left exactly as they were, for the boot
-    /// decision pass to arbitrate against a writer-consistent head.
+    /// decision pass to arbitrate against an exact, best-available
+    /// (replica-lag-exposed) relay head.
     Deferred,
 }
 
@@ -363,7 +375,8 @@ pub enum InboundOutcome {
 ///
 /// Deferring instead is not the final answer, only a safe one: which side wins
 /// is decided by the boot decision pass, which arbitrates the pending row
-/// against a writer-consistent head (and its paired tombstone) rather than
+/// against an exact, best-available (replica-lag-exposed) relay head (and its
+/// paired tombstone) rather than
 /// against whichever event happened to arrive first. Until that pass exists, a
 /// pending row shadows genuinely newer remote edits for its coordinate — the
 /// flush normally clears it within seconds, and preserving an edit that can
@@ -447,7 +460,8 @@ pub fn get_retained_personas(
 ) -> Result<Vec<RetainedEvent>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync, event_id
+            "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync, event_id,
+                    publish_blocked
              FROM persona_events
              WHERE pubkey = ?1
              ORDER BY d_tag",
@@ -465,6 +479,7 @@ pub fn get_retained_personas(
                 raw_event: row.get(5)?,
                 pending_sync: row.get::<_, i32>(6)? != 0,
                 event_id: row.get(7)?,
+                publish_blocked: row.get::<_, i32>(8)? != 0,
             })
         })
         .map_err(|e| format!("failed to query retained events: {e}"))?;
@@ -495,7 +510,8 @@ pub fn get_retained_personas(
 pub fn get_pending_sync(conn: &Connection) -> Result<Vec<RetainedEvent>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync, event_id
+            "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync, event_id,
+                    publish_blocked
              FROM persona_events
              WHERE pending_sync = 1 AND publish_blocked = 0
              ORDER BY (kind != 5), created_at ASC",
@@ -513,6 +529,9 @@ pub fn get_pending_sync(conn: &Connection) -> Result<Vec<RetainedEvent>, String>
                 raw_event: row.get(5)?,
                 pending_sync: row.get::<_, i32>(6)? != 0,
                 event_id: row.get(7)?,
+                // SQL gate ensures this is 0 for every row returned; carry it
+                // so the flush loop's pre-submit re-read uses the same type.
+                publish_blocked: row.get::<_, i32>(8)? != 0,
             })
         })
         .map_err(|e| format!("failed to query pending sync events: {e}"))?;
@@ -771,7 +790,8 @@ pub fn get_retained_event(
     d_tag: &str,
 ) -> Result<Option<RetainedEvent>, String> {
     conn.query_row(
-        "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync, event_id
+        "SELECT kind, pubkey, d_tag, content, created_at, raw_event, pending_sync, event_id,
+                publish_blocked
          FROM persona_events
          WHERE kind = ?1 AND pubkey = ?2 AND d_tag = ?3",
         params![kind, pubkey, d_tag],
@@ -785,6 +805,7 @@ pub fn get_retained_event(
                 raw_event: row.get(5)?,
                 pending_sync: row.get::<_, i32>(6)? != 0,
                 event_id: row.get(7)?,
+                publish_blocked: row.get::<_, i32>(8)? != 0,
             })
         },
     )

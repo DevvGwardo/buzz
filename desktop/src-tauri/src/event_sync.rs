@@ -26,16 +26,16 @@ pub fn run_event_sync(app: &tauri::AppHandle, owner_keys: &nostr::Keys, db_path:
 /// SQLite, and signing work, so it runs on the blocking pool rather than an
 /// async worker.
 ///
-/// # Ordering: reconcile, then barrier, and both before the flush publishes
+/// # Ordering: reconcile, then barrier, enforced by the flush readiness latch
 ///
 /// The reconcile marks changed coordinates `pending_sync = 1`; the boot barrier
 /// ([`crate::managed_agents::config_barrier::run_boot_barrier`]) then decides
-/// which of those may actually go out and gates the rest. Running the barrier
-/// after the reconcile is what lets it see the rows the reconcile just queued —
-/// the stale-store republish it exists to suppress is created right here. The
-/// flush loop's first tick is 30s of relay lookups away, so in practice the gate
-/// is set before anything publishes; if a flush did win the race, the barrier
-/// still gates every later sweep.
+/// which of those may actually go out and gates the rest. The flush loop
+/// enforces this ordering structurally: before publishing any row it checks the
+/// per-scope readiness latch in `AppState::config_sync_ready_scope`; if unset,
+/// it runs the barrier inline and only proceeds on success. This guarantees that
+/// nothing publishes for a scope until the barrier has completed successfully —
+/// regardless of when the flush loop's first tick fires.
 pub fn spawn_event_sync(
     app: tauri::AppHandle,
     owner_keys: nostr::Keys,

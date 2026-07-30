@@ -322,8 +322,9 @@ fn test_arbitration_reads_the_queued_row_not_disk() {
 
 // ── Cell 3: the evidence-gated carve-out ───────────────────────────────────
 
-/// A create against a provably empty coordinate: a completed writer-consistent
-/// lookup says no head and a completed scan says no tombstone. Nothing to
+/// A create against a provably empty coordinate: a completed, exact,
+/// best-available (replica-lag-exposed) lookup says no head and a completed
+/// scan says no tombstone. Nothing to
 /// revert and nothing to resurrect, so a genuinely new agent publishes rather
 /// than parking forever.
 #[test]

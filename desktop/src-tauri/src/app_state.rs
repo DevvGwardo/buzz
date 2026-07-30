@@ -48,6 +48,19 @@ pub struct AppState {
     pub channel_templates_store_lock: Mutex<()>,
     pub managed_agent_processes: Mutex<HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>>,
     pub huddle_state: Mutex<HuddleState>,
+    /// Per-scope config-sync readiness latch.
+    ///
+    /// Holds the `db_path` of the retention scope whose boot barrier has
+    /// completed successfully. `None` means no scope is ready. The flush loop
+    /// checks this before publishing: if the active scope's `db_path` does not
+    /// match, it runs the barrier inline (retry path) before attempting any
+    /// publishes. `apply_workspace` clears this to `None` before spawning a
+    /// new sync, so the incoming scope is unready until its own barrier passes.
+    ///
+    /// Invariant: once set to `Some(path)`, the barrier has enforced the
+    /// publication gate for every coordinate in that scope. Any error path in
+    /// the barrier leaves this as `None`, keeping the scope fail-closed.
+    pub config_sync_ready_scope: Mutex<Option<std::path::PathBuf>>,
     /// Tauri app handle — stored after setup so huddle commands can emit
     /// `huddle-state-changed` events without needing the handle threaded
     /// through every call site.
@@ -213,6 +226,7 @@ pub fn build_app_state() -> AppState {
         managed_agent_processes: Mutex::new(HashMap::new()),
         session_config_cache: Mutex::new(HashMap::new()),
         huddle_state: Mutex::new(HuddleState::default()),
+        config_sync_ready_scope: Mutex::new(None),
         app_handle: Mutex::new(None),
         audio_output_device: Mutex::new(None),
         media_proxy_port: AtomicU16::new(0),

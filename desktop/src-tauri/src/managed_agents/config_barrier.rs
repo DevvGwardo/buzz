@@ -45,11 +45,15 @@ use super::{
 use crate::app_state::AppState;
 use buzz_core_pkg::kind::{KIND_MANAGED_AGENT, KIND_PERSONA, KIND_TEAM};
 
-/// Run the boot barrier for the active scope, best-effort.
+/// Run the boot barrier for the active scope.
 ///
-/// Failures are logged and swallowed: a barrier that cannot run must not block
-/// boot, and its absence is not itself dangerous — it leaves the pre-barrier
-/// behaviour, which is what every prior release did.
+/// On success, marks the scope's `db_path` as ready in `AppState`, allowing
+/// the flush loop to publish for that scope. On any error, leaves the ready
+/// latch unset so the scope stays fail-closed until a later retry succeeds.
+///
+/// This is called from the flush loop when it finds the scope not ready —
+/// so a transient failure (relay unreachable) retries on the next flush tick
+/// rather than wedging publishing for the session.
 pub async fn run_boot_barrier(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
     let scope = match active_retention_scope(app, &state) {
@@ -60,8 +64,32 @@ pub async fn run_boot_barrier(app: &tauri::AppHandle) {
         }
     };
 
-    if let Err(error) = run_boot_barrier_for_scope(app, &state, &scope).await {
-        tracing::warn!(target: "buzz::config_sync", %error, "boot barrier failed");
+    match run_boot_barrier_for_scope(app, &state, &scope).await {
+        Ok(()) => {
+            // Mark the scope ready. Any error in the scope check or lock is
+            // treated as a barrier failure — leave unready rather than risk
+            // opening the gate without enforcement.
+            match state.config_sync_ready_scope.lock() {
+                Ok(mut guard) => {
+                    *guard = Some(scope.db_path.clone());
+                    tracing::info!(
+                        target: "buzz::config_sync",
+                        db_path = %scope.db_path.display(),
+                        "boot barrier complete; scope is ready for publication"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "buzz::config_sync",
+                        %error,
+                        "boot barrier completed but failed to set ready latch; scope stays closed"
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(target: "buzz::config_sync", %error, "boot barrier failed; scope stays closed for retry");
+        }
     }
 }
 

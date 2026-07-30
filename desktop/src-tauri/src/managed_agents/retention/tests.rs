@@ -87,6 +87,7 @@ fn sample_event() -> RetainedEvent {
         raw_event: r#"{"id":"..."}"#.to_string(),
         event_id: None,
         pending_sync: true,
+        publish_blocked: false,
     }
 }
 
@@ -121,6 +122,7 @@ fn tombstone_retention_keys_are_distinct_across_kinds() {
                 raw_event: format!("{{\"k\":{target_kind}}}"),
                 event_id: None,
                 pending_sync: true,
+                publish_blocked: false,
             },
         )
         .unwrap();
@@ -328,7 +330,7 @@ fn inbound_equal_second_defers_and_preserves_pending() {
     );
 
     // Local pending row is untouched: flag preserved, content unchanged, for
-    // the boot decision pass to arbitrate against a writer-consistent head.
+    // the boot decision pass to arbitrate against an exact, best-available relay head.
     let row = get_retained_event(&conn, 30175, "abc123", "test-persona")
         .unwrap()
         .unwrap();
@@ -578,7 +580,7 @@ fn test_equal_second_lower_id_inbound_defers_to_pending_row() {
     // the relay's id tie-break, applying it here would clear `pending_sync` and
     // silently drop the user's unpublished edit — the exact class of loss this
     // whole change exists to stop. Intent is arbitrated by the boot decision
-    // pass against a writer-consistent head, not by an id compare in the cache.
+    // pass against an exact, best-available relay head, not by an id compare in the cache.
     let conn = test_db();
     let (lower, higher) = lower_and_higher_ids();
     retain_event(

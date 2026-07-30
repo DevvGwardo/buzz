@@ -88,8 +88,8 @@ impl TombstonedCoordinates {
 /// On relay deployments that route historical reads through a read-replica
 /// pool, a replica that has not yet replayed a tombstone answers "not found"
 /// in the dangerous direction. The barrier's tracing line surfaces this if
-/// it ever fires; re-adding `sync_authoritative` to the protocol is a small
-/// standalone change reversible on observed evidence.
+/// it ever fires; re-adding a relay-side writer-pinned read opt-in to the
+/// protocol is a small standalone change reversible on observed evidence.
 pub fn scan_page_filter(owner_pubkey_hex: &str, cursor: Option<&PageCursor>) -> serde_json::Value {
     let mut filter = json!({
         "kinds": [buzz_core_pkg::kind::KIND_DELETION],

@@ -239,11 +239,57 @@ pub async fn flush_pending_events(
 /// The scope snapshots its relay, owner keys, and database path together
 /// before network work starts. Switching communities during the flush cannot
 /// redirect rows from the old scope into the new relay.
+///
+/// # Readiness gate
+///
+/// Before taking a publish snapshot, this function checks whether the active
+/// scope's boot barrier has completed successfully. If not (first run or after
+/// a workspace switch), it runs the barrier inline before flushing. A barrier
+/// failure leaves the scope unready and skips the flush for this tick — the
+/// next tick retries, so a transient relay-unreachable at boot does not wedge
+/// publishing for the session.
 pub async fn flush_active_pending_events(
     app: &tauri::AppHandle,
     state: &AppState,
 ) -> Result<u32, String> {
     let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+
+    // Check readiness before snapshotting pending rows. The check and the
+    // snapshot are separate DB reads — a gate set between the two is caught
+    // by the per-row publish_blocked re-read immediately before submit.
+    let scope_is_ready = state
+        .config_sync_ready_scope
+        .lock()
+        .map_err(|e| format!("config_sync_ready_scope lock poisoned: {e}"))?
+        .as_ref()
+        .is_some_and(|ready| *ready == scope.db_path);
+
+    if !scope_is_ready {
+        // Barrier not yet run (first boot tick) or a previous barrier failed
+        // (relay unreachable). Run it now; on success the latch is set and the
+        // flush proceeds. On failure the scope stays unready and we skip this
+        // tick — next tick retries the barrier rather than wedging forever.
+        crate::managed_agents::config_barrier::run_boot_barrier(app).await;
+
+        // Re-check readiness after the barrier attempt. If it failed, skip
+        // this flush tick; the barrier will retry on the next one.
+        let now_ready = state
+            .config_sync_ready_scope
+            .lock()
+            .map_err(|e| format!("config_sync_ready_scope lock poisoned: {e}"))?
+            .as_ref()
+            .is_some_and(|ready| *ready == scope.db_path);
+
+        if !now_ready {
+            tracing::info!(
+                target: "buzz::config_sync",
+                db_path = %scope.db_path.display(),
+                "flush skipped: boot barrier has not completed for this scope"
+            );
+            return Ok(0);
+        }
+    }
+
     flush_pending_events_at(&scope.db_path, state, &scope.relay_url, &scope.owner_keys).await
 }
 
@@ -287,6 +333,13 @@ async fn flush_pending_events_at(
         };
         if current.created_at != row.created_at || current.content != row.content {
             continue; // superseded by a newer edit; that row publishes itself
+        }
+        // Re-read publish_blocked: the boot barrier may have set it between
+        // the pending snapshot above and this point (race between barrier and
+        // flush snapshot). A row that was unblocked when snapshotted but gated
+        // before submit must not publish.
+        if current.publish_blocked {
+            continue; // gated after snapshot; barrier will own this row
         }
 
         let event = nostr::Event::from_json(&current.raw_event)

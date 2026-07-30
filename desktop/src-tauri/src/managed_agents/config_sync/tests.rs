@@ -108,6 +108,7 @@ fn retain_prompt(
             },
             pending_sync: pending,
             event_id: Some(event.id.to_hex()),
+            publish_blocked: false,
         },
     )
     .unwrap();

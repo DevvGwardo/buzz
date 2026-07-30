@@ -217,6 +217,13 @@ pub async fn apply_workspace(
     // collapse every community into one pending-event store.
     match crate::managed_agents::retention::active_retention_scope(&restore_app, &state) {
         Ok(scope) => {
+            // Clear the readiness latch before spawning so the new scope is
+            // unready until its own boot barrier completes. Without this,
+            // a prior scope's latch could let the new scope's flush loop
+            // publish before its gate has run.
+            if let Ok(mut ready) = state.config_sync_ready_scope.lock() {
+                *ready = None;
+            }
             // Adopt whatever the pre-scoping release left queued in the global
             // retention database BEFORE the scoped reconcile and flush run, so
             // stranded tombstones and archive requests publish on this boot

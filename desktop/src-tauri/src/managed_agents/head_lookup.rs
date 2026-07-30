@@ -20,8 +20,8 @@
 //! pool, a replica that has not yet replayed an event returns the same empty
 //! page as a genuine deletion, with no staleness budget bounding the
 //! difference. The barrier's tracing line is the detection mechanism if this
-//! ever fires in the wild; re-adding a `sync_authoritative` opt-in to the
-//! protocol is a small standalone change reversible on evidence.
+//! ever fires in the wild; re-adding a relay-side writer-pinned read opt-in to
+//! the protocol is a small standalone change reversible on evidence.
 
 use serde_json::json;
 

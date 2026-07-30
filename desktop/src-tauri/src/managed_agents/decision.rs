@@ -61,7 +61,7 @@ pub struct Observation {
     /// about content that is not the content going out.
     pub queued: Option<CanonicalProjection>,
     /// The relay head's state. `Absent` and `LookupFailed` are distinct: only a
-    /// completed, writer-consistent lookup can report absence.
+    /// completed, exact, best-available (replica-lag-exposed) lookup can report absence.
     pub head: HeadState,
     /// The projection this install last agreed was published for this
     /// coordinate. `None` before the baseline is established.
@@ -239,7 +239,7 @@ pub fn decide(observation: &Observation) -> Resolution {
             HeadState::Present(_) => Decision::Park(ParkReason::NoBaselineWithHead),
             HeadState::Absent => match observation.tombstone {
                 // Cell 3 — a create against a provably empty coordinate: a
-                // completed writer-consistent lookup says no head and a
+                // completed, exact, best-available lookup says no head and a
                 // completed scan says no tombstone. Nothing to revert and
                 // nothing to resurrect, so the genuinely-new record publishes.
                 // A queued deletion here removes a purely local coordinate.

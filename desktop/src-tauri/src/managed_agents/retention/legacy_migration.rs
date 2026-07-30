@@ -143,6 +143,10 @@ fn legacy_rows_for_owner(
                 event_id: super::event_id_from_raw(&raw_event),
                 raw_event,
                 pending_sync: row.get::<_, i32>(6)? != 0,
+                // Legacy databases may predate the publish_blocked column;
+                // treat all migrated rows as unblocked — the destination
+                // scope's boot barrier runs after migration and decides.
+                publish_blocked: false,
             })
         })
         .map_err(|e| format!("failed to query legacy retained events: {e}"))?;

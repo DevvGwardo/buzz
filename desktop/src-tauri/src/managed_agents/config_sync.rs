@@ -271,7 +271,8 @@ pub fn apply_gate(
 
 /// Record the relay head as this install's baseline for a coordinate.
 ///
-/// Only ever called with a head that a completed, writer-consistent lookup
+/// Only ever called with a head that a completed, exact, best-available
+/// (replica-lag-exposed) lookup
 /// actually returned, which is what makes the baseline a claim about the RELAY
 /// rather than about local disk. Stamping from disk content would defeat the
 /// entire model: the baseline's job is to distinguish "the user edited this"

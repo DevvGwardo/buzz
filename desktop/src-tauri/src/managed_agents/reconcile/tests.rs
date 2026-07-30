@@ -257,6 +257,7 @@ fn slimming_republish_wave_is_one_time() {
                 raw_event: String::new(),
                 event_id: None,
                 pending_sync: false,
+                publish_blocked: false,
             },
         )
         .unwrap();

@@ -18,6 +18,7 @@ fn pending_tombstone(d_tag: &str) -> RetainedEvent {
         raw_event: format!(r#"{{"kind":5,"d":"{d_tag}"}}"#),
         event_id: None,
         pending_sync: true,
+        publish_blocked: false,
     }
 }
 
@@ -144,6 +145,7 @@ fn test_post_upgrade_scoped_row_is_not_overwritten_by_its_legacy_ancestor() {
         raw_event: r#"{"content":"old"}"#.to_string(),
         event_id: None,
         pending_sync: true,
+        publish_blocked: false,
     };
     seed_legacy(dir.path(), &[legacy_head]);
     let scope = scope_path(dir.path(), "wss://a.example");
@@ -161,6 +163,7 @@ fn test_post_upgrade_scoped_row_is_not_overwritten_by_its_legacy_ancestor() {
             raw_event: r#"{"content":"new"}"#.to_string(),
             event_id: None,
             pending_sync: true,
+            publish_blocked: false,
         },
     )
     .unwrap();
