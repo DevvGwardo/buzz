@@ -414,9 +414,8 @@ export async function getCanvas(channelId: string): Promise<CanvasResponse> {
   });
   return {
     content: response.content,
-    // Normalize absent keys to null: ensureWelcomeCanvas treats null as
-    // "no canvas yet", and `undefined !== null` would make every fresh
-    // channel look already-seeded.
+    // Normalize absent keys to null: ensureWelcomeCanvas treats null as "no
+    // canvas yet"; `undefined !== null` makes fresh channels look seeded.
     updatedAt: response.updated_at ?? null,
     author: response.author ?? null,
   };
@@ -798,9 +797,8 @@ export async function getMyRelayMembership(): Promise<RelayMember | null> {
     const raw = await invokeTauri<RawRelayMember>("get_my_relay_membership");
     return fromRawRelayMember(raw);
   } catch (error) {
-    // "relay returned 404 Not Found" = not a relay member — return null so
-    // the UI hides the Members tab. Re-throw real errors (network, auth, 500)
-    // so React Query surfaces them.
+    // "relay returned 404 Not Found" = not a relay member — return null so the
+    // UI hides the Members tab. Re-throw real errors so React Query shows them.
     if (
       error instanceof Error &&
       error.message.startsWith("relay returned 404")

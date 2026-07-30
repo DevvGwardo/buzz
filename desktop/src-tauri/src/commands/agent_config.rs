@@ -48,16 +48,15 @@ pub struct RuntimeFileConfigSubset {
 /// The pipeline: resolve the linked persona's prompt/model/provider, inject
 /// each into the record only where the record lacks its own value, let
 /// `read_config_surface` tag those injected fields `BuzzExplicit`, then re-tag
-/// exactly the injected fields to `PersonaDefault`.
-///
-/// Global defaults fill in when neither the record nor the linked persona
-/// provides a value. They are re-tagged to `GlobalDefault` so the UI can
-/// display "inherited from global defaults".
+/// exactly the injected fields to `PersonaDefault`. Global defaults fill in
+/// when neither the record nor the linked persona provides a value, and are
+/// re-tagged `GlobalDefault` so the UI can show "inherited from global
+/// defaults".
 ///
 /// The re-tag is triple-gated — a field is re-tagged only when (a) the record
 /// did not already have it (`!had_*`), (b) the surface produced the field, and
-/// (c) the reader tagged it `BuzzExplicit`. A value the user set explicitly in
-/// Buzz keeps `had_* == true` and is never re-tagged.
+/// (c) the reader tagged it `BuzzExplicit`. A value the user set explicitly
+/// keeps `had_* == true` and is never re-tagged.
 fn resolve_config_surface(
     mut record: ManagedAgentRecord,
     personas: &[AgentDefinition],

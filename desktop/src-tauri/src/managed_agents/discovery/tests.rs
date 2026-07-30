@@ -397,8 +397,7 @@ fn effective_agent_command_empty_override_is_inherit() {
 
 #[test]
 fn effective_agent_command_falls_back_to_default() {
-    // No override, no persona runtime, and a deleted persona all fall back
-    // to the bundled default.
+    // No override, no persona runtime, and a deleted persona all fall back to the bundled default.
     let personas = vec![persona_with_runtime("p1", None)];
     assert_eq!(
         effective_agent_command(Some("p1"), &personas, None),

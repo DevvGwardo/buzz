@@ -223,10 +223,9 @@ pub struct ManagedAgentRecord {
     /// storage layer blanks this before writing JSON once the key is safely in
     /// the keyring, and re-hydrates it from the keyring on load.
     ///
-    /// It is only serialized inline (the `0o600` JSON fallback) when the
-    /// keyring is unreachable — `skip_serializing_if` keeps it out of JSON in
-    /// the normal keyring-backed case. `default` also lets an old build parse a
-    /// store whose inline key was already migrated out and blanked.
+    /// It is only serialized inline (the `0o600` JSON fallback) when the keyring
+    /// is unreachable — `skip_serializing_if` keeps it out of JSON otherwise, and
+    /// `default` lets an old build parse a store whose inline key was migrated out.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub private_key_nsec: String,
     /// NIP-OA auth tag JSON. Computed at agent creation time.
@@ -246,13 +245,13 @@ pub struct ManagedAgentRecord {
     pub avatar_url: Option<String>,
     pub acp_command: String,
     pub agent_command: String,
-    /// Explicit per-instance harness pin. `None` (the default) means inherit
-    /// the harness from the linked persona's `runtime`, so persona harness
-    /// edits propagate on the next spawn — mirroring the opt-in `model`
-    /// override. `Some` is set only when the user deliberately picks a harness
-    /// that diverges from the persona. Resolved via `effective_agent_command`;
-    /// `agent_command` above is the create-time snapshot kept for avatar/legacy
-    /// derivations and is not authoritative for spawn.
+    /// Explicit per-instance harness pin. `None` (the default) inherits the
+    /// harness from the linked persona's `runtime`, so persona harness edits
+    /// propagate on the next spawn — mirroring the opt-in `model` override.
+    /// `Some` is set only when the user deliberately picks a harness that
+    /// diverges from the persona. Resolved via `effective_agent_command`
+    /// (`agent_command` above is a create-time snapshot for avatar/legacy
+    /// derivations, not authoritative for spawn).
     #[serde(default)]
     pub agent_command_override: Option<String>,
     pub agent_args: Vec<String>,
@@ -277,22 +276,20 @@ pub struct ManagedAgentRecord {
     #[serde(default = "default_agent_parallelism")]
     pub parallelism: u32,
     pub system_prompt: Option<String>,
-    /// Desired LLM model ID. Matches AgentModelInfo.id from discovery.
-    /// The harness re-discovers the correct ACP switching metadata at session
+    /// Desired LLM model ID. Matches AgentModelInfo.id from discovery; the
+    /// harness re-discovers the correct ACP switching metadata at session
     /// creation by matching this ID against the fresh session/new response.
-    /// For a linked instance this is a legacy/display snapshot only — spawn
-    /// and deploy resolve the effective model from the definition, never
-    /// from this field (see `effective_config::resolve_effective_config`).
-    /// For a definition-less instance this field is authoritative.
+    /// For a linked instance this is a legacy/display snapshot only — spawn and
+    /// deploy resolve the effective model from the definition, never from this
+    /// field (see `effective_config::resolve_effective_config`). For a
+    /// definition-less instance this field is authoritative.
     #[serde(default)]
     pub model: Option<String>,
-    /// LLM inference provider. For a linked instance this is a legacy/display
-    /// snapshot only — spawn and deploy resolve the effective provider from
-    /// the definition, never from this field (see
-    /// `effective_config::resolve_effective_config`). For a definition-less
-    /// instance this field is authoritative. `#[serde(default)]` so
-    /// pre-existing records deserialize as `None` and get backfilled on
-    /// first load.
+    /// LLM inference provider. Like `model` above, a linked instance's value is
+    /// a legacy/display snapshot only — spawn and deploy resolve the effective
+    /// provider from the definition. For a definition-less instance this field
+    /// is authoritative. `#[serde(default)]` so pre-existing records
+    /// deserialize as `None` and get backfilled on first load.
     #[serde(default)]
     pub provider: Option<String>,
     /// Content hash of the persona at the time this agent was created — the
@@ -370,16 +367,15 @@ pub struct ManagedAgentRecord {
     /// Absorbed from `AgentDefinition.runtime` — the preferred ACP runtime ID
     /// (e.g. 'goose', 'claude'). Record-first command resolution reads this
     /// before falling back to legacy persona lookup; populated by the store
-    /// migration and at create time, and re-mirrored from the linked
-    /// definition at every snapshot apply (`apply_persona_snapshot`).
+    /// migration and at create time, and re-mirrored from the linked definition
+    /// at every snapshot apply (`apply_persona_snapshot`).
     ///
     /// `None` means "inherit from the linked definition" (the Inherit sentinel
     /// clears it). Serialization then omits the key, so boot-time
     /// `materialize_agent_runtimes` re-inserts a mirror of the definition's
     /// current runtime on the next launch — behaviorally identical, because
     /// every apply site re-mirrors the live definition anyway. A literal
-    /// `"runtime": null` in the store (key present, e.g. hand-edited) is
-    /// honored: materialization skips it and it deserializes to `None`.
+    /// `"runtime": null` (hand-edited) is honored: materialization skips it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
     /// Pool of short thematic names for clones of this agent. Absorbed from
@@ -417,11 +413,11 @@ pub struct ManagedAgentRecord {
     /// NIP-AP definition-level behavioral defaults, absorbed from
     /// `AgentDefinition` in WIRE shape (kebab-case string / optional u32),
     /// distinct from the instance-side `respond_to`/`respond_to_allowlist`/
-    /// `parallelism` fields above: these are what a *definition* advertises
-    /// and are copied onto instances at mint time only. Wire shape (not the
+    /// `parallelism` fields above: these are what a *definition* advertises and
+    /// are copied onto instances at mint time only. Wire shape (not the
     /// `RespondTo` enum) so absent-ness and unknown future mode strings
-    /// round-trip byte-identically through the store — parsed/validated
-    /// solely at the mint boundary.
+    /// round-trip byte-identically through the store — parsed/validated solely
+    /// at the mint boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition_respond_to: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -543,15 +539,14 @@ pub struct ManagedAgentSummary {
     /// Distinct from out-of-date: there is no current persona to respawn into.
     /// An orphaned agent also cannot be (re)started — `spawn_agent_child`
     /// refuses it (see `effective_config::resolve_effective_config`'s
-    /// `OrphanedInstance` arm via `require_resolved`) — so the UI
-    /// should surface that it's stuck, not merely stale.
+    /// `OrphanedInstance` arm via `require_resolved`) — so the UI should
+    /// surface that it's stuck, not merely stale.
     pub persona_orphaned: bool,
-    /// `true` when the running process was spawned with a config that no
-    /// longer matches what a spawn would use today — a plain restart would
-    /// change what runs. Complements `persona_out_of_date`: the badge means
-    /// "a restart would change what runs"; out-of-date means "a respawn
-    /// would." Always `false` for stopped agents and for processes adopted
-    /// via a persisted `runtime_pid` (their spawn config is unknown).
+    /// `true` when the running process was spawned with a config that no longer
+    /// matches what a spawn would use today. Complements `persona_out_of_date`:
+    /// the badge means "a restart would change what runs"; out-of-date means "a
+    /// respawn would." Always `false` for stopped agents and for processes
+    /// adopted via a persisted `runtime_pid` (their spawn config is unknown).
     pub needs_restart: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_vars: BTreeMap<String, String>,
