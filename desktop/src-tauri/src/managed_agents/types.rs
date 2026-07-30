@@ -260,9 +260,8 @@ pub struct ManagedAgentRecord {
     /// (`known_acp_runtime`) — and no longer written by updates. Kept for
     /// serde compatibility with existing stores.
     pub mcp_command: String,
-    /// Deprecated: `BUZZ_ACP_TURN_TIMEOUT` is ignored by the harness and the
-    /// desktop no longer emits or edits it. Kept for serde compatibility with
-    /// existing stores; use `idle_timeout_seconds` or
+    /// Deprecated: `BUZZ_ACP_TURN_TIMEOUT` is ignored by the harness and the desktop no
+    /// longer emits or edits it. Kept for serde compat; use `idle_timeout_seconds` or
     /// `max_turn_duration_seconds` for turn-length control.
     pub turn_timeout_seconds: u64,
     /// Idle timeout in seconds (`BUZZ_ACP_IDLE_TIMEOUT`): how long the agent
@@ -276,27 +275,23 @@ pub struct ManagedAgentRecord {
     #[serde(default = "default_agent_parallelism")]
     pub parallelism: u32,
     pub system_prompt: Option<String>,
-    /// Desired LLM model ID. Matches AgentModelInfo.id from discovery; the
-    /// harness re-discovers the correct ACP switching metadata at session
-    /// creation by matching this ID against the fresh session/new response.
-    /// For a linked instance this is a legacy/display snapshot only — spawn and
-    /// deploy resolve the effective model from the definition, never from this
-    /// field (see `effective_config::resolve_effective_config`). For a
+    /// Desired LLM model ID. Matches `AgentModelInfo.id` from discovery; the harness
+    /// re-discovers the correct ACP switching metadata on session creation. For a linked
+    /// instance this is a legacy/display snapshot — spawn and deploy resolve from the
+    /// definition (see `effective_config::resolve_effective_config`). For a
     /// definition-less instance this field is authoritative.
     #[serde(default)]
     pub model: Option<String>,
-    /// LLM inference provider. Like `model` above, a linked instance's value is
-    /// a legacy/display snapshot only — spawn and deploy resolve the effective
-    /// provider from the definition. For a definition-less instance this field
-    /// is authoritative. `#[serde(default)]` so pre-existing records
-    /// deserialize as `None` and get backfilled on first load.
+    /// LLM inference provider. Like `model` above, a linked instance's value is a
+    /// legacy/display snapshot — spawn and deploy resolve from the definition. For a
+    /// definition-less instance this field is authoritative. `#[serde(default)]` so
+    /// pre-existing records deserialize as `None` and backfill on first load.
     #[serde(default)]
     pub provider: Option<String>,
-    /// Content hash of the persona at the time this agent was created — the
-    /// `persona_content_hash` of the snapshot in `system_prompt` / `model` /
-    /// `provider` / `env_vars`. The Agents menu compares it against the linked
-    /// persona's current hash to flag a stale (out-of-date) instance. `None`
-    /// for non-persona agents and for pre-existing records pending backfill.
+    /// Content hash of the persona at this agent's creation time (snapshot of
+    /// `system_prompt`/`model`/`provider`/`env_vars`). The Agents menu compares it
+    /// against the linked persona's current hash to flag a stale instance. `None` for
+    /// non-persona agents and pre-existing records pending backfill.
     #[serde(default)]
     pub persona_source_version: Option<String>,
     /// Environment variables injected at spawn time. Layered as: desktop
@@ -497,25 +492,23 @@ pub struct ManagedAgentSummary {
     pub pubkey: String,
     pub name: String,
     pub persona_id: Option<String>,
-    /// The record's harness/runtime id (mirror of `ManagedAgentRecord.runtime`).
-    /// Lets the UI count agents referencing a harness definition (e.g. in the
+    /// The record's harness/runtime id (mirror of `ManagedAgentRecord.runtime`). Lets
+    /// the UI count agents referencing a harness definition (e.g. in the
     /// delete-confirmation flow). `None` = inherit from the linked persona.
     pub runtime: Option<String>,
     pub team_id: Option<String>,
     pub relay_url: String,
     pub acp_command: String,
     pub agent_command: String,
-    /// Mirrors `ManagedAgentRecord.agent_command_override`: `Some` when the user
-    /// has explicitly pinned this instance's harness, `None` when it inherits
-    /// from the persona. Lets the Edit dialog seed "Inherit from persona" vs a
-    /// concrete pin (`agent_command` above is the resolved/effective command).
+    /// Mirrors `ManagedAgentRecord.agent_command_override`: `Some` when the user has
+    /// explicitly pinned this instance's harness, `None` when it inherits from the
+    /// persona (`agent_command` above is the resolved/effective command).
     pub agent_command_override: Option<String>,
     pub agent_args: Vec<String>,
-    /// Catalog-derived from the effective harness (not the record's stored
-    /// field), so the UI always shows what a spawn would actually use.
+    /// Catalog-derived from the effective harness (not the stored field), so the UI
+    /// always shows what a spawn would actually use.
     pub mcp_command: String,
-    /// Deprecated passthrough of the stored record value; the harness ignores
-    /// it. Kept for wire compatibility.
+    /// Deprecated passthrough; the harness ignores it. Kept for wire compatibility.
     pub turn_timeout_seconds: u64,
     pub idle_timeout_seconds: Option<u64>,
     pub max_turn_duration_seconds: Option<u64>,
