@@ -112,7 +112,7 @@ because its enforcing mechanism is one small, boring thing — a refusal at
 payload construction (I1), a key-shape validator (I2), an ephemeral event
 the agent already publishes (I3), a deterministic name plus one annotation
 compare (I4), a timer that fires an existing shutdown channel (I5). The
-same rule holds below: the deploy state machine is one loop over seven
+same rule holds below: the deploy state machine is one loop over six
 ordered rows; the Secret scheme is "unique name, write first, reference
 exactly"; GC is one label-select with two filters (annotation, same-clock
 age). Where
@@ -214,6 +214,20 @@ against the *current* discovery set. A stored binary path on an agent record
 is a cache, revalidated against both the current candidates and the recorded
 id before every use. A record edit can therefore never redirect an operation
 to a binary discovery would not have found.
+
+**Pre-secret negotiation gate (normative).** Declaring `protocol_version`
+is worthless if nothing checks it before the nsec crosses the trust
+boundary — and at `c1bca1b56` nothing does: `provider_deploy` invokes
+`deploy` directly, so a stale UI-time probe (or a binary replaced on PATH
+since that probe) can receive `private_key_nsec` unchecked (Known Defect
+5). The deploy path MUST: resolve the provider id **once**; invoke `info`
+on that resolved executable; validate a compatible `protocol_version`; then
+invoke `deploy` on the **same executable identity** — at minimum the same
+canonical path with unchanged stable file identity/metadata (dev/inode or
+equivalent, size, mtime) between the two invocations, failing or
+re-prompting on any change. A UI-time probe result MUST NOT satisfy this
+gate. Remembered digest-based approval (Terraform-lock style) is a stronger
+follow-up, not a v1 requirement.
 
 ### Invocation
 
@@ -362,7 +376,9 @@ Claude; `BUZZ_AGENT_MODEL`/`BUZZ_AGENT_PROVIDER` for buzz-agent). A fixed
 built-in runtimes and is why this block exists.
 
 **What `policy_env` carries — and deliberately does not.** Its irreducible
-wire fields are exactly three scalars plus the metadata-derived defaults:
+wire fields are exactly three scalars plus the metadata-derived defaults —
+plus the four record-derived behavior knobs that would otherwise be
+mis-tiered (below):
 
 - `BUZZ_ACP_TEAM_INSTRUCTIONS` — the only truly non-reconstructible policy
   value: `effective_team_instructions` (`spawn_hash.rs:41-52`) needs the
@@ -391,6 +407,18 @@ wire fields are exactly three scalars plus the metadata-derived defaults:
 - `MCP_HOOK_SERVERS=*` when the resolved runtime has `mcp_hooks`
   (`runtime.rs:594-598`; buzz-agent only at `c1bca1b56`) — gates the
   `_Stop`/`_PostCompact` hook tools.
+- `BUZZ_ACP_SYSTEM_PROMPT`, `BUZZ_ACP_IDLE_TIMEOUT`,
+  `BUZZ_ACP_MAX_TURN_DURATION`, `BUZZ_ACP_AGENTS` — resolved by the desktop
+  from the record's `system_prompt` / `idle_timeout_seconds` /
+  `max_turn_duration_seconds` / `parallelism` (each omitted when null,
+  matching the local spawn's conditional emission). These are **tier-1 by
+  local fact, not by choice**: the local spawn writes them before the user
+  env layer (`runtime.rs:716-729,763` vs `:860`) and none is in
+  `RESERVED_ENV_KEYS`, so a power user's env override beats them today. A
+  provider that independently mapped the top-level payload copies after
+  `launch.env` would invert that — the structured field silently defeating
+  an override that works locally — which is why the provider MUST NOT remap
+  them (§Entrypoint mapping table).
 
 `BUZZ_ACP_DEDUP` and `BUZZ_ACP_MULTIPLE_EVENT_HANDLING` are **deliberately
 unset**: the local spawn writes `queue`/`steer` (`runtime.rs:730-731`), and
@@ -502,9 +530,8 @@ observation; on any conflict, *re-enter from step 1* rather than fail:
 | no instance | create, then verify startup (below) | first deploy / after GC |
 | terminated (Succeeded/Failed) | delete residue, wait for disappearance, re-enter (→ create) | the **normal restart path**: how a user revives a reaped or shut-down agent |
 | live and **started** (harness container running) | **strict no-op; return existing `agent_id`** | Start must never silently kill a live agent mid-turn; "already running" is the honest answer, consistent with I3 |
-| exists but **never started**, provably non-recoverable — referenced Secret confirmed absent, or invalid image reference | delete, wait for disappearance, re-enter (→ create) | a pod whose harness never ran is not a live agent: nothing can be killed mid-turn (I3), it never held the identity (I4), auto-stop cannot bound it (I5's reaper lives in the harness), and no-op'ing it would return a permanently inert instance as success on every future Start. "Provably" means the provider verified the referenced object's absence or the spec-level defect itself — never a reason string alone |
-| exists but **never started**, encountered by a *later* deploy past the startup bound — pod's server `creationTimestamp` older than the operation deadline (same-clock rule, §K8s GC) | delete, wait for disappearance, re-enter (→ create) | its own deploy's startup budget is exhausted; whatever it was waiting for did not come. Age, measured on the apiserver's clock, is the fatality discriminator that reason strings cannot be |
-| exists, **never started**, within bound — self-healable startup states: `Unschedulable` (scale-from-zero autoscaling), image pull / `ImagePullBackOff`, transient `CreateContainerConfigError` | observe until started or the operation deadline expires, then report the latest redacted condition | these states routinely self-heal — an autoscaler provisions the node, the pull retries, the kubelet re-resolves the Secret (it retries a never-created container regardless of `restartPolicy`). Immediate delete/recreate would thrash on transient registry or capacity delays and defeat the cold-start budget |
+| exists but **never started**, provably non-recoverable — referenced Secret confirmed absent (by a consistent read, below), or invalid image reference | delete (preconditioned, below), wait for disappearance, re-enter (→ create) | a pod whose harness never ran is not a live agent: nothing can be killed mid-turn (I3), it never held the identity (I4), auto-stop cannot bound it (I5's reaper lives in the harness), and no-op'ing it would return a permanently inert instance as success on every future Start. "Provably" means the provider verified the referenced object's absence or the spec-level defect itself — never a reason string alone |
+| exists, **never started**, recoverable — self-healable startup states: `Unschedulable` (scale-from-zero autoscaling), image pull / `ImagePullBackOff`, transient `CreateContainerConfigError` | observe until started or the operation deadline expires, then return the latest redacted condition — **never delete, on this call or any later one** | these states routinely self-heal — an autoscaler provisions the node, the pull retries, the kubelet re-resolves the Secret (it retries a never-created container regardless of `restartPolicy`). And recoverable-timeout MUST stay observational *across calls*: any finite pod-age threshold can collide with the cluster's own pod-age thresholds (Cluster Autoscaler's `--new-pod-scale-up-delay` / per-pod `pod-scale-up-delay` annotation — the FAQ's example is `"600s"`), and delete-recreate resets exactly the age the autoscaler keys on, converting a slow cold start into a livelock in which every individual decision is correct. A later deploy re-reads: started → strict no-op; still recoverable → observe under the new call's deadline without resetting pod age; provably non-recoverable → the row above. A permanently unschedulable pod persisting until operator action is the honest cost — a generic provider cannot know when an autoscaler will act, and M1 already makes substrate residue the operator's boundary |
 
 **Startup is part of create — phase is not readiness.** `Pending` (and even
 `Running` at the pod level) does not mean the harness started: a pod can sit
@@ -518,9 +545,11 @@ error carrying the actionable condition (the container waiting `reason` /
 pod condition), not a generic timeout. "Live" in the no-op row above means
 **started**, for the same reason — this is the lesson ephemeral-runner
 controllers learned upstream (inspect container state, not pod phase).
-Classification MUST combine container state, pod conditions,
-referenced-object existence, and pod age — **reason strings alone are not a
-stable fatality taxonomy**. In particular, `Unschedulable` is not fatal: a
+Classification MUST combine container state, pod conditions, and
+referenced-object existence — **reason strings alone are not a
+stable fatality taxonomy**, and pod age is never one (age triggers nothing
+destructive; see the recoverable row and the controlled-view rule below).
+In particular, `Unschedulable` is not fatal: a
 scale-from-zero pod reports it while the autoscaler provisions capacity,
 and the kubelet retries a container that never got a container status
 regardless of `restartPolicy: Never` (`ShouldContainerBeRestarted` returns
@@ -530,12 +559,40 @@ Secret self-heals. `restartPolicy: Never` suppresses restarting a container
 that ran and died; it says nothing about one that never started.
 A consequence to state plainly: once success includes container start, the
 600s operation deadline **is** the cold-start budget — image pull on a
-fresh node, scale-from-zero scheduling, all of it. Deadline expiry on a
-still-progressing startup is reported as "startup not confirmed within the
-deadline", and MUST NOT trigger cleanup or forced recycle: the next deploy's
-reconciler observes whatever the startup became and takes the matching row.
-Whether ten minutes fits the intended cluster class is a product ruling,
+fresh node, scale-from-zero scheduling, all of it. But the deadline bounds
+**how long one Start waits synchronously**, nothing more. Deadline expiry
+on a still-progressing startup is reported as "startup not confirmed within
+the deadline", and MUST NOT trigger cleanup or forced recycle — on this
+call *or any later one* (the recoverable row above): the next deploy's
+reconciler observes whatever the startup became and takes the matching row,
+preserving the pod's `creationTimestamp` for whatever cluster machinery
+keys on it. Whether ten minutes fits the intended cluster class is a
+product ruling,
 not a correctness one.
+
+**Destructive decisions come from views you control — reads and writes
+both (normative).** This is one rule with three instances, stated once so
+nobody optimizes an instance away. §K8s GC's same-clock rule is the time
+instance. The other two live here:
+
+- *Reads*: every read whose result can authorize a deletion — the
+  Secret-absence confirmation above, and the candidate list the GC pass
+  filters — MUST use most-recent semantics (`resourceVersion` **unset**,
+  a quorum read). `resourceVersion: "0"` is served from the watch cache,
+  which the Kubernetes API contract explicitly allows to be much older
+  than anything the client has already observed; a stale
+  Secret-absence read would delete a pod whose Secret exists and whose
+  container was about to start — the GC race again, arriving through read
+  consistency instead of a clock.
+- *Writes*: a fresh read is necessary but not sufficient — the kubelet can
+  start the container between observation and delete. Every DELETE
+  authorized by a classification MUST carry `preconditions.uid` **and**
+  `preconditions.resourceVersion` from that exact observation
+  (`metav1.Preconditions` supports both), making the edge a
+  compare-and-delete. A failed precondition (409) is neither an error nor
+  permission to retry the delete: re-enter from step 1 and classify the
+  object that exists now. The full-pubkey annotation check remains — the
+  precondition pins *when*, the annotation pins *whose*.
 
 **No-op means zero mutation.** The live-instance row MUST NOT replace or
 patch the Secret, patch metadata, or delete anything belonging to the
@@ -736,11 +793,8 @@ individually:
 | `launch.args` | `BUZZ_ACP_AGENT_ARGS`, comma-joined |
 | `launch.env`, `launch.policy_env` | verbatim, at their precedence tiers |
 | generation token (§K8s Secrets) | `BUZZ_MANAGED_AGENT_START_NONCE` — the lifecycle-frame correlator and the Secret generation are one identity (§Launch data tier 3) |
-| `system_prompt` | `BUZZ_ACP_SYSTEM_PROMPT` (omitted when null) |
-| `idle_timeout_seconds` | `BUZZ_ACP_IDLE_TIMEOUT` (omitted when null) |
+| `system_prompt`, `idle_timeout_seconds`, `max_turn_duration_seconds`, `parallelism` | **not mapped by the provider** — the desktop resolves these into `launch.policy_env` (`BUZZ_ACP_SYSTEM_PROMPT`, `BUZZ_ACP_IDLE_TIMEOUT`, `BUZZ_ACP_MAX_TURN_DURATION`, `BUZZ_ACP_AGENTS`), because they are tier-1 behavior knobs: locally they are written *before* the user env layer and none is reserved (`runtime.rs:716-729,763` vs `:860`; `env_vars.rs:54-57`), so user env beats them. A provider that mapped the top-level copies after `launch.env` would silently defeat an override that works locally. The top-level fields remain as display/bookkeeping inputs only |
 | `turn_timeout_seconds` | not mapped — deprecated upstream and ignored; the local spawn also does not emit it |
-| `max_turn_duration_seconds` | `BUZZ_ACP_MAX_TURN_DURATION` (omitted when null) |
-| `parallelism` | `BUZZ_ACP_AGENTS` |
 | `respond_to` | `BUZZ_ACP_RESPOND_TO` |
 | `respond_to_allowlist` | `BUZZ_ACP_RESPOND_TO_ALLOWLIST`, comma-joined |
 | — | `BUZZ_ACP_MCP_COMMAND=buzz-dev-mcp` (image-local; the dev-MCP requirement) |
@@ -1016,9 +1070,11 @@ A provider is conforming iff:
    annotation before any action, live (= **started**, §Deploy State
    Machine) → strict no-op (zero mutation), never-started states
    classified by evidence not reason strings (provably-broken →
-   delete-recreate, self-healable → observe within bound, past-bound →
-   delete-recreate), success only on confirmed container start,
-   conflicts converge by re-entry, delete-not-found is success.
+   preconditioned delete-recreate; recoverable → observe, never delete,
+   on this call or any later one), destructive reads consistent and
+   destructive deletes UID+resourceVersion-preconditioned (§Deploy State
+   Machine controlled-view rule), success only on confirmed container
+   start, conflicts converge by re-entry, delete-not-found is success.
 5. The deployed harness invocation enables an inactivity bound (I5) and the
    substrate does not resurrect terminated instances.
 6. The harness is the deployed container's **signal-receiving process**, and
@@ -1030,19 +1086,29 @@ A provider is conforming iff:
    suspenders).
 
 Conformance is testable without mechanization: a fake-provider harness can
-exercise items 1–3 and 7 over the wire contract, and an envtest/kind suite
+exercise items 1–3 and 7 over the wire contract — including the pre-secret
+negotiation gate (§Discovery): an incompatible `protocol_version` MUST be
+rejected before any request carrying `private_key_nsec` is sent, and an
+executable replaced between the deploy-path `info` and `deploy` MUST fail
+the same-identity check rather than receive the nsec — and an envtest/kind suite
 can drive item 4's reconciler against a real apiserver — concurrent
 deploys, a deletion-marked pod, terminal restart, an annotation-mismatch
 collision, and SIGTERM→presence-offline for items 5–6. Two families of
 cases are mandatory because they were the review-found failure modes:
 **startup discrimination** (slow-but-valid scheduling → poll-then-succeed;
 `Unschedulable` during scale-from-zero → observed until the autoscaler
-provisions capacity, then success — never immediate delete-recreate;
-referenced Secret *confirmed absent* → delete-recreate or actionable error,
-never silent success or no-op; a **never-started winner is repairable** —
-pod exists, Secret absent, container never started: a later deploy MUST
-delete-and-recreate rather than no-op, the test that pins started-not-phase
-as the no-op criterion) and the **GC/attempt interleaving** (attempt B's
+provisions capacity, then success — never delete, **including when
+provisioning completes only after the 600s deadline**: the original pod
+identity and `creationTimestamp` survive the expired call and become the
+no-op winner on a later deploy, the case that pins the anti-livelock rule;
+referenced Secret *confirmed absent* → preconditioned delete-recreate or
+actionable error, never silent success or no-op; a **never-started winner
+is repairable** — pod exists, Secret absent, container never started: a
+later deploy MUST delete-and-recreate rather than no-op, the test that pins
+started-not-phase as the no-op criterion; and the **classification→DELETE
+race** — the container transitions to running between the classifying read
+and the delete: the UID+resourceVersion precondition MUST fail and the
+live agent MUST be preserved) and the **GC/attempt interleaving** (attempt B's
 preflight GC running between attempt A's Secret create and pod create MUST
 NOT delete Secret A — the §K8s GC age gate under test; provider death after
 Secret create → the age gate protects, then a later GC reaps; and a
@@ -1087,7 +1153,14 @@ Desktop- and harness-side, discovered during this design:
    in the pod instead of being refused. Until `deploy_payload_json` emits
    the `launch` block, no provider can conform to §Launch data, and the
    current payload MUST be treated as insufficient for a
-   semantics-preserving remote launch.
+   semantics-preserving remote launch. **Security follow-through:** once
+   secrets can arrive via `launch.env`, desktop redaction MUST collect
+   candidate values from `launch.env` (and `launch.policy_env`) as well as
+   legacy `agent.env_vars` — at `c1bca1b56`, `env_secrets_from_request`
+   reads only `agent.env_vars` (`backend.rs`), leaving a
+   definition/persona-layer secret outside the literal-value scrub.
+   Conformance: a provider that echoes a launch-only secret into an error
+   must come back redacted.
 4. **The I5 reaper does not exist, and its natural home is a trap**
    (harness code prerequisite). `BUZZ_ACP_EXIT_AFTER_INACTIVITY` appears
    nowhere in the harness at `c1bca1b56`; §Auto-Stop is a design, not a
@@ -1098,6 +1171,13 @@ Desktop- and harness-side, discovered during this design:
    case (§Auto-Stop mechanism rule). The implementation MUST run the expiry
    check on a pool-independent timer and MUST add the env var to
    `RESERVED_ENV_KEYS` in the same change.
+5. **The deploy path never checks `protocol_version`** (desktop code
+   prerequisite). `provider_deploy` (`backend.rs`) sends the nsec-bearing
+   `deploy` request without any preceding `info` on the same resolved
+   executable; §Discovery's pre-secret negotiation gate is a design, not a
+   description, until the deploy command performs
+   resolve-once → `info` → compatibility check → `deploy` on the same
+   executable identity.
 
 ## Implementation Correspondence
 
@@ -1105,6 +1185,7 @@ Desktop- and harness-side, discovered during this design:
 |---|---|
 | Discovery, resolution rule | `desktop/src-tauri/src/managed_agents/backend.rs` (`discover_provider_candidates`, `resolve_provider_binary`) |
 | Invocation, output caps, exit rule | `backend.rs` (`invoke_provider`) |
+| Pre-secret negotiation gate | *to be added*: `backend.rs` deploy path — resolve-once → `info` → version check → same-identity `deploy` (Known Defect 5) |
 | Redaction | `backend.rs` (`redact_secrets_with`) |
 | I2 validation | `backend.rs` (`validate_provider_config`) |
 | I1 refusal, payload | `desktop/src-tauri/src/commands/agents_deploy.rs` |
@@ -1146,9 +1227,14 @@ Marked `[DECISION]` inline; consolidated:
   it is a policy statement about what power users may do to remote pods.
 - **H. Startup budget** — with deploy success now requiring container start
   (§Deploy State Machine), the 600s operation deadline is the de facto
-  cold-pull / scale-from-zero budget. Whether ten minutes fits the intended
-  cluster class is an SLO ruling; the spec fixes only the semantics
-  (deadline expiry = "startup not confirmed", never cleanup).
+  cold-pull / scale-from-zero budget. The spec fixes the semantics
+  narrowly: the deadline bounds how long one Start waits synchronously —
+  never when anything is destroyed (recoverable startup is observational
+  across calls, so a cluster whose autoscaler `new-pod-scale-up-delay`
+  exceeds 600s degrades to "Start reports unconfirmed, a later Start
+  adopts the now-running pod", not a livelock). The remaining SLO ruling
+  is UX-only: is ten minutes of synchronous waiting the right ceiling for
+  the intended cluster class?
 
 ## Summary
 
