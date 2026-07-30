@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   getDictationSendDecision,
   replaceTrailingTranscribedText,
+  shouldAutoSubmitDictation,
 } from "./voiceInput.ts";
 
 test("dictation send stops capture before submitting", () => {
@@ -41,6 +42,32 @@ test("dictation send waits for the final transcript", () => {
       isTranscribing: false,
     }),
     "send",
+  );
+});
+
+test("dictation auto-submit waits until capture and transcription settle", () => {
+  const state = {
+    requested: true,
+    isRecording: false,
+    isStarting: false,
+    isTranscribing: false,
+  };
+  assert.equal(shouldAutoSubmitDictation(state), true);
+  assert.equal(
+    shouldAutoSubmitDictation({ ...state, requested: false }),
+    false,
+  );
+  assert.equal(
+    shouldAutoSubmitDictation({ ...state, isRecording: true }),
+    false,
+  );
+  assert.equal(
+    shouldAutoSubmitDictation({ ...state, isStarting: true }),
+    false,
+  );
+  assert.equal(
+    shouldAutoSubmitDictation({ ...state, isTranscribing: true }),
+    false,
   );
 });
 

@@ -24,6 +24,20 @@ export function getDictationSendDecision({
   return "send";
 }
 
+export function shouldAutoSubmitDictation({
+  requested,
+  isRecording,
+  isStarting,
+  isTranscribing,
+}: {
+  requested: boolean;
+  isRecording: boolean;
+  isStarting: boolean;
+  isTranscribing: boolean;
+}): boolean {
+  return requested && !isRecording && !isStarting && !isTranscribing;
+}
+
 export function replaceTrailingTranscribedText(
   fullText: string,
   previousTranscribedText: string,

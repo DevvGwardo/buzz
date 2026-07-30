@@ -1,7 +1,10 @@
 import type * as React from "react";
-import { useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { useFeatureEnabled } from "@/shared/features";
-import { getDictationSendDecision } from "../lib/voiceInput";
+import {
+  getDictationSendDecision,
+  shouldAutoSubmitDictation,
+} from "../lib/voiceInput";
 import { DictationButton } from "../ui/DictationButton";
 import { useComposerDictation } from "./useComposerDictation";
 
@@ -15,10 +18,14 @@ interface UseMessageComposerDictationOptions {
   setEditorContent: (text: string) => void;
   draftKey: string | null;
   composerRef: React.RefObject<HTMLElement | null>;
+  submitMessageRef: React.MutableRefObject<() => void>;
 }
 
 export function useMessageComposerDictation({
+  disabled,
+  draftKey,
   setEditorContent,
+  submitMessageRef,
   ...options
 }: UseMessageComposerDictationOptions) {
   const enabled = useFeatureEnabled("voiceDictation");
@@ -26,10 +33,34 @@ export function useMessageComposerDictation({
   setEditorContentRef.current = setEditorContent;
   const dictation = useComposerDictation({
     ...options,
+    disabled,
+    draftKey,
     enabled,
     setEditorContentRef,
   });
   const { isRecording, isStarting, isTranscribing, stopRecording } = dictation;
+  const sendAfterTranscriptionRef = useRef(false);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: composer scope and availability are the reset triggers for a queued send
+  useEffect(() => {
+    sendAfterTranscriptionRef.current = false;
+  }, [disabled, draftKey]);
+
+  useEffect(() => {
+    if (
+      !shouldAutoSubmitDictation({
+        requested: sendAfterTranscriptionRef.current,
+        isRecording,
+        isStarting,
+        isTranscribing,
+      })
+    ) {
+      return;
+    }
+    sendAfterTranscriptionRef.current = false;
+    submitMessageRef.current();
+  }, [isRecording, isStarting, isTranscribing, submitMessageRef]);
+
   const prepareToSubmit = useCallback(() => {
     const decision = getDictationSendDecision({
       isRecording,
@@ -37,6 +68,7 @@ export function useMessageComposerDictation({
       isTranscribing,
     });
     if (decision === "stop-recording") {
+      sendAfterTranscriptionRef.current = true;
       stopRecording();
     }
     return decision === "send";

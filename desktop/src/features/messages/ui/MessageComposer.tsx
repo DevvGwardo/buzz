@@ -232,7 +232,6 @@ function MessageComposerImpl({
       (replyTarget
         ? `Reply to ${replyTarget.author} in #${channelName}`
         : `Message #${channelName}`));
-
   const richText = useRichTextEditor({
     placeholder: computedPlaceholder,
     editable: !disabled,
@@ -277,6 +276,7 @@ function MessageComposerImpl({
     setEditorContent: richText.setContent,
     draftKey: effectiveDraftKey,
     composerRef: composerScrollRef,
+    submitMessageRef,
   });
   prepareDictationSubmitRef.current = dictation.prepareToSubmit;
   const linkEditor = useLinkEditor(richText);
