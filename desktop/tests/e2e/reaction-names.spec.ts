@@ -6,6 +6,8 @@ const REACTION_TARGET_CONTENT = "React to me with a custom emoji";
 const REACTION_TARGET_EVENT_ID = "d".repeat(64);
 const BOB_PUBKEY =
   "bb22a5299220cad76ffd46190ccbeede8ab5dc260faa28b6e5a2cb31b9aff260";
+const MAX_REACTION_NAME =
+  "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl";
 
 function reactionTargetRow(page: import("@playwright/test").Page) {
   return page
@@ -50,4 +52,47 @@ test("reaction popover resolves a reactor with no authored message in the window
   await expect(pill).toBeVisible();
   await pill.hover();
   await expect(page.getByText("bob reacted with")).toBeVisible();
+});
+
+test("maximum-length reaction name wraps inside a fixed-width popover", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await page.waitForFunction(
+    () =>
+      window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+        channelName: "general",
+        kind: 7,
+      }) === true,
+  );
+
+  const reaction = `:${MAX_REACTION_NAME}:`;
+  await page.evaluate(
+    ({ content, targetId }) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "general",
+        content,
+        extraTags: [["e", targetId]],
+        kind: 7,
+      });
+    },
+    { content: reaction, targetId: REACTION_TARGET_EVENT_ID },
+  );
+
+  const pill = reactionTargetRow(page).getByRole("button", {
+    name: `Toggle ${reaction} reaction`,
+  });
+  await expect(pill).toBeVisible();
+  await pill.focus();
+
+  const popover = page
+    .locator("[data-radix-popper-content-wrapper]")
+    .filter({ hasText: reaction });
+  await expect(popover).toBeVisible();
+  await expect(popover).toHaveCSS("width", "288px");
+  const reactionName = popover.getByTestId("reaction-popover-name");
+  await expect(reactionName).toHaveCSS("word-break", "break-all");
+  await expect(reactionName).toHaveText(reaction);
 });
