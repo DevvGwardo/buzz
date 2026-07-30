@@ -105,6 +105,13 @@ pub async fn run_boot_barrier(app: &tauri::AppHandle) {
 /// the first round trip, and the decision pass re-opens it for the coordinates
 /// that earn it. A row is either provably publishable or it is not going out.
 ///
+/// Note: `disk_projections` runs before this call inside
+/// `run_boot_barrier_for_scope`. Under the readiness latch that ordering is
+/// defense-in-depth — the flush loop cannot snapshot any scope that has not
+/// yet passed its barrier, so quarantine ordering no longer determines whether
+/// a pre-quarantine row can escape. The synchronous-before-network property is
+/// retained because it is cheap and keeps the invariant obvious.
+///
 /// Scoped to rows with no baseline because those are precisely the unprovable
 /// ones: a legacy row queued before the baseline column existed, and a row
 /// queued by a second store whose retention database has never agreed to
