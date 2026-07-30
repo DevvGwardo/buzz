@@ -113,20 +113,18 @@ fn structured_fallback_intact_when_no_env_representation() {
     assert_eq!(model.origin, ConfigOrigin::PersonaDefault);
 }
 
-// ── Invalid normalized-value sanitization test ───────────────────────────────
+// ── Post-sanitization fallthrough test ───────────────────────────────────────
 //
-// A known normalized key with an invalid value (NUL byte or oversize) in an
-// inherited tier must NOT reach the display surface. Sanitization happens at
-// the command boundary in `build_inherited_tiers`; here we verify directly
-// via the builder that a sanitized (empty) env tier falls through correctly.
+// Sanitization itself happens at the command boundary in `build_inherited_tiers`
+// (a value with a NUL byte or an oversize value is dropped from the tier) and is
+// pinned by the tests in `commands/agent_config_tests.rs`. The reader only ever
+// sees the sanitized result, so what it must guarantee is the downstream half:
+// a key stripped from one tier falls through to the next.
 
-/// When an inherited tier has had its invalid value stripped (empty tier after
-/// sanitization), the field falls through to the next tier.
+/// A key absent from the global env tier — the shape the reader sees after the
+/// command boundary strips an invalid value — falls through to the persona tier.
 #[test]
-fn nul_value_in_inherited_env_falls_through_to_next_tier() {
-    // Simulate: global env had BUZZ_AGENT_THINKING_EFFORT="\0" which was
-    // sanitized away. After sanitization the global_env map is empty for
-    // that key, so the field falls through — here via an absent global tier.
+fn post_sanitization_empty_global_env_falls_through_to_persona_tier() {
     let record = test_record();
     let runtime = buzz_agent_rt();
     // No global env (stripped); persona provides the valid fallback.
