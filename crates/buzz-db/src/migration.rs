@@ -347,6 +347,7 @@ mod tests {
             "push_gateway_delivery_auth_replays",
             "push_gateway_delivery_request_replays",
             "product_feedback",
+            "replica_heartbeat",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -560,7 +561,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 27);
+        assert_eq!(migrations.len(), 28);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -902,40 +903,53 @@ mod tests {
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
             "desired-state schema must include join-policy evidence used by invite claims",
         );
+        // Replica heartbeat (this branch, renumbered to 0026 after
+        // 0025_relay_invites landed on main): the fence's portable read-side
+        // observation. A single CHECK'd row makes the token update the
+        // serialization point (multi-pod commit ordering), and the epoch
+        // column is what detects token resets — both are load-bearing for
+        // the routing proof.
+        assert_eq!(migrations[25].version, 26);
+        let heartbeat = migrations[25].sql.as_str();
+        assert!(heartbeat.contains("CREATE TABLE replica_heartbeat"));
+        assert!(heartbeat.contains("CHECK (id = 1)"));
+        assert!(heartbeat.contains("epoch"));
+        assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
+        assert!(heartbeat.contains("_operator_global_tables"));
 
         // Relay-verified identity bindings are additive and community-scoped.
-        assert_eq!(migrations[25].version, 26);
-        assert!(migrations[25]
+        assert_eq!(migrations[26].version, 27);
+        assert!(migrations[26]
             .sql
             .as_str()
             .contains("CREATE TABLE identity_bindings"));
-        assert!(migrations[25]
+        assert!(migrations[26]
             .sql
             .as_str()
             .contains("idx_identity_bindings_active_principal"));
-        assert_eq!(migrations[26].version, 27);
-        assert!(migrations[26].sql.as_str().contains("revocation_scope"));
-        assert!(migrations[26]
+        assert_eq!(migrations[27].version, 28);
+        assert!(migrations[27].sql.as_str().contains("revocation_scope"));
+        assert!(migrations[27]
             .sql
             .as_str()
             .contains("idx_identity_bindings_revoked_principal"));
-        assert!(migrations[26]
+        assert!(migrations[27]
             .sql
             .as_str()
             .contains("CREATE TABLE identity_principals"));
-        assert!(migrations[26]
+        assert!(migrations[27]
             .sql
             .as_str()
             .contains("INSERT INTO identity_principals"));
-        assert!(migrations[26]
+        assert!(migrations[27]
             .sql
             .as_str()
             .contains("INSERT INTO identity_revoked_keys"));
-        assert!(migrations[26]
+        assert!(migrations[27]
             .sql
             .as_str()
             .contains("rotation_completed_at"));
-        assert!(migrations[26]
+        assert!(migrations[27]
             .sql
             .as_str()
             .contains("CREATE TABLE identity_revoked_keys"));
@@ -1181,7 +1195,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(25));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
     }
 
     #[tokio::test]
