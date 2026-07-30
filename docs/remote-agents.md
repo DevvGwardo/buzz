@@ -321,7 +321,10 @@ observe "no instance" or "terminated" — the deterministic instance name
 prevents two live instances, but one caller loses the race. The provider
 MUST treat create-conflict (already exists) by re-reading and, if the winner
 is an annotation-verified live instance, returning it as the no-op row
-would; it MUST treat delete-not-found as success; and it MUST loop until a
+would — cleaning up only its own losing attempt's residue, never the
+winner's (the Kubernetes binding makes this concrete via per-attempt Secret
+names, §K8s Secrets); it MUST treat delete-not-found as success; and it
+MUST loop until a
 stable outcome or the operation deadline (600s) expires. Without this rule,
 "two deploys return an `agent_id`" (the idempotency claim below) is false
 under concurrency.
@@ -363,7 +366,8 @@ I5's enforcement point. A new harness knob:
 
 - **Default 0 = disabled.** The flag ships in the harness every *local*
   agent also runs; a reaper bug must not be able to kill a laptop agent.
-  Remote providers opt in (the Kubernetes binding sets 7200 = 2h).
+  Remote providers opt in (the Kubernetes binding's `inactivity_seconds`
+  config field, schema default 7200 = 2h, feeds this env var directly).
 - **"Inactivity" is defined as**: no events dispatched to the agent and no
   turns in flight. Raw relay traffic does not count — an agent lurking in a
   busy channel it never answers is exactly the waste this bounds.
@@ -484,7 +488,7 @@ top-level fields per the reserved-key rule:
 | `respond_to` | `BUZZ_ACP_RESPOND_TO` |
 | `respond_to_allowlist` | `BUZZ_ACP_RESPOND_TO_ALLOWLIST`, comma-joined |
 | — | `BUZZ_ACP_MCP_COMMAND=buzz-dev-mcp` (the dev-MCP requirement) |
-| — | `BUZZ_ACP_EXIT_AFTER_INACTIVITY=7200` (I5 opt-in, §Auto-Stop) |
+| `provider_config.inactivity_seconds` | `BUZZ_ACP_EXIT_AFTER_INACTIVITY` (schema default 7200; the I5 opt-in, §Auto-Stop — the config field and this env var are one knob, not two) |
 | `env_vars` | merged last; reserved keys already stripped by `D`, and the provider MUST NOT let them re-enter |
 
 **Encoding honesty note.** `BUZZ_ACP_AGENT_ARGS` is comma-delimited by the
@@ -518,8 +522,11 @@ regardless of `HOME`.
     **load-bearing**: per §Deploy State Machine step 1, every label-selected
     object's annotation MUST equal the derived pubkey before the provider
     no-ops against it, deletes it, mutates its Secret, or returns its name
-  - Secret name: same as the pod name (`buzz-agent-<first-12-hex>`), carrying
-    the same label and annotation
+  - Secret name: `buzz-agent-<first-12-hex>-<gen>`, where `<gen>` is a random
+    per-create-attempt **generation token** — unique, never reused, carrying
+    the same label and annotation. The pod's `envFrom` references this exact
+    Secret name. Deterministic pod name + unique Secret name is what makes
+    payload and Secret atomic at the pod-spec boundary (§K8s Secrets)
 - **Deletion semantics the reconciler must respect.** A Kubernetes `DELETE`
   returns success immediately while the object still exists; the name stays
   taken until the kubelet finishes the grace period. Two consequences:
@@ -548,14 +555,36 @@ regardless of `HOME`.
 
 ### Secrets {#k8s-secrets}
 
-Per-agent `Secret` named for the pod, containing the identity variables
-(built from top-level payload fields per the reserved-key rule) plus
-`env_vars`; consumed via `envFrom`. **Secret lifecycle follows the pod's
-generation**: the Secret is written only on the create arm of the
-reconciler, immediately before its pod; on the live no-op arm it is not
-touched (no-op means zero mutation — a live pod's env is immutable anyway,
-so rewriting its Secret changes nothing except silently desynchronizing the
-stored object from the running process); it is deleted by GC with its pod.
+Per-agent `Secret` containing the identity variables (built from top-level
+payload fields per the reserved-key rule) plus `env_vars`; consumed via
+`envFrom`.
+
+**Secret creation is per-attempt, immutable, and uniquely named**
+(`buzz-agent-<first-12-hex>-<gen>`, §Pod shape). The rationale is a
+concurrency race a deterministic shared Secret name cannot survive: two
+concurrent deploys carrying *different* payloads would both write the shared
+Secret, the loser's write could land last, and the winner's pod —
+deterministic name, winner's spec — would resolve the **loser's**
+identity/config through `envFrom`. The losing caller would have mutated the
+winning generation despite strict no-op. Unique names close this: each
+create attempt writes its own Secret first, then attempts the deterministic
+pod create with a spec referencing exactly that Secret. Pod creation elects
+the winner; payload and Secret are atomic at the pod-spec boundary, with no
+Lease or CAS machinery.
+
+Lifecycle rules that follow:
+
+- **Winner**: pod + its referenced Secret live together; GC deletes them
+  together.
+- **Losing contender** (create-conflict): annotation-verify the winning pod,
+  return its `agent_id` per the convergence rule, and delete **only its own
+  now-unreferenced Secret** — never the winner's, never any Secret
+  referenced by a live pod.
+- **Live no-op arm**: no Secret is written at all (zero mutation).
+- **GC**: also deletes annotation-verified **orphan Secrets** — those whose
+  generation token is not referenced by the surviving pod — covering
+  contenders that crashed between Secret create and their conflict cleanup.
+
 Fresh configuration therefore materializes exactly when a fresh generation
 does. Residual exposure, stated: any principal with
 pod-exec or secret-read in the namespace can read the nsec. This is the
@@ -567,12 +596,19 @@ accidental leakage into subprocess environments, not hostile cluster access.
 
 ### Garbage collection {#k8s-gc}
 
+A **generation** is one pod-create attempt and the uniquely-named Secret it
+references; the Secret's generation token is the generation's identity, and
+the *current* generation is the one referenced by the surviving pod's
+`envFrom`.
+
 GC is a **preflight reconciliation pass**, not a post-deploy afterthought:
 on every deploy, after identity derivation and before the state transition,
-the provider deletes terminated pods (and their Secrets) that match the
-pubkey label **and pass the full-pubkey annotation check** and do not
-belong to the generation about to be observed or created. Mismatched
-annotations are never GC'd (§Deploy State Machine step 1). Running GC first
+the provider deletes terminated pods (and their referenced Secrets) that
+match the pubkey label **and pass the full-pubkey annotation check**, plus
+annotation-verified orphan Secrets whose generation token no surviving pod
+references (§K8s Secrets). It never touches the current generation.
+Mismatched annotations are never GC'd (§Deploy State Machine step 1).
+Running GC first
 gives concurrency and Secret ownership one unambiguous order: reconcile
 always observes a world with at most one candidate generation. Completed
 pods from the *current* generation are left in place — their logs are the
