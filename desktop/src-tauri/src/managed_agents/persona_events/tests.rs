@@ -1024,7 +1024,7 @@ mod flush_barrier {
         {
             let guard = state.config_sync_ready_scope.lock().unwrap();
             assert!(
-                guard.as_ref().map_or(true, |p| *p != db_path),
+                guard.as_ref().is_none_or(|p| *p != db_path),
                 "scope is not ready after a barrier failure — flush must skip"
             );
         }
