@@ -328,15 +328,23 @@ fn summarize_body(body: &str, tags: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
     use tower::ServiceExt;
+
+    const TOKEN: &str = "5f0e1d2c3b4a59687786958493a2b1c0decadebeefcafe0123456789abcdef01";
 
     async fn test_state() -> Arc<crate::state::AppState> {
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
+        let mut token = [0u8; 32];
+        hex::decode_to_slice(TOKEN, &mut token).expect("test token is hex");
         config.admin = Some(crate::config::AdminConfig {
             host: "admin.example".to_string(),
+            token: crate::config::AdminToken::from_bytes(token),
             web_dir: None,
         });
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
@@ -374,84 +382,234 @@ mod tests {
 
     const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
+    /// Every route the admin API mounts. Each must enforce the credential.
+    fn mounted_routes() -> Vec<String> {
+        let id = Uuid::nil();
+        vec![
+            "/reports".to_string(),
+            format!("/reports/{id}"),
+            "/feedback".to_string(),
+            format!("/feedback/{id}"),
+            format!("/feedback/{id}/attachments/{HASH}"),
+        ]
+    }
+
+    fn authorized(uri: &str) -> axum::http::request::Builder {
+        Request::builder()
+            .uri(uri)
+            .header(header::HOST, "admin.example")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+    }
+
+    fn status_request(builder: axum::http::request::Builder) -> Request<Body> {
+        builder.body(Body::empty()).expect("request")
+    }
+
+    async fn status_for(
+        state: Arc<crate::state::AppState>,
+        request: Request<Body>,
+    ) -> axum::response::Response {
+        router(state).oneshot(request).await.expect("response")
+    }
+
     #[tokio::test]
-    async fn report_detail_requires_admin_host_before_database_access() {
-        let response = router(test_state().await)
-            .oneshot(
+    async fn every_route_rejects_a_missing_credential_before_database_access() {
+        let state = test_state().await;
+        for uri in mounted_routes() {
+            let response = status_for(
+                state.clone(),
                 Request::builder()
-                    .uri(format!("/reports/{}", Uuid::nil()))
-                    .header(header::HOST, "community.example")
+                    .uri(&uri)
+                    .header(header::HOST, "admin.example")
                     .body(Body::empty())
                     .expect("request"),
             )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_route_rejects_a_wrong_credential_before_database_access() {
+        let state = test_state().await;
+        let wrong = "f".repeat(64);
+        for uri in mounted_routes() {
+            let response = status_for(
+                state.clone(),
+                Request::builder()
+                    .uri(&uri)
+                    .header(header::HOST, "admin.example")
+                    .header(header::AUTHORIZATION, format!("Bearer {wrong}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_credentials_all_collapse_to_the_same_challenge() {
+        let state = test_state().await;
+        for value in [
+            format!("Basic {TOKEN}"),
+            TOKEN.to_string(),
+            "Bearer ".to_string(),
+            "Bearer".to_string(),
+            format!("Bearer {}", &TOKEN[..63]),
+            format!("Bearer {TOKEN}00"),
+            format!("Bearer {}", "z".repeat(64)),
+        ] {
+            let response = status_for(
+                state.clone(),
+                Request::builder()
+                    .uri("/reports")
+                    .header(header::HOST, "admin.example")
+                    .header(header::AUTHORIZATION, &value)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{value}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::WWW_AUTHENTICATE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer"),
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_authorization_headers_are_rejected() {
+        let response = status_for(
+            test_state().await,
+            Request::builder()
+                .uri("/reports")
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn lowercase_bearer_scheme_is_accepted() {
+        let response = status_for(
+            test_state().await,
+            Request::builder()
+                .uri(format!("/reports/{}", Uuid::nil()))
+                .header(header::HOST, "admin.example")
+                .header(header::AUTHORIZATION, format!("bearer {TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_valid_credential_on_the_wrong_host_is_forbidden_not_unauthorized() {
+        let response = status_for(
+            test_state().await,
+            Request::builder()
+                .uri(format!("/reports/{}", Uuid::nil()))
+                .header(header::HOST, "community.example")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_valid_credential_with_a_mismatched_origin_is_forbidden() {
+        let response = status_for(
+            test_state().await,
+            status_request(
+                authorized(&format!("/reports/{}", Uuid::nil()))
+                    .header(header::ORIGIN, "https://attacker.example"),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_valid_credential_on_the_admin_host_without_an_origin_is_served() {
+        let response = status_for(test_state().await, status_request(authorized("/reports"))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_request_on_the_wrong_host_reveals_no_host_oracle() {
+        let state = test_state().await;
+        let wrong_host = status_for(
+            state.clone(),
+            Request::builder()
+                .uri("/reports")
+                .header(header::HOST, "community.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        let right_host = status_for(
+            state,
+            Request::builder()
+                .uri("/reports")
+                .header(header::HOST, "admin.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(wrong_host.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(right_host.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn report_detail_rejects_unknown_report() {
-        let response = router(test_state().await)
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/reports/{}", Uuid::nil()))
-                    .header(header::HOST, "admin.example")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn feedback_attachment_requires_admin_host_before_database_access() {
-        let response = router(test_state().await)
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/feedback/{}/attachments/{HASH}", Uuid::nil()))
-                    .header(header::HOST, "community.example")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        let response = status_for(
+            test_state().await,
+            status_request(authorized(&format!("/reports/{}", Uuid::nil()))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn feedback_attachment_rejects_unknown_feedback() {
-        let response = router(test_state().await)
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/feedback/{}/attachments/{HASH}", Uuid::nil()))
-                    .header(header::HOST, "admin.example")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        let response = status_for(
+            test_state().await,
+            status_request(authorized(&format!(
+                "/feedback/{}/attachments/{HASH}",
+                Uuid::nil()
+            ))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn feedback_attachment_rejects_write_methods() {
         let state = test_state().await;
         for method in ["POST", "PUT", "PATCH", "DELETE"] {
-            let response = router(state.clone())
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(format!("/feedback/{}/attachments/{HASH}", Uuid::nil()))
-                        .header(header::HOST, "admin.example")
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
+            let response = status_for(
+                state.clone(),
+                status_request(
+                    authorized(&format!("/feedback/{}/attachments/{HASH}", Uuid::nil()))
+                        .method(method),
+                ),
+            )
+            .await;
             assert_eq!(
                 response.status(),
-                axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                StatusCode::METHOD_NOT_ALLOWED,
                 "{method}"
             );
         }

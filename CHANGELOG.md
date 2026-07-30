@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Breaking:** the relay admin moderation API (`/api/admin/v1`) now requires a
+  bearer token. Deployments that set `BUZZ_ADMIN_HOST` must also set
+  `BUZZ_ADMIN_TOKEN` to exactly 64 hex characters (`openssl rand -hex 32`) or
+  the relay refuses to start. `Host`/`Origin` matching is retained only as
+  defense-in-depth. The admin dashboard prompts for the token and keeps it in
+  `sessionStorage` for the browser session.
+
 ## v0.5.2
 
 - feat(cli): mirror Desktop mention delivery ([#3330](https://github.com/block/buzz/pull/3330)) ([`7adc46268`](https://github.com/block/buzz/commit/7adc46268d5e93f0b1d4dc8e700af22815dcac1b))

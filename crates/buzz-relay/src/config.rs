@@ -29,8 +29,63 @@ pub enum ConfigError {
 pub struct AdminConfig {
     /// Exact admin HTTP authority.
     pub host: String,
+    /// Operator bearer credential required on every admin API request.
+    pub token: AdminToken,
     /// Optional admin SPA bundle directory.
     pub web_dir: Option<std::path::PathBuf>,
+}
+
+/// Operator bearer credential for the deployment-admin API, held decoded.
+///
+/// `Debug` is redacted by hand so the secret cannot escape through a derived
+/// `Debug` on [`AdminConfig`] or [`Config`].
+#[derive(Clone)]
+pub struct AdminToken([u8; 32]);
+
+impl AdminToken {
+    /// Constant-time comparison against a presented credential.
+    pub fn matches(&self, presented: &[u8; 32]) -> bool {
+        use subtle::ConstantTimeEq;
+        self.0.ct_eq(presented).into()
+    }
+
+    /// Build a token from raw bytes. Test-only: production tokens come from
+    /// [`parse_admin_token`] so the operator-facing validation is never bypassed.
+    #[cfg(test)]
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for AdminToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AdminToken(redacted)")
+    }
+}
+
+/// Guidance repeated in every `BUZZ_ADMIN_TOKEN` rejection.
+const ADMIN_TOKEN_GUIDANCE: &str = "BUZZ_ADMIN_TOKEN must be 64 hexadecimal characters \
+     (surrounding whitespace is trimmed); generate one with `openssl rand -hex 32`";
+
+/// Read and validate the admin bearer credential. Fail-closed: the admin API is
+/// only ever mounted alongside a token that passed this check.
+fn parse_admin_token() -> Result<AdminToken, ConfigError> {
+    let raw = match std::env::var("BUZZ_ADMIN_TOKEN") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => {
+            return Err(ConfigError::InvalidValue(format!(
+                "BUZZ_ADMIN_TOKEN is required whenever BUZZ_ADMIN_HOST is set — \
+                 {ADMIN_TOKEN_GUIDANCE}"
+            )))
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError::InvalidValue(ADMIN_TOKEN_GUIDANCE.to_string()))
+        }
+    };
+    let mut token = [0u8; 32];
+    hex::decode_to_slice(raw.trim(), &mut token)
+        .map_err(|_| ConfigError::InvalidValue(ADMIN_TOKEN_GUIDANCE.to_string()))?;
+    Ok(AdminToken(token))
 }
 
 /// Relay-hosted policy content presented on join surfaces.
@@ -876,13 +931,22 @@ impl Config {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
         {
-            None => None,
+            None => {
+                if std::env::var_os("BUZZ_ADMIN_TOKEN").is_some() {
+                    tracing::warn!(
+                        "BUZZ_ADMIN_TOKEN is set without BUZZ_ADMIN_HOST — the admin \
+                         dashboard and API stay disabled and the token is ignored"
+                    );
+                }
+                None
+            }
             Some(host) => {
                 if host.contains(['/', '\\', '@']) {
                     return Err(ConfigError::InvalidValue(
                         "BUZZ_ADMIN_HOST must be an exact authority".to_string(),
                     ));
                 }
+                let token = parse_admin_token()?;
                 let web_dir = std::env::var("BUZZ_ADMIN_WEB_DIR")
                     .ok()
                     .map(|value| std::path::PathBuf::from(value.trim()))
@@ -895,7 +959,11 @@ impl Config {
                         )));
                     }
                 }
-                Some(AdminConfig { host, web_dir })
+                Some(AdminConfig {
+                    host,
+                    token,
+                    web_dir,
+                })
             }
         };
 
@@ -1051,6 +1119,133 @@ mod tests {
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
         );
+    }
+
+    /// Run `Config::from_env()` with the admin variables forced to `values`,
+    /// restoring the ambient environment afterwards.
+    fn config_with_admin_env(values: &[(&str, Option<&str>)]) -> Result<Config, ConfigError> {
+        const KEYS: [&str; 2] = ["BUZZ_ADMIN_HOST", "BUZZ_ADMIN_TOKEN"];
+        let previous: Vec<_> = KEYS
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        for key in KEYS {
+            std::env::remove_var(key);
+        }
+        for (key, value) in values {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let config = Config::from_env();
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        config
+    }
+
+    const VALID_ADMIN_TOKEN: &str =
+        "5f0e1d2c3b4a59687786958493a2b1c0decadebeefcafe0123456789abcdef01";
+
+    #[test]
+    fn admin_host_without_a_usable_token_fails_closed_at_startup() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        for token in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex1"),
+            Some(&VALID_ADMIN_TOKEN[..62]),
+            Some("5f0e1d2c3b4a59687786958493a2b1c0decadebeefcafe0123456789abcdef0100"),
+        ] {
+            let result = config_with_admin_env(&[
+                ("BUZZ_ADMIN_HOST", Some("admin.example")),
+                ("BUZZ_ADMIN_TOKEN", token),
+            ]);
+            assert!(
+                matches!(
+                    result,
+                    Err(ConfigError::InvalidValue(ref message))
+                        if message.contains("BUZZ_ADMIN_TOKEN")
+                ),
+                "{token:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_surface_activates_with_a_valid_token_and_tolerates_surrounding_whitespace() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        for token in [
+            VALID_ADMIN_TOKEN.to_string(),
+            format!("  {VALID_ADMIN_TOKEN}\n"),
+        ] {
+            let admin = config_with_admin_env(&[
+                ("BUZZ_ADMIN_HOST", Some("admin.example")),
+                ("BUZZ_ADMIN_TOKEN", Some(&token)),
+            ])
+            .expect("config with a valid admin token")
+            .admin
+            .expect("admin surface is configured");
+            let mut expected = [0u8; 32];
+            hex::decode_to_slice(VALID_ADMIN_TOKEN, &mut expected).expect("hex fixture");
+            assert_eq!(admin.host, "admin.example");
+            assert!(admin.token.matches(&expected));
+            assert!(!admin.token.matches(&[0u8; 32]));
+        }
+    }
+
+    #[test]
+    fn admin_token_without_a_host_leaves_the_surface_disabled() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let config = config_with_admin_env(&[
+            ("BUZZ_ADMIN_HOST", None),
+            ("BUZZ_ADMIN_TOKEN", Some(VALID_ADMIN_TOKEN)),
+        ])
+        .expect("a token alone is not a startup error");
+        assert!(config.admin.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_token_rejects_non_unicode_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous_host = std::env::var_os("BUZZ_ADMIN_HOST");
+        let previous_token = std::env::var_os("BUZZ_ADMIN_TOKEN");
+        std::env::set_var("BUZZ_ADMIN_HOST", "admin.example");
+        std::env::set_var("BUZZ_ADMIN_TOKEN", std::ffi::OsString::from_vec(vec![0xff]));
+
+        let invalid = Config::from_env();
+
+        for (key, value) in [
+            ("BUZZ_ADMIN_HOST", previous_host),
+            ("BUZZ_ADMIN_TOKEN", previous_token),
+        ] {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        assert!(matches!(
+            invalid,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_ADMIN_TOKEN")
+        ));
+    }
+
+    #[test]
+    fn admin_token_debug_output_is_redacted() {
+        let token = AdminToken::from_bytes([7u8; 32]);
+        let rendered = format!("{token:?}");
+        assert_eq!(rendered, "AdminToken(redacted)");
+        assert!(!rendered.contains("07"));
     }
 
     #[test]

@@ -6,7 +6,8 @@ import {
   useMemo,
   useState,
 } from "react";
-import { ApiFailure, request } from "./api";
+import { ApiFailure, request, requestObjectUrl } from "./api";
+import { setToken, useToken } from "./token";
 import type {
   FeedbackDetail,
   FeedbackSummary,
@@ -460,7 +461,7 @@ function FeedbackDetailView({ id }: { id: string }) {
                     <dd className="attachments">
                       {attachments.map((attachment) => (
                         <Attachment
-                          key={`${attachment.hash}-${attachment.url}`}
+                          key={`${attachment.hash}-${attachment.path}`}
                           attachment={attachment}
                         />
                       ))}
@@ -491,7 +492,7 @@ function FeedbackDetailView({ id }: { id: string }) {
 type FeedbackStatuses = Record<string, boolean>;
 
 interface FeedbackAttachment {
-  url: string;
+  path: string;
   sourceUrl: string;
   mimeType: string;
   hash: string;
@@ -551,7 +552,7 @@ function feedbackAttachments(
     const parsedSize = Number(values.get("size"));
     return [
       {
-        url: `/api/admin/v1/feedback/${encodeURIComponent(feedbackId)}/attachments/${hash}`,
+        path: `/feedback/${encodeURIComponent(feedbackId)}/attachments/${hash}`,
         sourceUrl: safeUrl,
         mimeType,
         hash,
@@ -596,7 +597,9 @@ function stripAttachmentMarkdown(
 }
 
 function Attachment({ attachment }: { attachment: FeedbackAttachment }) {
-  const url = attachment.url;
+  const [objectUrl, setObjectUrl] = useState<string>();
+  const [failed, setFailed] = useState(false);
+  const path = attachment.path;
   const name =
     attachment.filename ?? `attachment-${attachment.hash.slice(0, 8)}`;
   const metadata = [
@@ -607,33 +610,76 @@ function Attachment({ attachment }: { attachment: FeedbackAttachment }) {
     .filter(Boolean)
     .join(" · ");
 
+  useEffect(() => {
+    // The API requires an Authorization header, so the bytes are fetched here
+    // and handed to the DOM as an object URL revoked on replacement/unmount.
+    let url: string | undefined;
+    let active = true;
+    setObjectUrl(undefined);
+    setFailed(false);
+    requestObjectUrl(path)
+      .then((created) => {
+        if (!active) {
+          URL.revokeObjectURL(created);
+          return;
+        }
+        url = created;
+        setObjectUrl(created);
+      })
+      .catch(() => {
+        if (active) setFailed(true);
+      });
+    return () => {
+      active = false;
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [path]);
+
+  const detail = failed ? "Could not load attachment" : metadata;
+
   if (attachment.mimeType.startsWith("image/")) {
     return (
       <figure className="image-attachment">
-        <a href={url} target="_blank" rel="noreferrer">
-          <img src={url} alt={name} loading="lazy" />
-        </a>
+        {objectUrl ? (
+          <a href={objectUrl} target="_blank" rel="noreferrer">
+            <img src={objectUrl} alt={name} />
+          </a>
+        ) : (
+          <div className="attachment-placeholder">
+            {failed ? "Unavailable" : "Loading…"}
+          </div>
+        )}
         <figcaption>
           <span>{name}</span>
-          <small>{metadata}</small>
+          <small>{detail}</small>
         </figcaption>
       </figure>
     );
   }
 
+  const label = (
+    <>
+      <FileIcon />
+      <span>
+        <strong>{name}</strong>
+        <small>{detail}</small>
+      </span>
+    </>
+  );
+
+  // Until the bytes are fetched there is nothing a link could point at: the
+  // API path itself would open unauthenticated in a new tab.
+  if (!objectUrl) return <div className="file-attachment">{label}</div>;
+
   return (
     <a
       className="file-attachment"
-      href={url}
+      href={objectUrl}
       target="_blank"
       rel="noreferrer"
       download={name}
     >
-      <FileIcon />
-      <span>
-        <strong>{name}</strong>
-        <small>{metadata}</small>
-      </span>
+      {label}
       <ArrowIcon />
     </a>
   );
@@ -797,10 +843,54 @@ function ArrowIcon() {
   );
 }
 
+/// The whole dashboard is behind the credential: with no token in session
+/// storage there is nothing worth rendering, and every API call would 401.
+function TokenPrompt({ rejected }: { rejected: boolean }) {
+  const [value, setValue] = useState("");
+  return (
+    <div className="app">
+      <form
+        className="state token-prompt"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const token = value.trim();
+          if (token) setToken(token);
+        }}
+      >
+        <h2>Admin token required</h2>
+        <p>
+          {rejected
+            ? "That token was rejected. Enter the operator token for this deployment."
+            : "Enter the operator token for this deployment. It is kept for this browser session only."}
+        </p>
+        <label>
+          <span className="visually-hidden">Admin token</span>
+          <input
+            type="password"
+            name="token"
+            autoComplete="off"
+            placeholder="Admin token"
+            value={value}
+            onChange={(event) => setValue(event.target.value)}
+          />
+        </label>
+        <button type="submit">Continue</button>
+      </form>
+    </div>
+  );
+}
+
 export function App() {
   const { path } = usePath();
+  const token = useToken();
+  // Distinguishes the first visit from a token the relay just rejected.
+  const [everHadToken, setEverHadToken] = useState(token !== null);
+  useEffect(() => {
+    if (token !== null) setEverHadToken(true);
+  }, [token]);
   const report = path.match(/^\/reports\/([^/]+)$/);
   const feedback = path.match(/^\/feedback\/([^/]+)$/);
+  if (!token) return <TokenPrompt rejected={everHadToken} />;
   const content = report ? (
     <ReportDetail id={report[1]} />
   ) : feedback ? (

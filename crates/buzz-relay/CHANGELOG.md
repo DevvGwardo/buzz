@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Breaking:** `/api/admin/v1` requires an `Authorization: Bearer` token.
+  `BUZZ_ADMIN_HOST` now also requires `BUZZ_ADMIN_TOKEN` (exactly 64 hex
+  characters, `openssl rand -hex 32`); startup fails closed without it.
+  Unauthenticated requests get a uniform 401 with `WWW-Authenticate: Bearer`
+  before any database or media access, and `Host`/`Origin` checks are demoted
+  to defense-in-depth behind the credential check.
+
 ## relay-v0.2.0
 
 - feat: relay invite links (mint + claim + landing page + deep link) ([#1668](https://github.com/block/buzz/pull/1668)) ([`2e529aab7`](https://github.com/block/buzz/commit/2e529aab759a18c1bb81e447f3696fe99db53a27))

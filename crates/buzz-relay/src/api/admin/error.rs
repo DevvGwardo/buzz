@@ -42,6 +42,14 @@ impl ApiError {
         }
     }
 
+    pub fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            message: "a valid admin bearer token is required",
+        }
+    }
+
     pub fn not_found() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -61,7 +69,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             Json(ErrorEnvelope {
                 error: ErrorBody {
@@ -71,7 +79,16 @@ impl IntoResponse for ApiError {
                 },
             }),
         )
-            .into_response()
+            .into_response();
+        // RFC 9110 requires a challenge on every 401 so clients know which
+        // scheme to present.
+        if self.status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer"),
+            );
+        }
+        response
     }
 }
 
