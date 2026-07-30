@@ -19,6 +19,7 @@ import {
 } from "./communityThemePreference";
 import {
   CommunityThemeSyncManager,
+  isNewerCommunityThemeCoordinate,
   shouldSeedCommunityTheme,
   type RemoteCommunityTheme,
 } from "./communityThemeSync";
@@ -86,8 +87,15 @@ export function CommunityThemeController() {
     const scope = `${pubkey}:${relayUrl}`;
     scopeRef.current = scope;
     lastRemoteRef.current = { createdAt: 0, eventId: "" };
-    const manager = new CommunityThemeSyncManager(pubkey, (acknowledged) => {
-      clearCommunityThemeOutbox(pubkey, relayUrl, acknowledged);
+    const manager = new CommunityThemeSyncManager(pubkey, (published) => {
+      const last = lastRemoteRef.current;
+      if (isNewerCommunityThemeCoordinate(published, last)) {
+        lastRemoteRef.current = {
+          createdAt: published.createdAt,
+          eventId: published.eventId,
+        };
+      }
+      clearCommunityThemeOutbox(pubkey, relayUrl, published.preference);
     });
     managerRef.current = manager;
     const durablePending = readCommunityThemeOutbox(pubkey, relayUrl);
@@ -101,10 +109,7 @@ export function CommunityThemeController() {
         return;
       }
       const last = lastRemoteRef.current;
-      if (
-        remote.createdAt < last.createdAt ||
-        (remote.createdAt === last.createdAt && remote.eventId <= last.eventId)
-      ) {
+      if (!isNewerCommunityThemeCoordinate(remote, last)) {
         return;
       }
       lastRemoteRef.current = {

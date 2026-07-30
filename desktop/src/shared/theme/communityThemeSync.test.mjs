@@ -3,6 +3,7 @@ import test, { mock } from "node:test";
 import { relayClient } from "@/shared/api/relayClient";
 import {
   CommunityThemeSyncManager,
+  isNewerCommunityThemeCoordinate,
   shouldSeedCommunityTheme,
 } from "./communityThemeSync.ts";
 
@@ -16,22 +17,27 @@ const preference = {
 function installFakeTimer() {
   globalThis.window ??= {};
   let callback = null;
+  let delay = null;
   const originalSet = window.setTimeout;
   const originalClear = window.clearTimeout;
-  window.setTimeout = (fn) => {
+  window.setTimeout = (fn, requestedDelay) => {
     callback = fn;
+    delay = requestedDelay;
     return 1;
   };
   window.clearTimeout = () => {
     callback = null;
+    delay = null;
   };
   return {
     fire: () => {
       const fn = callback;
       callback = null;
+      delay = null;
       fn?.();
     },
     pending: () => callback !== null,
+    delay: () => delay,
     restore: () => {
       window.setTimeout = originalSet;
       window.clearTimeout = originalClear;
@@ -115,3 +121,84 @@ test("only confirmed absence permits seeding relay state", () => {
   assert.equal(shouldSeedCommunityTheme({ status: "invalid" }), false);
   assert.equal(shouldSeedCommunityTheme({ status: "unavailable" }), false);
 });
+
+test("acknowledged coordinates reject delayed same-second remotes", () => {
+  const acknowledged = { createdAt: 123, eventId: "published" };
+  assert.equal(
+    isNewerCommunityThemeCoordinate(
+      { createdAt: 123, eventId: "older" },
+      acknowledged,
+    ),
+    false,
+  );
+  assert.equal(
+    isNewerCommunityThemeCoordinate(
+      { createdAt: 123, eventId: "z-newer" },
+      acknowledged,
+    ),
+    true,
+  );
+});
+
+test("transient publish failure retries and acknowledges exact event", async () => {
+  const timer = installFakeTimer();
+  const published = [];
+  const acknowledgements = [];
+  let attempts = 0;
+  globalThis.window.__TAURI_INTERNALS__ = {
+    invoke(command, args) {
+      if (command === "nip44_encrypt_to_self") return Promise.resolve("cipher");
+      if (command === "sign_event") {
+        return Promise.resolve(
+          JSON.stringify(
+            relayEvent({
+              id: "published-event",
+              content: args.content,
+              created_at: args.createdAt,
+            }),
+          ),
+        );
+      }
+      throw new Error(`unexpected command: ${command}`);
+    },
+  };
+  mock.method(relayClient, "publishEvent", (event) => {
+    attempts += 1;
+    if (attempts === 1) return Promise.reject(new Error("timeout"));
+    published.push(event);
+    return Promise.resolve();
+  });
+  try {
+    const manager = new CommunityThemeSyncManager("alice", (event) => {
+      acknowledgements.push(event);
+    });
+    manager.publish(preference);
+    timer.fire();
+    await waitUntil(() => timer.pending());
+    assert.equal(timer.delay(), 1_000);
+    assert.deepEqual(manager.getPending(), preference);
+
+    timer.fire();
+    await waitUntil(() => acknowledgements.length === 1);
+    assert.equal(attempts, 2);
+    assert.equal(published.length, 1);
+    assert.equal(manager.getPending(), null);
+    assert.deepEqual(acknowledgements[0], {
+      preference,
+      createdAt: published[0].created_at,
+      eventId: "published-event",
+    });
+  } finally {
+    delete globalThis.window.__TAURI_INTERNALS__;
+    timer.restore();
+    mock.reset();
+  }
+});
+
+async function waitUntil(condition) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (condition()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail("condition not met");
+}

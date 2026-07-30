@@ -14,6 +14,14 @@ import {
 
 const D_TAG = "community-theme";
 const DEBOUNCE_MS = 2_000;
+const PUBLISH_RETRY_BASE_MS = 1_000;
+const PUBLISH_RETRY_MAX_MS = 30_000;
+
+export type PublishedCommunityTheme = {
+  preference: CommunityThemePreference;
+  createdAt: number;
+  eventId: string;
+};
 
 export type RemoteCommunityTheme = {
   preference: CommunityThemePreference;
@@ -24,6 +32,17 @@ export type RemoteCommunityTheme = {
 export type RemoteCommunityThemeResult =
   | { status: "valid"; remote: RemoteCommunityTheme }
   | { status: "absent" | "invalid" | "unavailable" };
+
+export function isNewerCommunityThemeCoordinate(
+  candidate: { createdAt: number; eventId: string },
+  current: { createdAt: number; eventId: string },
+): boolean {
+  return (
+    candidate.createdAt > current.createdAt ||
+    (candidate.createdAt === current.createdAt &&
+      candidate.eventId > current.eventId)
+  );
+}
 
 export function shouldSeedCommunityTheme(
   result: RemoteCommunityThemeResult,
@@ -50,13 +69,14 @@ export class CommunityThemeSyncManager {
   private debounceTimer: number | null = null;
   private destroyed = false;
   private lastRemoteCreatedAt = 0;
-  private lastPublished: CommunityThemePreference | null = null;
+  private lastPublished: PublishedCommunityTheme | null = null;
   private pending: CommunityThemePreference | null = null;
-  private readonly onPublished: (preference: CommunityThemePreference) => void;
+  private publishRetryAttempt = 0;
+  private readonly onPublished: (published: PublishedCommunityTheme) => void;
 
   constructor(
     pubkey: string,
-    onPublished: (preference: CommunityThemePreference) => void = () => {},
+    onPublished: (published: PublishedCommunityTheme) => void = () => {},
   ) {
     this.pubkey = pubkey;
     this.onPublished = onPublished;
@@ -87,13 +107,22 @@ export class CommunityThemeSyncManager {
   publish(preference: CommunityThemePreference): void {
     if (this.destroyed) return;
     this.pending = preference;
+    this.publishRetryAttempt = 0;
+    this.schedulePublish(preference, DEBOUNCE_MS);
+  }
+
+  private schedulePublish(
+    preference: CommunityThemePreference,
+    delayMs: number,
+  ): void {
+    if (this.destroyed) return;
     if (this.debounceTimer !== null) {
       window.clearTimeout(this.debounceTimer);
     }
     this.debounceTimer = window.setTimeout(() => {
       this.debounceTimer = null;
       void this.doPublish(preference);
-    }, DEBOUNCE_MS);
+    }, delayMs);
   }
 
   getPending(): CommunityThemePreference | null {
@@ -110,17 +139,18 @@ export class CommunityThemeSyncManager {
 
   private async doPublish(preference: CommunityThemePreference): Promise<void> {
     try {
+      const lastPublished = this.lastPublished;
       if (
         this.destroyed ||
-        (this.lastPublished &&
-          sameCommunityThemePreference(this.lastPublished, preference))
+        (lastPublished &&
+          sameCommunityThemePreference(lastPublished.preference, preference))
       ) {
         if (
           this.pending &&
           sameCommunityThemePreference(this.pending, preference)
         ) {
           this.pending = null;
-          this.onPublished(preference);
+          if (lastPublished) this.onPublished(lastPublished);
         }
         return;
       }
@@ -145,16 +175,35 @@ export class CommunityThemeSyncManager {
         "Failed to publish community theme.",
       );
       this.lastRemoteCreatedAt = event.created_at;
-      this.lastPublished = preference;
+      const published = {
+        preference,
+        createdAt: event.created_at,
+        eventId: event.id,
+      };
+      this.lastPublished = published;
+      this.publishRetryAttempt = 0;
       if (
         this.pending &&
         sameCommunityThemePreference(this.pending, preference)
       ) {
         this.pending = null;
       }
-      this.onPublished(preference);
+      this.onPublished(published);
     } catch (error) {
       console.warn("[communityThemeSync] publish failed:", error);
+      if (
+        this.destroyed ||
+        !this.pending ||
+        !sameCommunityThemePreference(this.pending, preference)
+      ) {
+        return;
+      }
+      const delay = Math.min(
+        PUBLISH_RETRY_BASE_MS * 2 ** this.publishRetryAttempt,
+        PUBLISH_RETRY_MAX_MS,
+      );
+      this.publishRetryAttempt += 1;
+      this.schedulePublish(preference, delay);
     }
   }
 
