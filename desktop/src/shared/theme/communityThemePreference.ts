@@ -3,6 +3,7 @@ import { ACCENT_COLORS } from "./ThemeProvider";
 import { SYNTAX_THEMES, type SyntaxThemeName } from "./theme-loader";
 
 const STORAGE_KEY_PREFIX = "buzz-community-theme.v1";
+const OUTBOX_KEY_PREFIX = "buzz-community-theme-outbox.v1";
 const MIGRATION_KEY_PREFIX = "buzz-community-theme-migrated.v1";
 
 export type CommunityThemePreference = {
@@ -27,6 +28,13 @@ export function communityThemeStorageKey(
   relayUrl: string,
 ): string {
   return `${STORAGE_KEY_PREFIX}:${pubkey}:${encodeURIComponent(normalizeRelayUrl(relayUrl))}`;
+}
+
+export function communityThemeOutboxKey(
+  pubkey: string,
+  relayUrl: string,
+): string {
+  return `${OUTBOX_KEY_PREFIX}:${pubkey}:${encodeURIComponent(normalizeRelayUrl(relayUrl))}`;
 }
 
 export function parseCommunityThemePreference(
@@ -65,6 +73,50 @@ export function readCommunityThemePreference(
     return raw ? parseCommunityThemePreference(JSON.parse(raw)) : null;
   } catch {
     return null;
+  }
+}
+
+export function readCommunityThemeOutbox(
+  pubkey: string,
+  relayUrl: string,
+): CommunityThemePreference | null {
+  try {
+    const raw = window.localStorage.getItem(
+      communityThemeOutboxKey(pubkey, relayUrl),
+    );
+    return raw ? parseCommunityThemePreference(JSON.parse(raw)) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeCommunityThemeOutbox(
+  pubkey: string,
+  relayUrl: string,
+  preference: CommunityThemePreference,
+): boolean {
+  try {
+    window.localStorage.setItem(
+      communityThemeOutboxKey(pubkey, relayUrl),
+      JSON.stringify(preference),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function clearCommunityThemeOutbox(
+  pubkey: string,
+  relayUrl: string,
+  acknowledged: CommunityThemePreference,
+): void {
+  const pending = readCommunityThemeOutbox(pubkey, relayUrl);
+  if (!pending || !sameCommunityThemePreference(pending, acknowledged)) return;
+  try {
+    window.localStorage.removeItem(communityThemeOutboxKey(pubkey, relayUrl));
+  } catch {
+    // A later retry can safely publish the same replaceable event again.
   }
 }
 

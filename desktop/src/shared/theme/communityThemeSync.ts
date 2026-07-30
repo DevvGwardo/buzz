@@ -52,9 +52,14 @@ export class CommunityThemeSyncManager {
   private lastRemoteCreatedAt = 0;
   private lastPublished: CommunityThemePreference | null = null;
   private pending: CommunityThemePreference | null = null;
+  private readonly onPublished: (preference: CommunityThemePreference) => void;
 
-  constructor(pubkey: string) {
+  constructor(
+    pubkey: string,
+    onPublished: (preference: CommunityThemePreference) => void = () => {},
+  ) {
     this.pubkey = pubkey;
+    this.onPublished = onPublished;
   }
 
   async fetchRemote(): Promise<RemoteCommunityThemeResult> {
@@ -110,7 +115,13 @@ export class CommunityThemeSyncManager {
         (this.lastPublished &&
           sameCommunityThemePreference(this.lastPublished, preference))
       ) {
-        this.pending = null;
+        if (
+          this.pending &&
+          sameCommunityThemePreference(this.pending, preference)
+        ) {
+          this.pending = null;
+          this.onPublished(preference);
+        }
         return;
       }
       const ciphertext = await nip44EncryptToSelf(JSON.stringify(preference));
@@ -135,7 +146,13 @@ export class CommunityThemeSyncManager {
       );
       this.lastRemoteCreatedAt = event.created_at;
       this.lastPublished = preference;
-      this.pending = null;
+      if (
+        this.pending &&
+        sameCommunityThemePreference(this.pending, preference)
+      ) {
+        this.pending = null;
+      }
+      this.onPublished(preference);
     } catch (error) {
       console.warn("[communityThemeSync] publish failed:", error);
     }

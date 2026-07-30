@@ -5,12 +5,15 @@ import { useIdentityQuery } from "@/shared/api/hooks";
 import {
   DEFAULT_COMMUNITY_THEME,
   cacheAndApplyCommunityTheme,
+  clearCommunityThemeOutbox,
   communityThemeApplyExpectation,
   communityThemePersistenceAction,
   hasMigratedCommunityTheme,
   markCommunityThemeMigrated,
+  readCommunityThemeOutbox,
   readCommunityThemePreference,
   sameCommunityThemePreference,
+  writeCommunityThemeOutbox,
   writeCommunityThemePreference,
   type CommunityThemePreference,
 } from "./communityThemePreference";
@@ -30,6 +33,7 @@ export function CommunityThemeController() {
   const managerRef = useRef<CommunityThemeSyncManager | null>(null);
   const scopeRef = useRef("");
   const expectedAppliedRef = useRef<CommunityThemePreference | null>(null);
+  const scopedPreferenceRef = useRef<CommunityThemePreference | null>(null);
   const lastRemoteRef = useRef({ createdAt: 0, eventId: "" });
   const initialPreferenceRef = useRef<CommunityThemePreference>({
     version: 1,
@@ -65,13 +69,16 @@ export function CommunityThemeController() {
   useLayoutEffect(() => {
     if (!pubkey || !relayUrl) return;
     const local = readCommunityThemePreference(pubkey, relayUrl);
+    const dirty = readCommunityThemeOutbox(pubkey, relayUrl);
     // Preserve the user's existing global appearance the first time this
     // feature sees their current community. Later missing/malformed target
     // records use the stable default so the previous community never leaks.
     const fallback = hasMigratedCommunityTheme(pubkey)
       ? DEFAULT_COMMUNITY_THEME
       : initialPreferenceRef.current;
-    applyPreference(local ?? fallback);
+    const scopedPreference = dirty ?? local ?? fallback;
+    scopedPreferenceRef.current = scopedPreference;
+    applyPreference(scopedPreference);
   }, [pubkey, relayUrl, applyPreference]);
 
   useEffect(() => {
@@ -79,11 +86,20 @@ export function CommunityThemeController() {
     const scope = `${pubkey}:${relayUrl}`;
     scopeRef.current = scope;
     lastRemoteRef.current = { createdAt: 0, eventId: "" };
-    const manager = new CommunityThemeSyncManager(pubkey);
+    const manager = new CommunityThemeSyncManager(pubkey, (acknowledged) => {
+      clearCommunityThemeOutbox(pubkey, relayUrl, acknowledged);
+    });
     managerRef.current = manager;
+    const durablePending = readCommunityThemeOutbox(pubkey, relayUrl);
+    if (durablePending) manager.publish(durablePending);
 
     const applyRemote = (remote: RemoteCommunityTheme) => {
       if (scopeRef.current !== scope) return;
+      const dirty = readCommunityThemeOutbox(pubkey, relayUrl);
+      if (dirty) {
+        manager.publish(dirty);
+        return;
+      }
       const last = lastRemoteRef.current;
       if (
         remote.createdAt < last.createdAt ||
@@ -95,6 +111,7 @@ export function CommunityThemeController() {
         createdAt: remote.createdAt,
         eventId: remote.eventId,
       };
+      scopedPreferenceRef.current = remote.preference;
       manager.cancelPendingPublish();
       cacheAndApplyCommunityTheme(
         pubkey,
@@ -111,9 +128,12 @@ export function CommunityThemeController() {
         markCommunityThemeMigrated(pubkey);
       } else if (shouldSeedCommunityTheme(result)) {
         const local =
+          readCommunityThemeOutbox(pubkey, relayUrl) ??
           readCommunityThemePreference(pubkey, relayUrl) ??
-          initialPreferenceRef.current;
+          scopedPreferenceRef.current ??
+          DEFAULT_COMMUNITY_THEME;
         writeCommunityThemePreference(pubkey, relayUrl, local);
+        writeCommunityThemeOutbox(pubkey, relayUrl, local);
         markCommunityThemeMigrated(pubkey);
         manager.publish(local);
       }
@@ -133,7 +153,7 @@ export function CommunityThemeController() {
           return;
         }
         if (result.status !== "absent") return;
-        const pending = manager.getPending();
+        const pending = readCommunityThemeOutbox(pubkey, relayUrl);
         if (pending) manager.publish(pending);
       });
     });
@@ -166,7 +186,9 @@ export function CommunityThemeController() {
     }
     const stored = readCommunityThemePreference(pubkey, relayUrl);
     if (stored && sameCommunityThemePreference(stored, preference)) return;
+    scopedPreferenceRef.current = preference;
     if (!writeCommunityThemePreference(pubkey, relayUrl, preference)) return;
+    if (!writeCommunityThemeOutbox(pubkey, relayUrl, preference)) return;
     managerRef.current?.publish(preference);
   }, [
     pubkey,

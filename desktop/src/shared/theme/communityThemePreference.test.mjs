@@ -3,11 +3,15 @@ import test from "node:test";
 import {
   DEFAULT_COMMUNITY_THEME,
   cacheAndApplyCommunityTheme,
+  clearCommunityThemeOutbox,
   communityThemeApplyExpectation,
+  communityThemeOutboxKey,
   communityThemePersistenceAction,
   communityThemeStorageKey,
   parseCommunityThemePreference,
+  readCommunityThemeOutbox,
   readCommunityThemePreference,
+  writeCommunityThemeOutbox,
   writeCommunityThemePreference,
 } from "./communityThemePreference.ts";
 
@@ -16,6 +20,7 @@ function localStorageStub() {
   return {
     getItem: (key) => data.get(key) ?? null,
     setItem: (key, value) => data.set(key, String(value)),
+    removeItem: (key) => data.delete(key),
   };
 }
 
@@ -78,6 +83,30 @@ test("local preferences are isolated by pubkey and normalized relay", () => {
   assert.notEqual(
     communityThemeStorageKey("alice", "wss://a.example"),
     communityThemeStorageKey("alice", "wss://b.example"),
+  );
+});
+
+test("dirty outbox survives restart and clears only its exact revision", () => {
+  globalThis.window = { localStorage: localStorageStub() };
+  const first = { ...DEFAULT_COMMUNITY_THEME, theme: "houston" };
+  const second = { ...DEFAULT_COMMUNITY_THEME, accent: "#ef4444" };
+
+  assert.equal(
+    writeCommunityThemeOutbox("alice", "WSS://A.EXAMPLE/", first),
+    true,
+  );
+  assert.deepEqual(readCommunityThemeOutbox("alice", "wss://a.example"), first);
+  writeCommunityThemeOutbox("alice", "wss://a.example", second);
+  clearCommunityThemeOutbox("alice", "wss://a.example", first);
+  assert.deepEqual(
+    readCommunityThemeOutbox("alice", "wss://a.example"),
+    second,
+  );
+  clearCommunityThemeOutbox("alice", "wss://a.example", second);
+  assert.equal(readCommunityThemeOutbox("alice", "wss://a.example"), null);
+  assert.notEqual(
+    communityThemeOutboxKey("alice", "wss://a.example"),
+    communityThemeStorageKey("alice", "wss://a.example"),
   );
 });
 
