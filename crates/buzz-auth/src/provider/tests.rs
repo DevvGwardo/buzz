@@ -42,26 +42,91 @@ fn capabilities(values: &[AuthorizationCapability]) -> CapabilitySet {
     CapabilitySet::new(values.to_vec()).expect("synthetic capabilities are non-empty")
 }
 
-fn direct_request_with_expiry(
+fn all_capabilities() -> [AuthorizationCapability; 10] {
+    [
+        AuthorizationCapability::CommunityRead,
+        AuthorizationCapability::CommunityWrite,
+        AuthorizationCapability::Moderate,
+        AuthorizationCapability::InviteMint,
+        AuthorizationCapability::InviteClaim,
+        AuthorizationCapability::MediaRead,
+        AuthorizationCapability::MediaWrite,
+        AuthorizationCapability::GitRead,
+        AuthorizationCapability::GitWrite,
+        AuthorizationCapability::AudioJoin,
+    ]
+}
+
+fn capability_coverage_is_exhaustive(capability: AuthorizationCapability) {
+    match capability {
+        AuthorizationCapability::CommunityRead
+        | AuthorizationCapability::CommunityWrite
+        | AuthorizationCapability::Moderate
+        | AuthorizationCapability::InviteMint
+        | AuthorizationCapability::InviteClaim
+        | AuthorizationCapability::MediaRead
+        | AuthorizationCapability::MediaWrite
+        | AuthorizationCapability::GitRead
+        | AuthorizationCapability::GitWrite
+        | AuthorizationCapability::AudioJoin => {}
+    }
+}
+
+fn proof_method_for_transport(transport: AuthTransport) -> AuthMethod {
+    match transport {
+        AuthTransport::RelayWebSocket => AuthMethod::Nip42,
+        AuthTransport::HttpBridge | AuthTransport::Git | AuthTransport::MediaDownload => {
+            AuthMethod::Nip98
+        }
+        AuthTransport::MediaUpload => AuthMethod::Blossom,
+        AuthTransport::Audio => AuthMethod::Nip42,
+    }
+}
+
+fn all_contract_errors() -> [ProviderContractError; 21] {
+    [
+        ProviderContractError::EmptyCapabilitySet,
+        ProviderContractError::EmptyProfileId,
+        ProviderContractError::ProfileIdTooLong,
+        ProviderContractError::EmptyPolicyVersion,
+        ProviderContractError::PolicyVersionTooLong,
+        ProviderContractError::InvalidIssuedAt,
+        ProviderContractError::InvalidFreshnessBound,
+        ProviderContractError::FreshnessWindowTooLong,
+        ProviderContractError::InvalidRetryAfter,
+        ProviderContractError::InvalidProviderTimeout,
+        ProviderContractError::InvalidCorrelationId,
+        ProviderContractError::DirectRequestHasOwner,
+        ProviderContractError::AuthorizationDomainMismatch,
+        ProviderContractError::TransportMismatch,
+        ProviderContractError::AssertionNotYetValid,
+        ProviderContractError::AssertionExpired,
+        ProviderContractError::KeyAttestationMismatch,
+        ProviderContractError::MissingKeyAttestation,
+        ProviderContractError::DelegationRequired,
+        ProviderContractError::DelegatedOwnerMismatch,
+        ProviderContractError::DelegationExpired,
+    ]
+}
+
+fn direct_request_for_transport(
     actor: &Keys,
+    transport: AuthTransport,
+    proof_method: AuthMethod,
+    not_before: Option<u64>,
     expiry: u64,
     requested: CapabilitySet,
-) -> AuthorizationRequest {
-    let proof = VerifiedNostrProof::new(
-        domain(1),
-        AuthTransport::RelayWebSocket,
-        actor.public_key(),
-        AuthMethod::Nip42,
-        None,
-    )
-    .expect("synthetic proof is valid");
+) -> Result<AuthorizationRequest, ProviderContractError> {
+    let proof =
+        VerifiedNostrProof::new(domain(1), transport, actor.public_key(), proof_method, None)
+            .expect("synthetic proof is valid");
     let assertion = VerifiedFederatedAssertion::new(
         domain(1),
-        AuthTransport::RelayWebSocket,
+        transport,
         principal(),
         Some(VerifiedKeyAttestation::new(actor.public_key())),
         AssertionTransport::TrustedProxy,
-        None,
+        not_before.map(AssertionNotBefore::new),
         AssertionExpiry::new(expiry).expect("synthetic assertion expiry is valid"),
     );
     AuthorizationRequest::direct(
@@ -71,6 +136,21 @@ fn direct_request_with_expiry(
         requested,
         Uuid::from_u128(20),
         NOW,
+    )
+}
+
+fn direct_request_with_expiry(
+    actor: &Keys,
+    expiry: u64,
+    requested: CapabilitySet,
+) -> AuthorizationRequest {
+    direct_request_for_transport(
+        actor,
+        AuthTransport::RelayWebSocket,
+        AuthMethod::Nip42,
+        None,
+        expiry,
+        requested,
     )
     .expect("synthetic direct request is valid")
 }
@@ -244,6 +324,48 @@ async fn current_allow_returns_request_scoped_snapshot() {
 }
 
 #[tokio::test]
+async fn allowed_snapshot_preserves_every_requested_transport_scope() {
+    let transports = [
+        AuthTransport::RelayWebSocket,
+        AuthTransport::HttpBridge,
+        AuthTransport::Git,
+        AuthTransport::MediaUpload,
+        AuthTransport::MediaDownload,
+        AuthTransport::Audio,
+    ];
+
+    for transport in transports {
+        let proof_method = proof_method_for_transport(transport);
+        let actor = Keys::generate();
+        let request = direct_request_for_transport(
+            &actor,
+            transport,
+            proof_method,
+            None,
+            200,
+            capabilities(&[AuthorizationCapability::CommunityRead]),
+        )
+        .expect("synthetic direct request is valid");
+        let provider = FakeProvider::returning(allow_for(
+            &request,
+            request.requested_capabilities().clone(),
+            "version-a",
+            90,
+            180,
+        ));
+
+        let AuthorizationOutcome::Allow(snapshot) =
+            resolve_authorization(&provider, &request, NOW, provider_timeout()).await
+        else {
+            panic!("current provider policy must allow every transport profile");
+        };
+        assert_eq!(snapshot.transport(), transport);
+        assert_eq!(snapshot.proof_method(), proof_method);
+        assert_eq!(snapshot.actor_pubkey(), actor.public_key());
+    }
+}
+
+#[tokio::test]
 async fn explicit_denial_is_preserved() {
     let actor = Keys::generate();
     let request = direct_request(&actor);
@@ -343,6 +465,46 @@ async fn stale_and_future_provider_decisions_deny() {
         future_denial.reason(),
         AuthorizationDenialReason::FutureDecision
     );
+}
+
+#[tokio::test]
+async fn provider_time_boundaries_and_current_assertion_are_exact() {
+    let actor = Keys::generate();
+    let request = direct_request_for_transport(
+        &actor,
+        AuthTransport::RelayWebSocket,
+        AuthMethod::Nip42,
+        Some(NOW),
+        200,
+        capabilities(&[AuthorizationCapability::CommunityRead]),
+    )
+    .expect("assertion with not-before equal to server time is current");
+
+    let issued_now = FakeProvider::returning(allow_for(
+        &request,
+        request.requested_capabilities().clone(),
+        "version-a",
+        NOW,
+        180,
+    ));
+    assert!(matches!(
+        resolve_authorization(&issued_now, &request, NOW, provider_timeout()).await,
+        AuthorizationOutcome::Allow(_)
+    ));
+
+    let stale_at_now = FakeProvider::returning(allow_for(
+        &request,
+        request.requested_capabilities().clone(),
+        "version-a",
+        90,
+        NOW,
+    ));
+    let AuthorizationOutcome::Deny(denial) =
+        resolve_authorization(&stale_at_now, &request, NOW, provider_timeout()).await
+    else {
+        panic!("freshness ending at server time must deny");
+    };
+    assert_eq!(denial.reason(), AuthorizationDenialReason::StaleDecision);
 }
 
 #[tokio::test]
@@ -462,6 +624,55 @@ async fn invite_mint_does_not_authorize_invite_claim() {
     );
 }
 
+#[test]
+fn capability_sets_are_normalized_and_deduplicated() {
+    let normalized = CapabilitySet::new(vec![
+        AuthorizationCapability::GitWrite,
+        AuthorizationCapability::CommunityRead,
+        AuthorizationCapability::GitWrite,
+        AuthorizationCapability::CommunityRead,
+    ])
+    .expect("synthetic capabilities are non-empty");
+
+    assert_eq!(
+        normalized.as_slice(),
+        &[
+            AuthorizationCapability::CommunityRead,
+            AuthorizationCapability::GitWrite,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn no_distinct_capability_authorizes_another_capability() {
+    let actor = Keys::generate();
+    for requested in all_capabilities() {
+        for granted in all_capabilities() {
+            if requested == granted {
+                continue;
+            }
+
+            let request = direct_request_with_expiry(&actor, 200, capabilities(&[requested]));
+            let provider = FakeProvider::returning(allow_for(
+                &request,
+                capabilities(&[granted]),
+                "version-a",
+                90,
+                180,
+            ));
+            let AuthorizationOutcome::Deny(denial) =
+                resolve_authorization(&provider, &request, NOW, provider_timeout()).await
+            else {
+                panic!("a distinct capability must not widen provider authority");
+            };
+            assert_eq!(
+                denial.reason(),
+                AuthorizationDenialReason::MissingCapability
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn assertion_expiry_bounds_provider_freshness() {
     let actor = Keys::generate();
@@ -485,6 +696,52 @@ async fn assertion_expiry_bounds_provider_freshness() {
     };
     assert_eq!(snapshot.fresh_until(), 180);
     assert_eq!(snapshot.effective_until(), 120);
+}
+
+#[tokio::test]
+async fn identity_evidence_expiring_during_provider_resolution_denies() {
+    let actor = Keys::generate();
+    let direct = direct_request_with_expiry(
+        &actor,
+        120,
+        capabilities(&[AuthorizationCapability::CommunityRead]),
+    );
+    let direct_provider = FakeProvider::returning(allow_for(
+        &direct,
+        direct.requested_capabilities().clone(),
+        "version-a",
+        110,
+        180,
+    ));
+    let AuthorizationOutcome::Deny(direct_denial) =
+        resolve_authorization(&direct_provider, &direct, 120, provider_timeout()).await
+    else {
+        panic!("assertion expiring during provider resolution must deny");
+    };
+    assert_eq!(
+        direct_denial.reason(),
+        AuthorizationDenialReason::IdentityEvidenceExpired
+    );
+
+    let delegate = Keys::generate();
+    let owner = Keys::generate();
+    let delegated = delegated_request(&delegate, &owner, 140);
+    let delegated_provider = FakeProvider::returning(allow_for(
+        &delegated,
+        delegated.requested_capabilities().clone(),
+        "version-a",
+        130,
+        180,
+    ));
+    let AuthorizationOutcome::Deny(delegated_denial) =
+        resolve_authorization(&delegated_provider, &delegated, 140, provider_timeout()).await
+    else {
+        panic!("delegation expiring during provider resolution must deny");
+    };
+    assert_eq!(
+        delegated_denial.reason(),
+        AuthorizationDenialReason::IdentityEvidenceExpired
+    );
 }
 
 #[tokio::test]
@@ -571,10 +828,16 @@ fn provider_contract_rejects_malformed_values() {
         AuthorizationProfileId::new("x".repeat(MAX_OPAQUE_ID_BYTES + 1)),
         Err(ProviderContractError::ProfileIdTooLong)
     );
+    assert!(AuthorizationProfileId::new("x".repeat(MAX_OPAQUE_ID_BYTES)).is_ok());
     assert_eq!(
         PolicyVersion::new(""),
         Err(ProviderContractError::EmptyPolicyVersion)
     );
+    assert_eq!(
+        PolicyVersion::new("x".repeat(MAX_OPAQUE_ID_BYTES + 1)),
+        Err(ProviderContractError::PolicyVersionTooLong)
+    );
+    assert!(PolicyVersion::new("x".repeat(MAX_OPAQUE_ID_BYTES)).is_ok());
     assert_eq!(
         RetryAfter::new(0),
         Err(ProviderContractError::InvalidRetryAfter)
@@ -584,12 +847,24 @@ fn provider_contract_rejects_malformed_values() {
         Err(ProviderContractError::InvalidRetryAfter)
     );
     assert_eq!(
+        RetryAfter::new(MAX_RETRY_AFTER_SECONDS)
+            .expect("maximum retry hint is valid")
+            .seconds(),
+        MAX_RETRY_AFTER_SECONDS
+    );
+    assert_eq!(
         ProviderTimeout::new(Duration::ZERO),
         Err(ProviderContractError::InvalidProviderTimeout)
     );
     assert_eq!(
         ProviderTimeout::new(MAX_PROVIDER_TIMEOUT + Duration::from_nanos(1)),
         Err(ProviderContractError::InvalidProviderTimeout)
+    );
+    assert_eq!(
+        ProviderTimeout::new(MAX_PROVIDER_TIMEOUT)
+            .expect("maximum provider timeout is valid")
+            .duration(),
+        MAX_PROVIDER_TIMEOUT
     );
     assert_eq!(
         ProviderAllow::new(
@@ -623,10 +898,32 @@ fn provider_contract_rejects_malformed_values() {
             capabilities(&[AuthorizationCapability::CommunityRead]),
             policy_version("version-a"),
             100,
+            99,
+        ),
+        Err(ProviderContractError::InvalidFreshnessBound)
+    );
+    assert_eq!(
+        ProviderAllow::new(
+            domain(1),
+            principal(),
+            profile(),
+            capabilities(&[AuthorizationCapability::CommunityRead]),
+            policy_version("version-a"),
+            100,
             100 + MAX_PROVIDER_FRESHNESS_SECONDS + 1,
         ),
         Err(ProviderContractError::FreshnessWindowTooLong)
     );
+    assert!(ProviderAllow::new(
+        domain(1),
+        principal(),
+        profile(),
+        capabilities(&[AuthorizationCapability::CommunityRead]),
+        policy_version("version-a"),
+        100,
+        100 + MAX_PROVIDER_FRESHNESS_SECONDS,
+    )
+    .is_ok());
 }
 
 #[test]
@@ -840,17 +1137,38 @@ fn request_construction_rejects_mismatched_verified_evidence() {
 async fn request_decision_snapshot_and_errors_are_redaction_safe() {
     let actor = Keys::generate();
     let request = direct_request(&actor);
+    let request_debug = concat!(
+        "AuthorizationRequest { authorization_domain: \"[redacted]\", ",
+        "transport: \"[redacted]\", actor_pubkey: \"[redacted]\", ",
+        "proof_method: \"[redacted]\", ",
+        "authority: \"[redacted]\", principal: \"[redacted]\", ",
+        "profile_id: \"[redacted]\", requested_capabilities: \"[redacted]\", ",
+        "correlation_id: \"[redacted]\", decision_source: \"[redacted]\", ",
+        "evidence_valid_until: \"[redacted]\" }"
+    );
+    // Keep this exact-shape assertion deliberately: adding a field must fail until
+    // the disclosure contract explicitly confirms that the new field is redacted.
+    assert_eq!(format!("{request:?}"), request_debug);
+
+    let delegate = Keys::generate();
+    let owner = Keys::generate();
+    let delegated_request = delegated_request(&delegate, &owner, 180);
+    assert_eq!(format!("{delegated_request:?}"), request_debug);
     assert_eq!(
-        format!("{request:?}"),
-        concat!(
-            "AuthorizationRequest { authorization_domain: \"[redacted]\", ",
-            "transport: \"[redacted]\", actor_pubkey: \"[redacted]\", ",
-            "proof_method: \"[redacted]\", ",
-            "authority: \"[redacted]\", principal: \"[redacted]\", ",
-            "profile_id: \"[redacted]\", requested_capabilities: \"[redacted]\", ",
-            "correlation_id: \"[redacted]\", decision_source: \"[redacted]\", ",
-            "evidence_valid_until: \"[redacted]\" }"
-        )
+        format!("{:?}", request.authority()),
+        "AuthorizationAuthority(\"[redacted]\")"
+    );
+    assert_eq!(
+        format!("{:?}", delegated_request.authority()),
+        "AuthorizationAuthority(\"[redacted]\")"
+    );
+    assert_eq!(
+        format!("{:?}", request.decision_source()),
+        "DecisionSource(\"[redacted]\")"
+    );
+    assert_eq!(
+        format!("{:?}", delegated_request.decision_source()),
+        "DecisionSource(\"[redacted]\")"
     );
 
     let allow = ProviderAllow::new(
@@ -916,6 +1234,44 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
         )
     );
     assert_eq!(
+        format!(
+            "{:?}",
+            ProviderDecision::Deny(AuthorizationDenial::new(
+                AuthorizationDenialReason::ProviderDenied,
+            ))
+        ),
+        "ProviderDecision(\"[redacted]\")"
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            ProviderDecision::Unavailable(ProviderUnavailable::new(
+                ProviderUnavailableReason::DependencyUnavailable,
+                None,
+            ))
+        ),
+        "ProviderDecision(\"[redacted]\")"
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            AuthorizationOutcome::Deny(AuthorizationDenial::new(
+                AuthorizationDenialReason::ProviderDenied,
+            ))
+        ),
+        "AuthorizationOutcome(\"[redacted]\")"
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            AuthorizationOutcome::Unavailable(ProviderUnavailable::new(
+                ProviderUnavailableReason::DependencyUnavailable,
+                None,
+            ))
+        ),
+        "AuthorizationOutcome(\"[redacted]\")"
+    );
+    assert_eq!(
         format!("{:?}", provider_timeout()),
         "ProviderTimeout(\"[redacted]\")"
     );
@@ -932,17 +1288,58 @@ async fn request_decision_snapshot_and_errors_are_redaction_safe() {
         "CapabilitySet(\"[redacted]\")"
     );
 
-    for error in [
-        ProviderContractError::EmptyCapabilitySet,
-        ProviderContractError::EmptyProfileId,
-        ProviderContractError::EmptyPolicyVersion,
-        ProviderContractError::AuthorizationDomainMismatch,
-        ProviderContractError::DelegatedOwnerMismatch,
+    for capability in all_capabilities() {
+        capability_coverage_is_exhaustive(capability);
+        assert_eq!(
+            format!("{capability:?}"),
+            "AuthorizationCapability(\"[redacted]\")"
+        );
+    }
+    for reason in [
+        AuthorizationDenialReason::ProviderDenied,
+        AuthorizationDenialReason::AuthorizationDomainMismatch,
+        AuthorizationDenialReason::PrincipalMismatch,
+        AuthorizationDenialReason::AuthorizationProfileMismatch,
+        AuthorizationDenialReason::MissingCapability,
+        AuthorizationDenialReason::StaleDecision,
+        AuthorizationDenialReason::FutureDecision,
+        AuthorizationDenialReason::IdentityEvidenceExpired,
     ] {
-        let rendered = error.to_string();
-        assert!(!rendered.contains("idp.example"));
-        assert!(!rendered.contains("subject-123"));
-        assert!(!rendered.contains("private-policy-version"));
+        assert_eq!(
+            format!("{reason:?}"),
+            "AuthorizationDenialReason(\"[redacted]\")"
+        );
+    }
+    for reason in [
+        ProviderUnavailableReason::TemporarilyUnavailable,
+        ProviderUnavailableReason::Timeout,
+        ProviderUnavailableReason::DependencyUnavailable,
+    ] {
+        assert_eq!(
+            format!("{reason:?}"),
+            "ProviderUnavailableReason(\"[redacted]\")"
+        );
+    }
+    assert_eq!(
+        format!("{:?}", ProviderAllowReason::CurrentPolicy),
+        "ProviderAllowReason(\"[redacted]\")"
+    );
+    assert_eq!(
+        format!("{:?}", RetryAfter::new(30).expect("retry hint is valid")),
+        "RetryAfter(\"[redacted]\")"
+    );
+
+    for error in all_contract_errors() {
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            for private_value in [
+                "idp.example",
+                "subject-123",
+                "profile-1",
+                "private-policy-version",
+            ] {
+                assert!(!rendered.contains(private_value));
+            }
+        }
     }
 }
 
@@ -972,29 +1369,7 @@ fn provider_trait_is_object_safe_and_codes_are_unique() {
     codes.dedup();
     assert_eq!(codes.len(), 12);
 
-    let contract_errors = [
-        ProviderContractError::EmptyCapabilitySet,
-        ProviderContractError::EmptyProfileId,
-        ProviderContractError::ProfileIdTooLong,
-        ProviderContractError::EmptyPolicyVersion,
-        ProviderContractError::PolicyVersionTooLong,
-        ProviderContractError::InvalidIssuedAt,
-        ProviderContractError::InvalidFreshnessBound,
-        ProviderContractError::FreshnessWindowTooLong,
-        ProviderContractError::InvalidRetryAfter,
-        ProviderContractError::InvalidProviderTimeout,
-        ProviderContractError::InvalidCorrelationId,
-        ProviderContractError::DirectRequestHasOwner,
-        ProviderContractError::AuthorizationDomainMismatch,
-        ProviderContractError::TransportMismatch,
-        ProviderContractError::AssertionNotYetValid,
-        ProviderContractError::AssertionExpired,
-        ProviderContractError::KeyAttestationMismatch,
-        ProviderContractError::MissingKeyAttestation,
-        ProviderContractError::DelegationRequired,
-        ProviderContractError::DelegatedOwnerMismatch,
-        ProviderContractError::DelegationExpired,
-    ];
+    let contract_errors = all_contract_errors();
     let mut contract_codes = contract_errors
         .iter()
         .copied()
