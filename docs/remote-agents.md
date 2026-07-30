@@ -162,7 +162,7 @@ that enforces it and the boundary beyond which it does not hold.
   harness terminates its container (harness as the container's
   signal-receiving PID 1, `restartPolicy: Never`). Boundaries: (a) the
   guarantee is conditional on a live harness event loop — a wedged process
-  that cannot run its maintenance tick cannot reap itself, and M1 means
+  that cannot run its reaper timer cannot reap itself, and M1 means
   nothing else will (the mitigation is the substrate operator's, e.g. a
   namespace-level TTL policy, out of scope per §Non-Goals); (b)
   `restartPolicy: Never` prevents resurrection, it does not prove process
@@ -180,6 +180,17 @@ match `[a-z0-9][a-z0-9_-]*`. On Windows, an `.exe`/`.bat`/`.cmd` extension
 MUST be stripped before the id is derived (see §Known Defects — as of
 `c1bca1b56` it is not, so Windows providers probe but cannot deploy). First
 hit per filename wins. Discovery executes nothing.
+
+**Shadowing and invalid candidates are diagnosable, not silent.** First-hit
+wins is the right selection rule (it is kubectl's), but kubectl also warns
+when a later-PATH plugin is shadowed, and Docker's CLI reports invalid
+plugin candidates with reasons. Discovery MUST retain, and the UI and
+deploy-time errors MUST be able to surface: the selected binary's full
+path, any shadowed candidates for the same id (later-PATH duplicates), and
+candidates rejected for malformed names. A deploy error that names which
+binary ran answers the first question a user with two copies of
+`buzz-backend-kubernetes` will ask. (At `c1bca1b56` discovery records only
+the winning path — a desktop change alongside Known Defect 3's.)
 
 **Resolution rule.** Every subsequent operation resolves the provider id
 against the *current* discovery set. A stored binary path on an agent record
@@ -218,9 +229,20 @@ propagate them into `D`'s persisted `last_error` or logs.
 ```
 request:  {"op": "info", "request_id": "<uuid>"}
 response: {"ok": true, "name": str, "version": str,
-           "description": str, "config_schema": <JSON Schema>}
+           "protocol_version": int, "description": str,
+           "config_schema": <JSON Schema>}
 timeout:  10s
 ```
+
+`version` is the provider's *software* version — useful in error reports,
+useless for compatibility. `protocol_version` (this document: `1`) is the
+wire-contract version, following the pattern Docker's CLI plugins
+(`SchemaVersion`) and HashiCorp go-plugin (negotiated protocol version) both
+converged on: the desktop rejects a provider whose `protocol_version` it
+does not speak, with an error naming both versions and the binary path,
+instead of failing later inside a half-understood `deploy`. A missing
+`protocol_version` is treated as `1` for exactly one major cycle, then
+becomes an error.
 
 `config_schema` drives the UI form: `properties[*].default` prefill,
 string/number/boolean coercion, `required` gating. A provider MAY compute
@@ -237,8 +259,9 @@ response: {"ok": true, "agent_id": str}
 timeout:  600s
 ```
 
-The agent payload (authoritative field list in
-`commands/agents_deploy.rs: deploy_payload_json`):
+The agent payload (field list per
+`commands/agents_deploy.rs: deploy_payload_json` at `c1bca1b56`; the
+`launch` block is a normative addition not yet emitted — Known Defect 3):
 
 | field | meaning |
 |---|---|
@@ -246,12 +269,13 @@ The agent payload (authoritative field list in
 | `relay_url` | concrete WS URL (workspace fallback materialized — the remote side has no workspace notion) |
 | `private_key_nsec` | **the identity** (I1: never empty) |
 | `auth_tag` | NIP-OA owner attestation |
-| `agent_command`, `agent_args` | the ACP agent under the harness (configurable-harness support) |
+| `agent_command`, `agent_args` | the ACP agent under the harness (configurable-harness support). At `c1bca1b56` these are raw record bytes — see Known Defect 3: the normative source is the resolved descriptor in `launch` |
 | `system_prompt`, `model`, `provider` | effective values, live-persona-first resolution |
 | `turn_timeout_seconds`, `idle_timeout_seconds`, `max_turn_duration_seconds` | harness timeout knobs |
 | `parallelism` | concurrent-turn bound |
 | `respond_to`, `respond_to_allowlist` | inbound author gate |
 | `env_vars` | merged user env: global < persona < agent |
+| `launch` | **normative addition** (§Launch data): the desktop-resolved launch contract — `command` (name, not path), normalized `args`, layered `env`, overridable `policy_env`, and `owner_pubkey` |
 
 **Reserved-key rule (normative for providers).** `D` strips
 `BUZZ_PRIVATE_KEY`, `NOSTR_PRIVATE_KEY`, `BUZZ_AUTH_TAG`, `BUZZ_RELAY_URL`,
@@ -276,6 +300,157 @@ orphans the substrate objects; the UI therefore requires an explicit
 `force_remote_delete` confirmation, and the binding's GC + I5 bound the
 orphan's cost (the agent self-stops; the pod residue is reaped on the next
 deploy of the same key, or manually).
+
+### Launch data (`launch`) {#launch-data}
+
+Reproducing the local spawn's launch semantics requires state only the
+desktop can resolve: the runtime-metadata table (`model_env_var`,
+`provider_env_var`, `provider_locked`, `default_env` —
+`discovery.rs:74-193`), the six-layer env resolution, harness-definition
+command/args fallback, team instructions, session title, the respond-to
+gate's legacy owner fallback, and the mesh rewrite. A provider MUST NOT
+reimplement that derivation — it would be a second copy of desktop runtime
+discovery, drifting from the first. Instead the payload carries a typed
+`launch` block that `D` resolves with **the same code paths as local
+spawn**, and the provider applies it mechanically.
+
+```
+"launch": {
+  "command":      str,          // command NAME (e.g. "goose"), never a host path
+  "args":         [str],        // normalized args, definition fallback applied
+  "env":          {str: str},   // layered env: baked → runtime metadata →
+                                // definition → global → persona → agent
+                                // (resolve_effective_harness_descriptor)
+  "policy_env":   {str: str},   // overridable behavior defaults (tier 1, below):
+                                // runtime default_env (e.g. GOOSE_MODE=auto),
+                                // BUZZ_ACP_RELAY_OBSERVER, BUZZ_ACP_LAZY_POOL=true,
+                                // BUZZ_ACP_SESSION_TITLE (resolved),
+                                // BUZZ_ACP_TEAM_INSTRUCTIONS, BUZZ_ACP_MODEL,
+                                // MCP_HOOK_SERVERS=* (mcp_hooks runtimes only)
+  "owner_pubkey": str | null    // resolved workspace owner (hex) — legacy
+                                // BUZZ_ACP_AGENT_OWNER fallback, non-secret
+}
+```
+
+`launch.command`/`launch.args` come from
+`resolve_effective_harness_descriptor` (`readiness.rs:125`) — the same
+resolver local spawn uses — which fixes two silent divergences the raw
+record fields carry: a persona-derived `agent_command` is a blank record
+byte, and definition-provided `agent_args` are lost when the instance's own
+args are empty. `launch.env` is that descriptor's layered env, which is
+where per-runtime model/provider injection lives (`GOOSE_MODEL`/
+`GOOSE_PROVIDER` for goose; nothing for `provider_locked` runtimes like
+Claude; `BUZZ_AGENT_MODEL`/`BUZZ_AGENT_PROVIDER` for buzz-agent). A fixed
+`provider → BUZZ_AGENT_PROVIDER` mapping is wrong for three of the four
+built-in runtimes and is why this block exists.
+
+**What `policy_env` carries — and deliberately does not.** Its irreducible
+wire fields are exactly three scalars plus the metadata-derived defaults:
+
+- `BUZZ_ACP_TEAM_INSTRUCTIONS` — the only truly non-reconstructible policy
+  value: `effective_team_instructions` (`spawn_hash.rs:41-52`) needs the
+  desktop's `TeamRecord` store, which no pod can reach.
+- `BUZZ_ACP_SESSION_TITLE` — sent **resolved** (`resolve_session_title`,
+  `runtime/metadata.rs:45`), not as its `display_name`/`name` inputs. The
+  resolution strips control characters, and that property transfers: an
+  interior NUL fails a local spawn at the env boundary, and would make the
+  Kubernetes apiserver reject the whole pod spec — a rename must degrade,
+  not turn into a deploy failure.
+- `owner_pubkey` (block-level, not env) — the respond-to gate is otherwise
+  fully reconstructible from payload fields (`build_respond_to_env`,
+  `runtime.rs:380-421`); this is its one irreducible input.
+- Runtime `default_env` (e.g. `GOOSE_MODE=auto`) — computed **from the
+  runtime metadata table only, unconditionally**. The local spawn applies
+  each default only `if std::env::var(key).is_err()` (`runtime.rs:733-737`)
+  — a test of the *desktop's own* ambient environment. That makes "the
+  resolved local env" not a pure function of the record; serializing it
+  verbatim would bake a host accident into the pod. Launch data MUST be
+  computed from record + config alone.
+- `BUZZ_ACP_LAZY_POOL=true` — a **deliberate pick, not a transcription**:
+  the two local paths disagree (manual Start is eager, `runtime.rs:1006`;
+  launch restore is lazy, `restore.rs:333`, precisely to avoid "N idle
+  brains on every launch"). Remote pods take the lazy arm: an idle LLM pool
+  in a cluster is billable waste with no user watching it warm up.
+- `MCP_HOOK_SERVERS=*` when the resolved runtime has `mcp_hooks`
+  (`runtime.rs:594-598`; buzz-agent only at `c1bca1b56`) — gates the
+  `_Stop`/`_PostCompact` hook tools.
+
+`BUZZ_ACP_DEDUP` and `BUZZ_ACP_MULTIPLE_EVENT_HANDLING` are **deliberately
+unset**: the local spawn writes `queue`/`steer` (`runtime.rs:730-731`), and
+those are exactly the harness's clap defaults (`config.rs:344,356`) — a pod
+that omits both is behaviorally identical, and adding rows for them would
+imply a divergence that does not exist. `BUZZ_MANAGED_AGENT` is likewise
+deliberately absent remotely: it brands local harness processes so the
+desktop's orphan sweep and instance reaper can prove ownership by scanning
+process env (`orphan_sweep.rs`, `instance_reaper.rs`) — there is no local
+process to sweep.
+
+**Environment precedence (normative) — three tiers, later wins:**
+
+1. **Overridable behavior defaults** — `launch.policy_env`. These keys are
+   deliberately non-reserved (`env_vars.rs:54-57` says so outright: power
+   users may bypass the dedicated UI fields), and locally the user env is
+   written after them (`runtime.rs:860` and its comment). A policy-wins
+   order here would make remote agents ignore overrides local agents honor.
+2. **User/layered env** — `launch.env`. User `env_vars` need no separate
+   slot: the descriptor's layering already merged them (global < persona <
+   agent), so a provider applies `launch.env` and MUST NOT re-merge the
+   legacy `env_vars` field on top.
+3. **Authoritative** — unoverridable at every layer, written last and
+   backed by the reserved-key strip: the identity variables from top-level
+   payload fields (§Reserved-key rule), the respond-to gate values,
+   `BUZZ_ACP_AGENT_OWNER`, the inactivity bound, `BUZZ_ACP_MCP_COMMAND`,
+   and `BUZZ_MANAGED_AGENT_START_NONCE`. For the nonce, the provider MUST
+   set it to the attempt's **generation token** (§K8s Secrets): the harness
+   stamps it into every observer lifecycle frame (`buzz-acp/lib.rs:1501`),
+   so the Secret generation and the lifecycle correlator become one
+   identity instead of an empty string.
+
+**Host-resolved values MUST NOT be forwarded and MUST be re-derived
+in-image.** The local spawn sets several variables to absolute paths on the
+desktop's filesystem; forwarding them into a container is a guaranteed
+failure. The provider/image re-derives:
+
+- the harness and agent binaries: `launch.command` is a *name*, resolved
+  against the image's own `PATH` (`BUZZ_ACP_AGENT_COMMAND`), and
+  `BUZZ_ACP_MCP_COMMAND=buzz-dev-mcp` likewise;
+- `CLAUDE_CODE_EXECUTABLE` — a `resolve_command()` host path
+  (`configure_runtime_cli`, `runtime.rs:424-446`), same class as the
+  command paths: image-local resolution or unset;
+- `PATH` itself (the desktop's augmented PATH is meaningless in the image);
+- git credential/signing helper locations — the relay-URL *scoping* of the
+  credential config is normative (never a global helper), the helper *path*
+  is image-local (§Image);
+- `BUZZ_ACP_SETUP_PAYLOAD` is desktop-computed readiness state and MUST NOT
+  appear in a remote pod.
+
+**Owner resolution (normative):** the provider MUST have either a non-null
+`auth_tag` (→ `BUZZ_AUTH_TAG`) or a non-null `launch.owner_pubkey`
+(→ `BUZZ_ACP_AGENT_OWNER`) before any mutation; if both are null it MUST
+refuse the deploy. Without an owner the harness cannot match `!shutdown`
+(`buzz-acp/src/lib.rs: resolve_agent_owner`, main-loop owner check) and the
+agent answers its own stop command conversationally — §Stop would be
+describing a mechanism that does not work. `BUZZ_ACP_AGENT_OWNER` is a
+reserved key, so this value can only arrive as authoritative launch data,
+never through user env.
+
+**Buzz shared compute (relay-mesh) is non-deployable, and this is forced,
+not chosen.** The mesh rewrite resolves to an OpenAI-compatible transport at
+`http://127.0.0.1:9337/v1` (`relay_mesh.rs: RELAY_MESH_API_BASE_URL`) — a
+loopback proxy on the desktop. Serializing that policy into a pod points the
+agent at its own localhost, where nothing listens. `D` already rejects
+mesh-configured creates on non-local backends
+(`agents.rs: normalize_relay_mesh`); the deploy path MUST equally fail
+closed — before any mutation — when the effective provider resolves to
+`relay-mesh`, rather than passing `relay-mesh` through as if it were a
+runtime provider. Remote mesh transport is a possible v2 (an in-image mesh
+client), not a v1 silent breakage.
+
+**The governing invariant:** a remote agent's environment differs from the
+same record's local spawn **only where the substrate forces it** (paths,
+PATH, readiness). Anyone adding a local behavior knob adds it to the shared
+resolver, and both spawn paths inherit it; there are not two derivations to
+keep in sync.
 
 ### Deploy State Machine
 
@@ -307,9 +482,32 @@ observation; on any conflict, *re-enter from step 1* rather than fail:
 | observed | action | rationale |
 |---|---|---|
 | instance marked for deletion (`deletionTimestamp` set, any phase) | wait for actual disappearance, then re-enter | the user pressed Start and the old instance is unrecoverable; returning the dying instance's id records a success that evaporates. **Note: in Kubernetes there is no `Terminating` phase — a pod being gracefully deleted stays in phase `Running` for its whole grace period.** The deletion mark MUST be checked *before* phase, or this row is mistaken for the no-op row |
-| no instance | create | first deploy / after GC |
+| no instance | create, then verify startup (below) | first deploy / after GC |
 | terminated (Succeeded/Failed) | delete residue, wait for disappearance, re-enter (→ create) | the **normal restart path**: how a user revives a reaped or shut-down agent |
-| live, not marked for deletion (Pending/Running) | **strict no-op; return existing `agent_id`** | Start must never silently kill a live agent mid-turn; "already running" is the honest answer, consistent with I3 |
+| live and **started** (harness container running) | **strict no-op; return existing `agent_id`** | Start must never silently kill a live agent mid-turn; "already running" is the honest answer, consistent with I3 |
+| exists but **never started** — fatal startup condition (`ImagePullBackOff`, `ErrImagePull`, `CreateContainerConfigError`, `Unschedulable`) or startup age beyond bound | delete, wait for disappearance, re-enter (→ create) | a pod whose harness never ran is not a live agent: nothing can be killed mid-turn, auto-stop cannot bound it (I5's reaper lives in the harness), and no-op'ing it would return a permanently inert instance as success on every future Start |
+| exists, starting, within bound (scheduling, pulling) | poll until started or the operation deadline expires, then the corresponding row | a slow-but-valid startup must not be fought by a concurrent deploy deleting it |
+
+**Startup is part of create — phase is not readiness.** `Pending` (and even
+`Running` at the pod level) does not mean the harness started: a pod can sit
+in `ImagePullBackOff`, `CreateContainerConfigError` (e.g. a missing
+`envFrom` Secret), or unschedulable `Pending` forever, and I5's inactivity
+reaper cannot bound a harness that never began. Therefore `deploy` MUST NOT
+report success at pod acceptance: it succeeds only when the harness
+container has actually started (container `state.running`), bounded by the
+operation deadline. On failure or deadline expiry it MUST return an in-band
+error carrying the actionable condition (the container waiting `reason` /
+pod condition), not a generic timeout. "Live" in the no-op row above means
+**started**, for the same reason — this is the lesson ephemeral-runner
+controllers learned upstream (inspect container state, not pod phase).
+A consequence to state plainly: once success includes container start, the
+600s operation deadline **is** the cold-start budget — image pull on a
+fresh node, scale-from-zero scheduling, all of it. Deadline expiry on a
+still-progressing startup is reported as "startup not confirmed within the
+deadline", and MUST NOT trigger cleanup or forced recycle: the next deploy's
+reconciler observes whatever the startup became and takes the matching row.
+Whether ten minutes fits the intended cluster class is a product ruling,
+not a correctness one.
 
 **No-op means zero mutation.** The live-instance row MUST NOT replace or
 patch the Secret, patch metadata, or delete anything belonging to the
@@ -371,12 +569,26 @@ I5's enforcement point. A new harness knob:
 - **"Inactivity" is defined as**: no events dispatched to the agent and no
   turns in flight. Raw relay traffic does not count — an agent lurking in a
   busy channel it never answers is exactly the waste this bounds.
-- **Mechanism**: the harness's existing 30s maintenance tick checks
-  last-activity against the bound and, on expiry, fires the same shutdown
+- **Mechanism**: on expiry of the bound, the harness fires the same shutdown
   channel `!shutdown` uses — so inactivity exit gets in-flight drain,
   presence→offline, and graceful relay close identically to an owner stop.
-  Granularity: the tick makes the effective bound `t ∈ [T, T+30s)`, which is
-  immaterial at T=7200.
+  **The expiry check MUST NOT depend on pool readiness.** This is a design
+  constraint learned by inspection, not a transcription: the harness's
+  existing 30s maintenance tick is gated on `pool_ready` (`lib.rs:1743`),
+  which under `lazy_pool` starts false (`:1320`) and flips true only on a
+  wake (`:2570`) — and wakes require pending work (`pool_lifecycle.rs:42`).
+  A reaper riding that tick composes with the mandated
+  `BUZZ_ACP_LAZY_POOL=true` (§Launch data) into a deadlock in I5's single
+  most important case: a never-mentioned lazy pod never runs the tick, so
+  the idle agent the reaper exists to kill is exactly the one it can never
+  evaluate. The reaper therefore runs on its own timer, independent of pool
+  state (an idle-pool check needs no pool). Check granularity makes the
+  effective bound `t ∈ [T, T+interval)`, immaterial at T=7200.
+- **Reserved key**: `BUZZ_ACP_EXIT_AFTER_INACTIVITY` MUST join
+  `RESERVED_ENV_KEYS` (`env_vars.rs`) when it lands — it is tier-3
+  authoritative (§Launch data), and without reservation a user env var
+  could disable the reaper and reopen unbounded lifetime through the front
+  door.
 - Distinctness note: this is a **fourth** timeout concept, deliberately named
   away from the existing three (`--idle-timeout` = per-turn ACP wire silence,
   900s; `turn_timeout`; `max_turn_duration` = 7200s — numerically equal to
@@ -428,15 +640,27 @@ run — it MUST NOT fall back to `default`.
 shell tool) + `git` + CA certificates + the static musl `sprig` multicall
 binary with its personality links (`buzz-acp`, `buzz-agent`, `buzz-dev-mcp`,
 `rg`, `tree`, `buzz`, `git-credential-nostr`, `git-sign-nostr`) + a baked
-system gitconfig wiring the nostr signing and credential helpers. ~15–25MB;
+system gitconfig wiring the nostr signing and credential helpers. The baked
+credential-helper config MUST be scoped to the relay's git URL — mirroring
+the local spawn's `credential.<relay-url>/git.helper` scoping — never a
+global `credential.helper`: a global nostr helper would answer for every
+remote, including github.com. ~15–25MB;
 not FROM-scratch (bash and git preclude it). Sprig-only: alternate-harness
 dependencies (node for Claude Code / Codex) come via the `image` override
 field, not a fatter default. Tagging follows the relay image's matrix —
 `sha-<short>` on main, semver on `sprig-v*` tags (the sprig tarball's
-`+git.<sha>` version string is not a legal Docker tag). The provider bakes
-its build git-sha at compile time and defaults `image` to
-`ghcr.io/block/buzz-sprig:sha-<that>`, so provider and image derive from one
-commit; `image` accepts tag, digest, or full custom registry reference.
+`+git.<sha>` version string is not a legal Docker tag). **The default image
+reference MUST be pinned by digest, not tag**: the provider bakes, at
+compile time, the multi-arch manifest digest of the image built from its
+own commit and defaults `image` to
+`ghcr.io/block/buzz-sprig@sha256:<that-digest>` — a `sha-<git-sha>` *tag*
+is traceable but still movable (registry tags are mutable pointers;
+Kubernetes distinguishes movable tags from immutable digests for exactly
+this reason), and the object holding it runs with an nsec. The provider
+records the reference it used in a pod annotation, and rejects `:latest`.
+User `image` overrides accept tag, digest, or full custom registry
+reference — visibly the user's trust decision, with the resolved image ID
+recorded in the same annotation for post-hoc attribution.
 **An image override MUST contain the runtime ABI** — the `buzz-acp`
 entrypoint and everything §Entrypoint and launch ABI requires — not merely
 alternate-harness dependencies. A conforming custom image is "buzz-sprig
@@ -468,28 +692,38 @@ online — voiding I5's substrate half and the very staleness window
 shape and the grace period are one requirement, not two.
 
 **Payload → environment mapping.** The provider builds the pod environment
-(via the per-agent Secret, §K8s Secrets) as follows; identity comes from
-top-level fields per the reserved-key rule:
+(via the per-agent Secret, §K8s Secrets) by applying the §Launch data
+three-tier precedence — `launch.policy_env` (overridable defaults), then
+`launch.env` (user/layered), then the authoritative tier from top-level
+fields per the reserved-key rule. Only the
+non-`launch` scalars and the substrate-forced re-derivations are mapped
+individually:
 
-| payload field | env var |
+| source | env var |
 |---|---|
 | `relay_url` | `BUZZ_RELAY_URL` |
 | `private_key_nsec` | `BUZZ_PRIVATE_KEY` and `NOSTR_PRIVATE_KEY` (the git helpers read the latter) |
-| `auth_tag` | `BUZZ_AUTH_TAG` (omitted when null) |
-| `agent_command` | `BUZZ_ACP_AGENT_COMMAND` |
-| `agent_args` | `BUZZ_ACP_AGENT_ARGS`, comma-joined |
+| `auth_tag` | `BUZZ_AUTH_TAG` (omitted when null; then `launch.owner_pubkey` → `BUZZ_ACP_AGENT_OWNER` is REQUIRED — §Launch data owner rule) |
+| `launch.command` | `BUZZ_ACP_AGENT_COMMAND` — the *name*, resolved against the image's own PATH; never a forwarded host path |
+| `launch.args` | `BUZZ_ACP_AGENT_ARGS`, comma-joined |
+| `launch.env`, `launch.policy_env` | verbatim, at their precedence tiers |
+| generation token (§K8s Secrets) | `BUZZ_MANAGED_AGENT_START_NONCE` — the lifecycle-frame correlator and the Secret generation are one identity (§Launch data tier 3) |
 | `system_prompt` | `BUZZ_ACP_SYSTEM_PROMPT` (omitted when null) |
-| `model` | `BUZZ_ACP_MODEL` (omitted when null) |
-| `provider` | `BUZZ_AGENT_PROVIDER` (consumed by the `buzz-agent` runtime; other runtimes take provider-specific vars via `env_vars`) |
 | `idle_timeout_seconds` | `BUZZ_ACP_IDLE_TIMEOUT` (omitted when null) |
 | `turn_timeout_seconds` | not mapped — deprecated upstream and ignored; the local spawn also does not emit it |
 | `max_turn_duration_seconds` | `BUZZ_ACP_MAX_TURN_DURATION` (omitted when null) |
 | `parallelism` | `BUZZ_ACP_AGENTS` |
 | `respond_to` | `BUZZ_ACP_RESPOND_TO` |
 | `respond_to_allowlist` | `BUZZ_ACP_RESPOND_TO_ALLOWLIST`, comma-joined |
-| — | `BUZZ_ACP_MCP_COMMAND=buzz-dev-mcp` (the dev-MCP requirement) |
+| — | `BUZZ_ACP_MCP_COMMAND=buzz-dev-mcp` (image-local; the dev-MCP requirement) |
 | `provider_config.inactivity_seconds` | `BUZZ_ACP_EXIT_AFTER_INACTIVITY` (schema default 7200; the I5 opt-in, §Auto-Stop — the config field and this env var are one knob, not two) |
-| `env_vars` | merged last; reserved keys already stripped by `D`, and the provider MUST NOT let them re-enter |
+
+The top-level `model`/`provider` payload fields are display/bookkeeping
+inputs; the *environment* consequence of model and provider selection
+(per-runtime vars, `provider_locked` suppression, `BUZZ_ACP_MODEL`) arrives
+resolved inside `launch.env`/`launch.policy_env`. A provider MUST NOT map
+`provider` to any env var itself — that mapping is per-runtime and lives in
+the desktop's resolver (§Launch data).
 
 **Encoding honesty note.** `BUZZ_ACP_AGENT_ARGS` is comma-delimited by the
 harness's CLI parser, and the desktop's *local* spawn performs the same
@@ -535,15 +769,38 @@ regardless of `HOME`.
   phase (there is no `Terminating` phase to match on); (b) after deleting a
   live pod, a naive immediate create gets AlreadyExists for up to the full
   grace period — the reconciler MUST poll for actual disappearance (GET →
-  404) before creating. For *terminal* (Succeeded/Failed) pods the apiserver
+  404) before creating. The delete call MUST use the object's own grace
+  period (kube-rs: `DeleteParams { grace_period_seconds: None, .. }`); the
+  tempting shortcut of passing `0` to skip the poll is a **force-kill** that
+  discards the 60s shutdown grace pinned below — the poll is mandatory
+  precisely because the fast path is wrong. For *terminal*
+  (Succeeded/Failed) pods — and for **unscheduled** pods (no assigned node:
+  unschedulable or quota-blocked `Pending`, a state users hit while setting
+  up a namespace) — the apiserver
   zeroes the grace period and deletes immediately, so the normal restart
-  path needs no meaningful wait — do not add a fixed sleep.
+  path needs no meaningful wait — do not add a fixed sleep, and do not use
+  zero-grace cleanup as a reason to skip the poll in the live-pod arm.
 - **`terminationGracePeriodSeconds: 60`.** The harness's graceful shutdown
   has a ~37s **bounded tail** (30s drain + 2s presence + 5s relay close)
   after an agent-pool shutdown that is not itself bounded; Kubernetes'
   default 30s grace would SIGKILL it mid-drain, leaving presence
   stale-online — the avoidable half of I3's staleness window. 60s is a
   chosen operational margin over the bounded tail, not a proven upper bound.
+- **Hardening defaults (normative).** The workload is a prompted coding
+  agent running repository and tool code while holding an nsec; the pod MUST
+  NOT hand it ambient cluster credentials or kernel privilege on top:
+  `automountServiceAccountToken: false` (Kubernetes mounts a ServiceAccount
+  token unless told otherwise — an API-stealable credential the agent never
+  needs), `runAsNonRoot: true` with a fixed nonzero UID/GID,
+  `allowPrivilegeEscalation: false`, capabilities drop-all,
+  `seccompProfile.type: RuntimeDefault`; never privileged, `hostPID`,
+  `hostNetwork`, or `hostPath`. `readOnlyRootFilesystem` is *not* required
+  in v1 — the sprig toolchain writes outside the workspace mount — but is a
+  named candidate once the image's write surface is mapped. The
+  `service_account` config field selects an identity for scheduling/RBAC
+  purposes only; it MUST NOT silently re-enable token mounting — API-token
+  access, if ever wanted, is a separate explicit opt-in, not a side effect
+  of naming an SA.
 - **Resources**: requests 1 cpu / 2Gi, limits 2 cpu / 4Gi, all four
   configurable (`cargo build` in an agent workspace makes 500m/1Gi requests
   unrealistic).
@@ -579,11 +836,16 @@ Lifecycle rules that follow:
 - **Losing contender** (create-conflict): annotation-verify the winning pod,
   return its `agent_id` per the convergence rule, and delete **only its own
   now-unreferenced Secret** — never the winner's, never any Secret
-  referenced by a live pod.
+  referenced by an *existing* pod. "Existing" deliberately includes
+  not-yet-started pods: an `envFrom` reference from a pod still pulling its
+  image is exactly as load-bearing as one from a running pod.
 - **Live no-op arm**: no Secret is written at all (zero mutation).
 - **GC**: also deletes annotation-verified **orphan Secrets** — those whose
-  generation token is not referenced by the surviving pod — covering
-  contenders that crashed between Secret create and their conflict cleanup.
+  generation token no existing pod references — covering contenders that
+  crashed between Secret create and their conflict cleanup. But only when
+  **age-eligible**: see the normative age gate in §K8s GC — "unreferenced"
+  is not "orphaned" while a concurrent attempt may still be between its
+  Secret create and its pod create.
 
 Fresh configuration therefore materializes exactly when a fresh generation
 does. Residual exposure, stated: any principal with
@@ -598,21 +860,68 @@ accidental leakage into subprocess environments, not hostile cluster access.
 
 A **generation** is one pod-create attempt and the uniquely-named Secret it
 references; the Secret's generation token is the generation's identity, and
-the *current* generation is the one referenced by the surviving pod's
+the *current* generation is the one referenced by the existing pod's
 `envFrom`.
 
 GC is a **preflight reconciliation pass**, not a post-deploy afterthought:
 on every deploy, after identity derivation and before the state transition,
 the provider deletes terminated pods (and their referenced Secrets) that
 match the pubkey label **and pass the full-pubkey annotation check**, plus
-annotation-verified orphan Secrets whose generation token no surviving pod
+annotation-verified orphan Secrets whose generation token no existing pod
 references (§K8s Secrets). It never touches the current generation.
 Mismatched annotations are never GC'd (§Deploy State Machine step 1).
+
+**Orphan-Secret age gate (normative).** An unreferenced Secret is
+GC-eligible only when its server-assigned `creationTimestamp` is older than
+**twice the deploy operation deadline** (2 × 600s). Rationale — without the
+gate, GC composes with per-attempt Secrets into a legal interleaving that
+strands a deploy: attempt A creates Secret A; concurrent attempt B runs its
+preflight GC *before A creates its pod*, sees Secret A unreferenced, and
+deletes it as an "orphan"; A's pod is then accepted referencing a missing
+Secret and sits in `CreateContainerConfigError` forever. Unique Secret
+names made payload↔Secret atomic *at the pod-spec boundary*, but
+Secret-create→pod-create is not atomic against an independent GC pass —
+the standard controller lesson that observations may be stale and
+reconciliation must tolerate in-flight peers. The age bound makes
+"unreferenced" mean "provably abandoned": any attempt that could still
+reference the Secret has exceeded its own deadline. A losing contender's
+immediate cleanup of **its own** Secret is exempt — ownership, not age, is
+its safety argument. (A Lease per agent identity would also close this
+race; the age gate achieves the same with no extra machinery.)
+
+**Alternative considered — `ownerReferences`, rejected for v1.** Kubernetes'
+native GC (a Secret owned by its attempt's Pod is deleted when the owner is
+verified absent) would replace the orphan sweep with apiserver machinery —
+but an ownerReference needs the owner's UID, which exists only after pod
+create, so the ordering must flip to Pod-first-then-Secret. That flip makes
+`CreateContainerConfigError` a *normal transient on every healthy deploy* —
+the exact state §Deploy State Machine classifies as fatal-never-started —
+so a concurrent deploy would delete a healthy in-flight attempt between its
+pod create and Secret create, and the fatal/transient discriminator would
+need its own age bound: the same timer, relocated to a worse place.
+Patching the ownerReference after pod create avoids the flip but leaves a
+crash window (Secret created, patch never ran) that still needs the
+age-gated sweep as backstop. The age gate composes with Secret-first
+ordering and the startup classification; ownerReferences fight both.
+
 Running GC first
 gives concurrency and Secret ownership one unambiguous order: reconcile
-always observes a world with at most one candidate generation. Completed
+always observes a world with at most one candidate generation *older than
+the gate*. Completed
 pods from the *current* generation are left in place — their logs are the
-only forensics M1 permits. GC on next-deploy also self-heals the missing
+only forensics M1 permits. That forensic window is deliberately fragile:
+next-deploy GC, node loss, or namespace deletion erases it, and M1 means
+there is no log operation to reach for. **Cluster-native log shipping is
+therefore a production prerequisite, not an optional nicety** — the
+ephemeral-runner lesson: disposable generations still need durable
+diagnostics, forwarded off the pod by the cluster operator's stack. The
+binding's contribution is correlation, not transport: the pod carries the
+full-pubkey annotation, the generation token (doubling as
+`BUZZ_MANAGED_AGENT_START_NONCE`, so lifecycle frames and pod logs share a
+correlator), the provider version, and the resolved image reference
+(§Image) — enough to attribute any shipped log line to an exact identity,
+generation, and binary, with no secret in any of it. GC on next-deploy
+also self-heals the missing
 `undeploy`: delete-then-recreate converges, and a deleted-forever agent's
 residue is one Completed pod that never restarts (I5) plus one Secret,
 removable with `kubectl delete`.
@@ -641,10 +950,16 @@ A provider is conforming iff:
    `{"ok": false}` errors.
 2. It never requests or accepts credentials through `provider_config` (I2).
 3. It builds agent identity env from top-level payload fields, never from
-   `env_vars` (reserved-key rule).
+   `env_vars` (reserved-key rule), applies §Launch data mechanically —
+   three-tier precedence, host-resolved re-derivation, no re-merge of
+   legacy `env_vars`, no provider-side model/provider mapping — and refuses
+   a deploy that resolves neither `auth_tag` nor `launch.owner_pubkey`, or
+   whose provider is `relay-mesh`.
 4. `deploy` implements the reconciliation loop (I4): identity derived from
    the nsec before any mutation, candidates verified by full-identity
-   annotation before any action, live → strict no-op (zero mutation),
+   annotation before any action, live (= **started**, §Deploy State
+   Machine) → strict no-op (zero mutation), never-started fatal states →
+   delete-recreate, success only on confirmed container start,
    conflicts converge by re-entry, delete-not-found is success.
 5. The deployed harness invocation enables an inactivity bound (I5) and the
    substrate does not resurrect terminated instances.
@@ -660,14 +975,22 @@ Conformance is testable without mechanization: a fake-provider harness can
 exercise items 1–3 and 7 over the wire contract, and an envtest/kind suite
 can drive item 4's reconciler against a real apiserver — concurrent
 deploys, a deletion-marked pod, terminal restart, an annotation-mismatch
-collision, and SIGTERM→presence-offline for items 5–6. A model checker is
+collision, and SIGTERM→presence-offline for items 5–6. Two families of
+cases are mandatory because they were the review-found failure modes:
+**startup discrimination** (slow-but-valid scheduling → poll-then-succeed;
+`Unschedulable`, image-pull failure, and missing-Secret
+`CreateContainerConfigError` → delete-recreate or actionable error, never
+silent success or no-op) and the **GC/attempt interleaving** (attempt B's
+preflight GC running between attempt A's Secret create and pod create MUST
+NOT delete Secret A — the §K8s GC age gate under test). A model checker is
 the wrong tool here: the failure modes found in review were wrong
 *abstractions of Kubernetes* (a nonexistent `Terminating` phase, non-atomic
-delete), which a hand-written model would have reproduced convincingly.
+delete, phase-as-readiness, non-atomic Secret→pod against GC), which a
+hand-written model would have reproduced convincingly.
 
 ## Known Defects (at `c1bca1b56`)
 
-Desktop-side, discovered during this design; both predate it:
+Desktop- and harness-side, discovered during this design:
 
 1. **Windows discovery id pollution**: the `.exe` suffix survives into the
    provider id, which then fails id validation at deploy — dropdown-visible,
@@ -677,6 +1000,38 @@ Desktop-side, discovered during this design; both predate it:
    environment through unmodified; combined with launchd's minimal PATH this
    breaks kubeconfig exec plugins. Mitigated provider-side (§K8s Auth);
    a desktop-side PATH augmentation would fix the class.
+3. **Deploy payload bypasses the launch resolver** (the prerequisite this
+   spec names for §Launch data — a desktop code change, not spec text).
+   At `c1bca1b56`, `deploy_payload_json` serializes raw record bytes and a
+   three-layer `merged_user_env` where the local spawn uses
+   `resolve_effective_harness_descriptor`'s six-layer resolution. Concrete
+   consequences, each verified in review: (a) no per-runtime model/provider
+   env — a remote goose agent silently ignores the user's model choice, and
+   `provider_locked` runtimes would receive vars the desktop deliberately
+   withholds; (b) persona-derived `agent_command` and definition-provided
+   `agent_args` serialize as blank/empty — a different command line than the
+   identical local agent; (c) no `owner_pubkey` — a null-`auth_tag` agent
+   cannot match `!shutdown` (it *answers* it), stranding §Stop; (d) spawn
+   policy (`BUZZ_ACP_RELAY_OBSERVER`, runtime `default_env` such as
+   `GOOSE_MODE=auto`, team instructions, session title, lazy-pool selection)
+   is absent — remote pods run different observer/approval semantics
+   (`BUZZ_ACP_DEDUP`/`BUZZ_ACP_MULTIPLE_EVENT_HANDLING` are *not* on this
+   list: the local writes match the harness defaults, §Launch data); (e) a
+   mesh-provider agent deploys pointed at a loopback URL that cannot exist
+   in the pod instead of being refused. Until `deploy_payload_json` emits
+   the `launch` block, no provider can conform to §Launch data, and the
+   current payload MUST be treated as insufficient for a
+   semantics-preserving remote launch.
+4. **The I5 reaper does not exist, and its natural home is a trap**
+   (harness code prerequisite). `BUZZ_ACP_EXIT_AFTER_INACTIVITY` appears
+   nowhere in the harness at `c1bca1b56`; §Auto-Stop is a design, not a
+   description. Worse, the obvious attachment point — the existing 30s
+   maintenance tick — is gated on `pool_ready` (`lib.rs:1743`), which under
+   `lazy_pool` only becomes true when work arrives, so a never-mentioned
+   lazy pod would never evaluate the bound: I5 dead in its most important
+   case (§Auto-Stop mechanism rule). The implementation MUST run the expiry
+   check on a pool-independent timer and MUST add the env var to
+   `RESERVED_ENV_KEYS` in the same change.
 
 ## Implementation Correspondence
 
@@ -687,12 +1042,14 @@ Desktop-side, discovered during this design; both predate it:
 | Redaction | `backend.rs` (`redact_secrets_with`) |
 | I2 validation | `backend.rs` (`validate_provider_config`) |
 | I1 refusal, payload | `desktop/src-tauri/src/commands/agents_deploy.rs` |
+| Launch resolver (shared with local spawn) | `desktop/src-tauri/src/managed_agents/readiness.rs` (`resolve_effective_harness_descriptor`); `launch` block emission *to be added* to `agents_deploy.rs` (Known Defect 3) |
+| Mesh rewrite (why relay-mesh is non-deployable) | `desktop/src-tauri/src/managed_agents/relay_mesh.rs`; create-time rejection in `commands/agents.rs` (`normalize_relay_mesh`) |
 | Reserved-key strip | `desktop/src-tauri/src/managed_agents/env_vars.rs` (`RESERVED_ENV_KEYS`) |
 | Unconditional deploy on Start | `desktop/src-tauri/src/commands/agents.rs` (`start_managed_agent`) |
 | Presence publish / offline-on-exit | `crates/buzz-acp/src/lib.rs` (`publish_presence`, shutdown path) |
 | `!shutdown` owner check | `crates/buzz-acp/src/lib.rs` (main loop) |
 | Graceful shutdown bounded tail (~37s) | `crates/buzz-acp/src/lib.rs` (pool shutdown, then drain / presence / relay close) |
-| Auto-stop flag | *to be added*: `crates/buzz-acp/src/config.rs` + maintenance tick |
+| Auto-stop flag | *to be added*: `crates/buzz-acp/src/config.rs` + a pool-independent timer (NOT the `pool_ready`-gated maintenance tick — Known Defect 4) + `RESERVED_ENV_KEYS` entry |
 | Kubernetes binding | *to be added*: `crates/buzz-backend-kubernetes` |
 | Sprig image | *to be added*: `Dockerfile.sprig` + workflow |
 
@@ -710,6 +1067,22 @@ Marked `[DECISION]` inline; consolidated:
   as stated.
 - **E. Running-pod semantics** — no-op (recommended, both reviewers) vs
   forcible recycle on Start.
+- **F. Mesh deployability** — the spec refuses relay-mesh agents
+  pre-mutation in v1 (§Launch data: the transport is desktop loopback;
+  serializing it fails identically but invisibly). Reviewer consensus is
+  refusal; ratification requested because it makes a visible product cut
+  (shared-compute agents are local-only until an in-image mesh client
+  exists).
+- **G. Remote override semantics** — the spec keeps local semantics: user
+  env continues to beat Buzz behavior defaults remotely (three-tier
+  precedence, §Launch data), because the alternative is a quiet behavior
+  fork between local and remote spawns of the same record. Flagged because
+  it is a policy statement about what power users may do to remote pods.
+- **H. Startup budget** — with deploy success now requiring container start
+  (§Deploy State Machine), the 600s operation deadline is the de facto
+  cold-pull / scale-from-zero budget. Whether ten minutes fits the intended
+  cluster class is an SLO ruling; the spec fixes only the semantics
+  (deadline expiry = "startup not confirmed", never cleanup).
 
 ## Summary
 
