@@ -6,7 +6,12 @@ import {
   useMemo,
   useState,
 } from "react";
-import { ApiFailure, request, requestObjectUrl } from "./api";
+import {
+  ApiFailure,
+  probeAuthRequired,
+  request,
+  requestObjectUrl,
+} from "./api";
 import { setToken, useToken } from "./token";
 import type {
   FeedbackDetail,
@@ -888,9 +893,36 @@ export function App() {
   useEffect(() => {
     if (token !== null) setEverHadToken(true);
   }, [token]);
+
+  // When no token is stored, probe the relay to find out whether it requires
+  // one. In insecure_no_auth mode the probe returns 200 and the dashboard
+  // renders without a credential; in token mode it returns 401 and the prompt
+  // is shown. `null` means the probe is still in flight.
+  const [authRequired, setAuthRequired] = useState<boolean | null>(
+    token !== null ? false : null,
+  );
+  useEffect(() => {
+    if (token !== null) {
+      setAuthRequired(false);
+      return;
+    }
+    let active = true;
+    probeAuthRequired().then((required) => {
+      if (active) setAuthRequired(required);
+    });
+    return () => {
+      active = false;
+    };
+  }, [token]);
+
   const report = path.match(/^\/reports\/([^/]+)$/);
   const feedback = path.match(/^\/feedback\/([^/]+)$/);
-  if (!token) return <TokenPrompt rejected={everHadToken} />;
+
+  // Probe still in flight — render nothing to avoid a visible flash.
+  if (authRequired === null) return null;
+
+  if (authRequired && !token) return <TokenPrompt rejected={everHadToken} />;
+
   const content = report ? (
     <ReportDetail id={report[1]} />
   ) : feedback ? (

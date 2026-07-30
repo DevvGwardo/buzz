@@ -30,7 +30,13 @@ pub struct AdminConfig {
     /// Exact admin HTTP authority.
     pub host: String,
     /// Operator bearer credential required on every admin API request.
-    pub token: AdminToken,
+    /// `None` when the operator has set `BUZZ_ADMIN_INSECURE_NO_AUTH=true`.
+    pub token: Option<AdminToken>,
+    /// When `true`, bearer authentication is disabled. The operator has
+    /// explicitly asserted that the admin API is protected at the network
+    /// layer (reverse proxy, VPN, firewall). `Host`/`Origin` checks remain
+    /// active as defense-in-depth.
+    pub insecure_no_auth: bool,
     /// Optional admin SPA bundle directory.
     pub web_dir: Option<std::path::PathBuf>,
 }
@@ -938,6 +944,12 @@ impl Config {
                          dashboard and API stay disabled and the token is ignored"
                     );
                 }
+                if std::env::var_os("BUZZ_ADMIN_INSECURE_NO_AUTH").is_some() {
+                    tracing::warn!(
+                        "BUZZ_ADMIN_INSECURE_NO_AUTH is set without BUZZ_ADMIN_HOST — \
+                         the admin dashboard and API stay disabled and the flag is ignored"
+                    );
+                }
                 None
             }
             Some(host) => {
@@ -946,7 +958,43 @@ impl Config {
                         "BUZZ_ADMIN_HOST must be an exact authority".to_string(),
                     ));
                 }
-                let token = parse_admin_token()?;
+
+                // Parse BUZZ_ADMIN_INSECURE_NO_AUTH. Only the exact value
+                // "true" enables disabled mode; any other non-empty value is a
+                // startup error to prevent silent typo-coercion.
+                let insecure_no_auth =
+                    match std::env::var("BUZZ_ADMIN_INSECURE_NO_AUTH").ok().as_deref() {
+                        None | Some("") => false,
+                        Some("true") => true,
+                        Some(other) => {
+                            return Err(ConfigError::InvalidValue(format!(
+                                "BUZZ_ADMIN_INSECURE_NO_AUTH must be exactly \"true\" or unset; \
+                             got \"{other}\""
+                            )))
+                        }
+                    };
+
+                // Both BUZZ_ADMIN_TOKEN and BUZZ_ADMIN_INSECURE_NO_AUTH=true
+                // is ambiguous intent; fail closed.
+                if insecure_no_auth && std::env::var_os("BUZZ_ADMIN_TOKEN").is_some() {
+                    return Err(ConfigError::InvalidValue(
+                        "BUZZ_ADMIN_TOKEN and BUZZ_ADMIN_INSECURE_NO_AUTH=true are mutually \
+                         exclusive — set one or the other, not both"
+                            .to_string(),
+                    ));
+                }
+
+                let token = if insecure_no_auth {
+                    tracing::warn!(
+                        "BUZZ_ADMIN_INSECURE_NO_AUTH=true — the admin API is \
+                         unauthenticated; the operator has asserted that access is \
+                         controlled at the network layer (reverse proxy, VPN, firewall)"
+                    );
+                    None
+                } else {
+                    Some(parse_admin_token()?)
+                };
+
                 let web_dir = std::env::var("BUZZ_ADMIN_WEB_DIR")
                     .ok()
                     .map(|value| std::path::PathBuf::from(value.trim()))
@@ -962,6 +1010,7 @@ impl Config {
                 Some(AdminConfig {
                     host,
                     token,
+                    insecure_no_auth,
                     web_dir,
                 })
             }
@@ -1124,7 +1173,11 @@ mod tests {
     /// Run `Config::from_env()` with the admin variables forced to `values`,
     /// restoring the ambient environment afterwards.
     fn config_with_admin_env(values: &[(&str, Option<&str>)]) -> Result<Config, ConfigError> {
-        const KEYS: [&str; 2] = ["BUZZ_ADMIN_HOST", "BUZZ_ADMIN_TOKEN"];
+        const KEYS: [&str; 3] = [
+            "BUZZ_ADMIN_HOST",
+            "BUZZ_ADMIN_TOKEN",
+            "BUZZ_ADMIN_INSECURE_NO_AUTH",
+        ];
         let previous: Vec<_> = KEYS
             .iter()
             .map(|key| (*key, std::env::var_os(key)))
@@ -1194,8 +1247,10 @@ mod tests {
             let mut expected = [0u8; 32];
             hex::decode_to_slice(VALID_ADMIN_TOKEN, &mut expected).expect("hex fixture");
             assert_eq!(admin.host, "admin.example");
-            assert!(admin.token.matches(&expected));
-            assert!(!admin.token.matches(&[0u8; 32]));
+            assert!(!admin.insecure_no_auth);
+            let token = admin.token.expect("token must be present in token mode");
+            assert!(token.matches(&expected));
+            assert!(!token.matches(&[0u8; 32]));
         }
     }
 
@@ -1246,6 +1301,80 @@ mod tests {
         let rendered = format!("{token:?}");
         assert_eq!(rendered, "AdminToken(redacted)");
         assert!(!rendered.contains("07"));
+    }
+
+    #[test]
+    fn insecure_no_auth_activates_without_a_token() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let admin = config_with_admin_env(&[
+            ("BUZZ_ADMIN_HOST", Some("admin.example")),
+            ("BUZZ_ADMIN_TOKEN", None),
+            ("BUZZ_ADMIN_INSECURE_NO_AUTH", Some("true")),
+        ])
+        .expect("insecure_no_auth without a token is valid")
+        .admin
+        .expect("admin surface is configured");
+        assert_eq!(admin.host, "admin.example");
+        assert!(admin.insecure_no_auth);
+        assert!(admin.token.is_none());
+    }
+
+    #[test]
+    fn insecure_no_auth_and_token_both_set_fails_closed() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let result = config_with_admin_env(&[
+            ("BUZZ_ADMIN_HOST", Some("admin.example")),
+            ("BUZZ_ADMIN_TOKEN", Some(VALID_ADMIN_TOKEN)),
+            ("BUZZ_ADMIN_INSECURE_NO_AUTH", Some("true")),
+        ]);
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidValue(ref message))
+                    if message.contains("mutually exclusive")
+            ),
+            "both set must be a startup error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn insecure_no_auth_junk_values_all_fail_closed() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        for junk in ["1", "yes", "TRUE", "True", "false", "0", "on"] {
+            let result = config_with_admin_env(&[
+                ("BUZZ_ADMIN_HOST", Some("admin.example")),
+                ("BUZZ_ADMIN_TOKEN", None),
+                ("BUZZ_ADMIN_INSECURE_NO_AUTH", Some(junk)),
+            ]);
+            assert!(
+                matches!(
+                    result,
+                    Err(ConfigError::InvalidValue(ref message))
+                        if message.contains("BUZZ_ADMIN_INSECURE_NO_AUTH")
+                ),
+                "{junk:?} must be rejected: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn insecure_no_auth_empty_string_is_treated_as_unset() {
+        // An empty value (e.g. `BUZZ_ADMIN_INSECURE_NO_AUTH=`) behaves exactly
+        // like absence — the operator must set a token or the relay fails closed.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let result = config_with_admin_env(&[
+            ("BUZZ_ADMIN_HOST", Some("admin.example")),
+            ("BUZZ_ADMIN_TOKEN", None),
+            ("BUZZ_ADMIN_INSECURE_NO_AUTH", Some("")),
+        ]);
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidValue(ref message))
+                    if message.contains("BUZZ_ADMIN_TOKEN")
+            ),
+            "empty BUZZ_ADMIN_INSECURE_NO_AUTH should fall through to the token requirement"
+        );
     }
 
     #[test]

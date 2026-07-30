@@ -17,11 +17,23 @@ async function seedToken(page: Page, token = TOKEN) {
 async function recordAuthorization(page: Page, body: unknown = []) {
   const seen: (string | undefined)[] = [];
   await page.route("**/api/admin/v1/**", async (route) => {
-    seen.push(route.request().headers().authorization);
-    await route.fulfill({
-      contentType: "application/json",
-      body: JSON.stringify(body),
-    });
+    const authorization = route.request().headers().authorization;
+    seen.push(authorization);
+    // Simulate token-mode relay: 401 without a credential, 200 with one.
+    if (!authorization) {
+      await route.fulfill({
+        status: 401,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: { code: "unauthorized", message: "token required" },
+        }),
+      });
+    } else {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(body),
+      });
+    }
   });
   return seen;
 }
@@ -34,7 +46,9 @@ test("the dashboard prompts for a token before any api call", async ({
   await expect(
     page.getByRole("heading", { name: "Admin token required" }),
   ).toBeVisible();
-  expect(seen).toHaveLength(0);
+  // The probe fires unauthenticated (no Authorization header), but no
+  // bearer-credentialed call has been made yet.
+  expect(seen.filter(Boolean)).toHaveLength(0);
 
   await page.getByPlaceholder("Admin token").fill(TOKEN);
   await page.getByRole("button", { name: "Continue" }).click();
@@ -55,9 +69,21 @@ test("api calls carry the stored token", async ({ page }) => {
 });
 
 test("the token survives a reload within the session", async ({ page }) => {
-  await page.route("**/api/admin/v1/**", (route) =>
-    route.fulfill({ contentType: "application/json", body: "[]" }),
-  );
+  // Simulate token mode: 401 for unauthenticated, 200 for authenticated.
+  await page.route("**/api/admin/v1/**", (route) => {
+    const authorization = route.request().headers().authorization;
+    if (!authorization) {
+      route.fulfill({
+        status: 401,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: { code: "unauthorized", message: "token required" },
+        }),
+      });
+    } else {
+      route.fulfill({ contentType: "application/json", body: "[]" });
+    }
+  });
   await page.goto("/reports");
   await page.getByPlaceholder("Admin token").fill(TOKEN);
   await page.getByRole("button", { name: "Continue" }).click();
@@ -372,4 +398,51 @@ test("concurrent rejected requests re-prompt exactly once", async ({
   await expect(
     page.getByRole("heading", { name: "Admin token required" }),
   ).toHaveCount(1);
+});
+
+test("probe: insecure_no_auth mode skips the token prompt when probe returns 200", async ({
+  page,
+}) => {
+  // No token in storage. The probe to /api/admin/v1/reports returns 200,
+  // indicating the relay runs in insecure_no_auth mode. The dashboard must
+  // render directly without showing the token prompt.
+  await page.route("**/api/admin/v1/reports**", (route) =>
+    route.fulfill({ contentType: "application/json", body: "[]" }),
+  );
+
+  await page.goto("/reports");
+
+  await expect(
+    page.getByRole("heading", { name: "Open reports" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Admin token required" }),
+  ).toHaveCount(0);
+});
+
+test("probe: token mode shows the prompt when probe returns 401", async ({
+  page,
+}) => {
+  // No token in storage. The probe to /api/admin/v1/reports returns 401,
+  // indicating the relay requires a bearer token. The prompt must be shown.
+  await page.route("**/api/admin/v1/**", (route) =>
+    route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({
+        error: { code: "unauthorized", message: "token required" },
+      }),
+    }),
+  );
+
+  await page.goto("/reports");
+
+  await expect(
+    page.getByRole("heading", { name: "Admin token required" }),
+  ).toBeVisible();
+  // The prompt must not say "rejected" on a fresh first visit.
+  await expect(page.getByText("That token was rejected.")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Open reports" })).toHaveCount(
+    0,
+  );
 });

@@ -344,7 +344,51 @@ mod tests {
         hex::decode_to_slice(TOKEN, &mut token).expect("test token is hex");
         config.admin = Some(crate::config::AdminConfig {
             host: "admin.example".to_string(),
-            token: crate::config::AdminToken::from_bytes(token),
+            token: Some(crate::config::AdminToken::from_bytes(token)),
+            insecure_no_auth: false,
+            web_dir: None,
+        });
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        Arc::new(state)
+    }
+
+    async fn insecure_no_auth_state() -> Arc<crate::state::AppState> {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.admin = Some(crate::config::AdminConfig {
+            host: "admin.example".to_string(),
+            token: None,
+            insecure_no_auth: true,
             web_dir: None,
         });
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
@@ -701,5 +745,67 @@ mod tests {
         assert!(!is_sha256(&HASH.to_uppercase()));
         assert!(!is_sha256(&HASH[..63]));
         assert!(!is_sha256(&format!("{HASH}.png")));
+    }
+
+    #[tokio::test]
+    async fn insecure_no_auth_mode_allows_unauthenticated_requests_on_the_admin_host() {
+        let state = insecure_no_auth_state().await;
+        for uri in mounted_routes() {
+            let response = status_for(
+                state.clone(),
+                Request::builder()
+                    .uri(&uri)
+                    .header(header::HOST, "admin.example")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await;
+            // The routes return 200 (or 404 for unknown resources) — never 401.
+            // 404 is fine here: there is no real DB, so the row lookups fail.
+            assert_ne!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} must not return 401 in insecure_no_auth mode"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn insecure_no_auth_mode_still_requires_the_correct_host() {
+        let state = insecure_no_auth_state().await;
+        let response = status_for(
+            state,
+            Request::builder()
+                .uri("/reports")
+                .header(header::HOST, "community.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "wrong host must still be rejected in insecure_no_auth mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn insecure_no_auth_mode_still_requires_a_matching_origin() {
+        let state = insecure_no_auth_state().await;
+        let response = status_for(
+            state,
+            Request::builder()
+                .uri("/reports")
+                .header(header::HOST, "admin.example")
+                .header(header::ORIGIN, "https://attacker.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "mismatched origin must still be rejected in insecure_no_auth mode"
+        );
     }
 }

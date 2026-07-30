@@ -2,12 +2,17 @@
 
 ## Unreleased
 
-- **Breaking:** `/api/admin/v1` requires an `Authorization: Bearer` token.
-  `BUZZ_ADMIN_HOST` now also requires `BUZZ_ADMIN_TOKEN` (exactly 64 hex
-  characters, `openssl rand -hex 32`); startup fails closed without it.
-  Unauthenticated requests get a uniform 401 with `WWW-Authenticate: Bearer`
-  before any database or media access, and `Host`/`Origin` checks are demoted
-  to defense-in-depth behind the credential check.
+- **Breaking:** `/api/admin/v1` now requires explicit authentication when
+  `BUZZ_ADMIN_HOST` is set. Choose one mode:
+  - **Token mode:** set `BUZZ_ADMIN_TOKEN` (exactly 64 hex characters,
+    `openssl rand -hex 32`); startup fails closed without it. Every request
+    requires `Authorization: Bearer`. Unauthenticated requests get a uniform
+    `401` with `WWW-Authenticate: Bearer` before any database or media access.
+  - **Network-layer mode:** set `BUZZ_ADMIN_INSECURE_NO_AUTH=true` (exact value
+    only). Use only when the admin API is already protected at the network layer
+    (VPN, firewall, private ingress). The relay logs a `WARN` on every startup.
+  - Both set at the same time, or neither, is a startup error.
+  `Host`/`Origin` checks are demoted to defense-in-depth in both modes.
 
 ## relay-v0.2.0
 

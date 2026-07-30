@@ -2,12 +2,17 @@
 
 ## Unreleased
 
-- **Breaking:** the relay admin moderation API (`/api/admin/v1`) now requires a
-  bearer token. Deployments that set `BUZZ_ADMIN_HOST` must also set
-  `BUZZ_ADMIN_TOKEN` to exactly 64 hex characters (`openssl rand -hex 32`) or
-  the relay refuses to start. `Host`/`Origin` matching is retained only as
-  defense-in-depth. The admin dashboard prompts for the token and keeps it in
-  `sessionStorage` for the browser session.
+- **Breaking:** the relay admin moderation API (`/api/admin/v1`) now requires
+  explicit authentication when `BUZZ_ADMIN_HOST` is set. Choose one mode:
+  - **Token mode:** set `BUZZ_ADMIN_TOKEN` to exactly 64 hex characters
+    (`openssl rand -hex 32`). Every API request requires `Authorization: Bearer`.
+    The dashboard prompts for the token on first load.
+  - **Network-layer mode:** set `BUZZ_ADMIN_INSECURE_NO_AUTH=true` (exact value
+    only). Use only when the admin API is already protected by a VPN or private
+    ingress. The relay logs a `WARN` on every startup. The dashboard skips the
+    token prompt and renders directly.
+  - Both set at the same time, or neither, is a startup error.
+  `Host`/`Origin` matching is retained in both modes as defense-in-depth.
 
 ## v0.5.2
 

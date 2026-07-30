@@ -531,7 +531,8 @@ mod tests {
         config.web_dir = Some(web_dir.to_path_buf());
         config.admin = Some(crate::config::AdminConfig {
             host: "admin.example".to_string(),
-            token: crate::config::AdminToken::from_bytes([7u8; 32]),
+            token: Some(crate::config::AdminToken::from_bytes([7u8; 32])),
+            insecure_no_auth: false,
             web_dir: Some(admin_dir.to_path_buf()),
         });
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
