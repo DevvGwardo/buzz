@@ -6,4 +6,3 @@ export {
 } from "./hooks/useMessageComposerDictation";
 export { useVoiceDictationShortcut } from "./hooks/useVoiceDictationShortcut";
 export { DictationButton } from "./ui/DictationButton";
-export { getDictationSendDecision } from "./lib/voiceInput";

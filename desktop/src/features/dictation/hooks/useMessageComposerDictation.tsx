@@ -44,7 +44,6 @@ export function useMessageComposerDictation({
 
   return {
     ...dictation,
-    isSendBlocked: isRecording || isStarting || isTranscribing,
     prepareToSubmit,
   };
 }
