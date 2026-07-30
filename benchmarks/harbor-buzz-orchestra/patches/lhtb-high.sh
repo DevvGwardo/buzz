@@ -31,8 +31,26 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cd "$HOME/buzz/benchmarks/harbor-buzz-orchestra" || exit 1
 
+# Refuse to start if a run is already on this box. Two of these racing is not a
+# slow run, it is a corrupt one: the cleanup below cannot tell a leaked container
+# from a live trial's, so the second launch force-removes the first launch's task
+# container and harbor blocks forever in epoll_wait on a container that no longer
+# exists -- empty trial.log, no error, no timeout. That happened once already,
+# when a launch command that appeared to hang was in fact still queued and fired
+# nine minutes later into a box that had since been relaunched by hand.
+#
+# argv[0], not a cmdline grep: the shell running this very script carries
+# "benchmark.py" in its own arguments, so a substring match finds itself and
+# every run refuses to start.
+running=$(ps -eo args= | grep -ac "^[^ ]*python3* scripts/benchmark.py")
+if [ "$running" -gt 0 ]; then
+  echo "=== $(date -u +%H:%M:%SZ) [$LABEL] REFUSING: $running benchmark.py already running here."
+  exit 2
+fi
+
 # Leaked containers from an earlier run keep holding CPU, which makes the real
-# concurrency higher than -n claims and quietly breaks the -n match.
+# concurrency higher than -n claims and quietly breaks the -n match. Safe only
+# because of the guard above.
 docker ps --format '{{.Names}}' | grep -v '^buzz-benchmark-' \
   | xargs -r docker rm -f > /dev/null 2>&1 || true
 
