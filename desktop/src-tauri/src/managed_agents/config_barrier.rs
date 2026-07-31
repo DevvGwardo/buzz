@@ -65,34 +65,42 @@ pub async fn run_boot_barrier(app: &tauri::AppHandle) {
     // Single-flight: only the first caller to claim InProgress runs the
     // barrier. If the state is already InProgress (spawn_event_sync's
     // reconcile is in-flight) or Ready, skip.
-    if !config_sync_readiness::claim_in_progress() {
+    let Some(claim) = config_sync_readiness::claim_in_progress() else {
         return;
-    }
+    };
 
-    run_boot_barrier_enforcing(app).await;
+    run_boot_barrier_enforcing(app, claim).await;
 }
 
 /// Execute the barrier enforcement assuming the caller already claimed
 /// `InProgress`.
 ///
-/// Called from `spawn_event_sync` after reconcile completes. The caller holds
-/// `InProgress` through the entire reconcile+barrier window, preventing any
-/// concurrent flush tick from certifying readiness against the pre-reconcile
-/// database state. This function never calls `claim_in_progress` — ownership
-/// is the caller's invariant.
+/// Called from `spawn_event_sync` after reconcile completes, and from
+/// `apply_workspace` (via `spawn_event_sync_with_held_claim`) after legacy
+/// migration + reconcile. The caller holds a [`ReadinessClaim`] through the
+/// entire reconcile+barrier window, preventing any concurrent flush tick from
+/// running its own barrier against the pre-reconcile database state.
 ///
 /// On success: transitions to `Ready(db_path)`. On any error: resets to
 /// `Unready` (fail-closed, retryable on the next flush tick).
-pub(crate) async fn run_boot_barrier_after_claim(app: &tauri::AppHandle) {
-    run_boot_barrier_enforcing(app).await;
+pub(crate) async fn run_boot_barrier_after_claim(
+    app: &tauri::AppHandle,
+    claim: super::config_sync_readiness::ReadinessClaim,
+) {
+    run_boot_barrier_enforcing(app, claim).await;
 }
 
 /// Shared enforcement body: scope resolution, relay lookups, decision pass.
 ///
-/// Caller must own `InProgress` (either via `claim_in_progress` in
-/// `run_boot_barrier`, or via the pre-spawn claim in `spawn_event_sync` passed
-/// through `run_boot_barrier_after_claim`).
-async fn run_boot_barrier_enforcing(app: &tauri::AppHandle) {
+/// Takes ownership of the `ReadinessClaim` RAII guard. On the success path,
+/// the guard is resolved before `mark_ready` sets the final state. On any
+/// error path (including panics), the guard's `Drop` impl resets to `Unready`
+/// — so a panic inside `run_boot_barrier_for_scope` can never leave the latch
+/// permanently wedged at `InProgress`.
+async fn run_boot_barrier_enforcing(
+    app: &tauri::AppHandle,
+    claim: super::config_sync_readiness::ReadinessClaim,
+) {
     use super::config_sync_readiness;
 
     let state = app.state::<AppState>();
@@ -100,13 +108,15 @@ async fn run_boot_barrier_enforcing(app: &tauri::AppHandle) {
         Ok(scope) => scope,
         Err(error) => {
             tracing::warn!(target: "buzz::config_sync", %error, "boot barrier skipped: no active scope");
-            config_sync_readiness::mark_unready();
+            // claim drops here → mark_unready via RAII
             return;
         }
     };
 
     match run_boot_barrier_for_scope(app, &state, &scope).await {
         Ok(()) => {
+            // Resolve the claim so the RAII drop does not reset to Unready.
+            claim.resolve();
             config_sync_readiness::mark_ready(scope.db_path.clone());
             tracing::info!(
                 target: "buzz::config_sync",
@@ -116,7 +126,8 @@ async fn run_boot_barrier_enforcing(app: &tauri::AppHandle) {
         }
         Err(error) => {
             tracing::warn!(target: "buzz::config_sync", %error, "boot barrier failed; scope stays closed for retry");
-            config_sync_readiness::mark_unready();
+            // claim drops here → mark_unready via RAII (explicit call would
+            // double-reset, but that is idempotent; RAII is the safety net).
         }
     }
 }

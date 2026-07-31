@@ -217,20 +217,23 @@ pub async fn apply_workspace(
     // collapse every community into one pending-event store.
     match crate::managed_agents::retention::active_retention_scope(&restore_app, &state) {
         Ok(scope) => {
-            // Clear the readiness latch before spawning so the new scope is
-            // unready until its own boot barrier completes. Without this,
-            // a prior scope's latch could let the new scope's flush loop
-            // publish before its gate has run.
-            crate::managed_agents::config_sync_readiness::mark_unready();
+            // Preempt the readiness latch from any state (including a prior
+            // scope's Ready) and hold InProgress across the entire sequence:
+            // legacy migration → reconcile → barrier. This closes the window
+            // between the old mark_unready() and spawn_event_sync's inner CAS,
+            // during which the flush loop could win the claim and certify
+            // readiness against pre-migration, pre-reconcile database state.
+            let claim = crate::managed_agents::config_sync_readiness::force_claim_in_progress();
             // Adopt whatever the pre-scoping release left queued in the global
             // retention database BEFORE the scoped reconcile and flush run, so
             // stranded tombstones and archive requests publish on this boot
             // instead of being abandoned by the storage cutover.
             migrate_legacy_retention_into(&restore_app, &scope);
-            crate::event_sync::spawn_event_sync(
+            crate::event_sync::spawn_event_sync_with_held_claim(
                 restore_app.clone(),
                 scope.owner_keys,
                 scope.db_path,
+                claim,
             )
         }
         Err(error) => {
