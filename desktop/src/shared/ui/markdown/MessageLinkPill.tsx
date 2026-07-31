@@ -1,3 +1,4 @@
+import { canReadMessageEmbedSource } from "@/features/messages/lib/messageEmbed";
 import { cn } from "@/shared/lib/cn";
 import {
   MENTION_CHIP_BASE_CLASSES,
@@ -14,15 +15,20 @@ export function MessageLinkPill({
   onOpenMessageLink,
 }: MessageLinkPillProps) {
   const channel = channels.find((c) => c.id === link.channelId);
-  const channelLabel = channel?.name ?? "channel";
+  const canRead = canReadMessageEmbedSource(channel);
+  const channelLabel = canRead
+    ? (channel?.name ?? "channel")
+    : "private channel";
   const shortId = link.messageId.slice(0, 6);
-  const label = (
+  const label = canRead ? (
     <>
       #{channelLabel} · {shortId}
     </>
+  ) : (
+    <>Private message</>
   );
 
-  if (!interactive) {
+  if (!interactive || !canRead) {
     return <span data-message-link="">{label}</span>;
   }
 
