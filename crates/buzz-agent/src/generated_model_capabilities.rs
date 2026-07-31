@@ -98,6 +98,7 @@ pub fn lookup_exact(provider: &str, raw_model_id: &str) -> Option<CapabilityResu
     match (provider, raw_model_id) {
         ("databricks_v2", "databricks-gpt-5-4-mini") => {
             // provenance: exact(databricks_v2::databricks-gpt-5-4-mini)
+            //   registry_label: exact_record
             //   supported_efforts: exact_record
             //   databricks_v2_wire_route: family:openai-gpt5-4@15
             //   thinking_mode: family:openai-gpt5-4@15
@@ -118,6 +119,7 @@ pub fn lookup_exact(provider: &str, raw_model_id: &str) -> Option<CapabilityResu
         }
         ("databricks_v2", "databricks-gpt-5-4-nano") => {
             // provenance: exact(databricks_v2::databricks-gpt-5-4-nano)
+            //   registry_label: exact_record
             //   supported_efforts: exact_record
             //   databricks_v2_wire_route: family:openai-gpt5-4@15
             //   thinking_mode: family:openai-gpt5-4@15
@@ -138,6 +140,7 @@ pub fn lookup_exact(provider: &str, raw_model_id: &str) -> Option<CapabilityResu
         }
         ("databricks_v2", "databricks-gpt-5-6-sol") => {
             // provenance: exact(databricks_v2::databricks-gpt-5-6-sol)
+            //   registry_label: exact_record
             //   supported_efforts: exact_record
             //   databricks_v2_wire_route: family:openai-gpt5-6@15
             //   thinking_mode: family:openai-gpt5-6@15
@@ -161,6 +164,7 @@ pub fn lookup_exact(provider: &str, raw_model_id: &str) -> Option<CapabilityResu
         }
         ("databricks_v2", "databricks-gpt-5-5") => {
             // provenance: exact(databricks_v2::databricks-gpt-5-5)
+            //   registry_label: exact_record
             //   supported_efforts: family:openai-gpt5-5@15
             //   databricks_v2_wire_route: family:openai-gpt5-5@15
             //   thinking_mode: family:openai-gpt5-5@15
@@ -183,6 +187,7 @@ pub fn lookup_exact(provider: &str, raw_model_id: &str) -> Option<CapabilityResu
         }
         ("databricks_v2", "databricks-claude-opus-4-7") => {
             // provenance: exact(databricks_v2::databricks-claude-opus-4-7)
+            //   registry_label: exact_record
             //   supported_efforts: family:anthropic-adaptive-xhigh-opus-4-7@10
             //   databricks_v2_wire_route: family:anthropic-adaptive-xhigh-opus-4-7@10
             //   thinking_mode: family:anthropic-adaptive-xhigh-opus-4-7@10
@@ -1165,38 +1170,8 @@ pub const THINKING_EFFORT_VALUES: &[&str] =
 
 /// Databricks v2 known model IDs. Mirrors goose DATABRICKS_V2_KNOWN_MODELS.
 /// Single source of truth inside buzz; generated from manifest databricks_v2_known_models section.
-pub const DATABRICKS_V2_KNOWN_MODELS: &[&str] = &[
-    "databricks-claude-haiku-4-5",
-    "databricks-claude-opus-4-1",
-    "databricks-claude-opus-4-5",
-    "databricks-claude-opus-4-6",
-    "databricks-claude-opus-4-7",
-    "databricks-claude-sonnet-4",
-    "databricks-claude-sonnet-4-5",
-    "databricks-claude-sonnet-4-6",
-    "databricks-gemini-2-5-flash",
-    "databricks-gemini-2-5-pro",
-    "databricks-gemini-3-1-flash-lite",
-    "databricks-gemini-3-1-pro",
-    "databricks-gemini-3-flash",
-    "databricks-gemini-3-pro",
-    "databricks-glm-5-2",
-    "databricks-gpt-5",
-    "databricks-gpt-5-1",
-    "databricks-gpt-5-2",
-    "databricks-gpt-5-4",
-    "databricks-gpt-5-4-mini",
-    "databricks-gpt-5-4-nano",
-    "databricks-gpt-5-5",
-    "databricks-gpt-5-6-luna",
-    "databricks-gpt-5-6-sol",
-    "databricks-gpt-5-6-terra",
-    "databricks-gpt-5-mini",
-    "databricks-gpt-5-nano",
-    "databricks-gpt-oss-120b",
-    "databricks-gpt-oss-20b",
-    "databricks-kimi-k2-7-code",
-];
+pub const DATABRICKS_V2_KNOWN_MODELS: &[&str] =
+    &["databricks-gpt-5-5", "databricks-claude-opus-4-7"];
 
 /// Databricks endpoint-ID to display-name registry. Generated from manifest registry_labels section.
 /// Feeds the static registry tier of resolveModelLabel(). Final display label is determined

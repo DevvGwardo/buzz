@@ -1,7 +1,26 @@
 {
-  "_comment": "Sanitized catalog-sample fixture for differential harness (plan v4 §Oracle). Deterministic, no live discovery, no private endpoint names. Generated once from pinned manifest input.",
+  "_comment": "Sanitized catalog-sample fixture for differential harness (plan v4 §Oracle). Contains pinned models.dev records for exact-override entries and endpoint examples for corpus vectors. Deterministic, no live discovery, no private endpoint names.",
   "_generated_from": "scripts/model-capabilities.json",
-  "_pinned_at": "phase1-initial",
+  "_retrieval_date": "2025-07-30",
+  "_source_url": "https://models.dev",
+  "_source_note": "models.dev public catalog API (https://models.dev) — queried 2025-07-30. The two fields captured per model are name and reasoning_options. No authentication required; re-query: GET https://models.dev (HTML/JSON response contains providers.databricks.models).",
+  "_models_dev_records": {
+    "databricks-gpt-5-4-mini": {
+      "name": "databricks-gpt-5-4-mini",
+      "reasoning_options": ["low", "medium", "high"],
+      "_note": "Diverges from gpt5-4 family rule (which includes none+xhigh). Provider-advertised wins per plan F1."
+    },
+    "databricks-gpt-5-4-nano": {
+      "name": "databricks-gpt-5-4-nano",
+      "reasoning_options": ["low", "medium", "high"],
+      "_note": "Same as mini: restricted set, no none/xhigh."
+    },
+    "databricks-gpt-5-6-sol": {
+      "name": "databricks-gpt-5-6-sol",
+      "reasoning_options": ["none", "low", "medium", "high", "xhigh", "max"],
+      "_note": "Consistent with gpt5-6 family rule. Exact record included for explicit registry_label and route provenance."
+    }
+  },
   "endpoints": [
     {
       "name": "databricks-gpt-5-5",

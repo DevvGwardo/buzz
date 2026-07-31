@@ -3,11 +3,13 @@
  * Per-interpreter mutation evidence runner.
  *
  * Introduces deliberate resolver faults into the manifest, regenerates artifacts,
- * and verifies the shared normative corpus detects every fault in both the JS and
- * Rust interpreters. Exits 0 if all mutations are killed; exits 1 if any survive.
+ * and verifies the shared normative corpus detects every fault in BOTH the generated
+ * TypeScript interpreter (via --experimental-strip-types import) and the Rust
+ * interpreter (via cargo test shared-corpus harness). Exits 0 if all mutations are
+ * killed in both interpreters; exits 1 if any survive.
  *
  * Usage:
- *   node scripts/run-mutation-evidence.mjs [--verbose]
+ *   node --experimental-strip-types scripts/run-mutation-evidence.mjs [--verbose]
  *
  * This script is non-CI (run manually to generate MUTATION_EVIDENCE.md). It writes
  * its findings to stdout in a format suitable for copy-paste into the evidence doc.
@@ -29,34 +31,62 @@
  *       resolver-prefixed-alias-misses-exact vector.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..");
 const VERBOSE = process.argv.includes("--verbose");
 
 const manifestPath = join(repoRoot, "scripts", "model-capabilities.json");
-const corpusPath = join(repoRoot, "scripts", "normative-corpus.json");
 const generatorPath = join(repoRoot, "scripts", "generate-model-capabilities.mjs");
 const jsRunnerPath = join(repoRoot, "scripts", "run-corpus.mjs");
 
 const originalManifest = readFileSync(manifestPath, "utf8");
 
-function runJsCorpus() {
+function runTsCorpus() {
   try {
-    execSync(`node "${jsRunnerPath}"`, { cwd: repoRoot, stdio: VERBOSE ? "inherit" : "pipe" });
-    return { passed: true };
-  } catch (e) {
-    const output = (e.stdout?.toString() ?? "") + (e.stderr?.toString() ?? "");
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", jsRunnerPath],
+      { cwd: repoRoot, encoding: "utf8" },
+    );
+    if (result.status === 0) return { passed: true };
+    const output = (result.stdout ?? "") + (result.stderr ?? "");
     return { passed: false, output };
+  } catch (e) {
+    return { passed: false, output: e.message };
+  }
+}
+
+function runRustCorpus() {
+  try {
+    const result = spawnSync(
+      "cargo",
+      [
+        "test",
+        "-p", "buzz-agent",
+        "--",
+        "generated_model_capabilities::tests::shared_corpus_tests",
+        "--nocapture",
+      ],
+      { cwd: repoRoot, encoding: "utf8", env: { ...process.env, RUST_BACKTRACE: "0" } },
+    );
+    if (result.status === 0) return { passed: true };
+    const output = (result.stdout ?? "") + (result.stderr ?? "");
+    return { passed: false, output };
+  } catch (e) {
+    return { passed: false, output: e.message };
   }
 }
 
 function regen() {
-  execSync(`node "${generatorPath}"`, { cwd: repoRoot, stdio: VERBOSE ? "inherit" : "pipe" });
+  execSync(`"${process.execPath}" "${generatorPath}"`, {
+    cwd: repoRoot,
+    stdio: VERBOSE ? "inherit" : "pipe",
+  });
 }
 
 function restore() {
@@ -139,23 +169,32 @@ let allKilled = true;
 const results = [];
 
 for (const mut of mutations) {
-  process.stdout.write(`  ${mut.id}: ${mut.description} ... `);
+  process.stdout.write(`  ${mut.id}: ${mut.description}\n`);
   try {
     applyMutation(mut.mutate);
     regen();
-    const jsResult = runJsCorpus();
-    if (jsResult.passed) {
-      process.stdout.write("SURVIVED (mutation not killed by corpus!)\n");
-      allKilled = false;
-      results.push({ ...mut, killed: false, output: jsResult.output });
-    } else {
-      process.stdout.write("killed ✓\n");
-      results.push({ ...mut, killed: true });
-    }
+
+    // TS interpreter
+    process.stdout.write(`    TS  ... `);
+    const tsResult = runTsCorpus();
+    const tsKilled = !tsResult.passed;
+    process.stdout.write(tsKilled ? "killed ✓\n" : "SURVIVED ✗\n");
+    if (VERBOSE && !tsKilled) process.stdout.write(`      ${tsResult.output}\n`);
+
+    // Rust interpreter
+    process.stdout.write(`    Rust... `);
+    const rustResult = runRustCorpus();
+    const rustKilled = !rustResult.passed;
+    process.stdout.write(rustKilled ? "killed ✓\n" : "SURVIVED ✗\n");
+    if (VERBOSE && !rustKilled) process.stdout.write(`      ${rustResult.output}\n`);
+
+    const killed = tsKilled && rustKilled;
+    if (!killed) allKilled = false;
+    results.push({ ...mut, killed, tsKilled, rustKilled });
   } catch (e) {
-    process.stdout.write(`ERROR: ${e.message}\n`);
+    process.stdout.write(`    ERROR: ${e.message}\n`);
     allKilled = false;
-    results.push({ ...mut, killed: false, output: e.message });
+    results.push({ ...mut, killed: false, tsKilled: false, rustKilled: false, output: e.message });
   } finally {
     restore();
     regen(); // restore generated files
@@ -163,11 +202,12 @@ for (const mut of mutations) {
 }
 
 console.log("");
-console.log(`Mutation results: ${results.filter(r => r.killed).length}/${results.length} killed`);
+const killed = results.filter(r => r.killed).length;
+console.log(`Mutation results: ${killed}/${results.length} killed (both interpreters)`);
 
 if (!allKilled) {
   console.error("ERROR: Some mutations survived — corpus does not kill all resolver faults.");
   process.exit(1);
 }
 
-console.log("All mutations killed — corpus provides adequate coverage of resolver faults.");
+console.log("All mutations killed in both TS and Rust interpreters.");

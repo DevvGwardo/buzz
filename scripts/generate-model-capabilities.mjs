@@ -5,7 +5,7 @@
  * Reads `scripts/model-capabilities.json` and emits:
  *   - `crates/buzz-agent/src/generated_model_capabilities.rs`
  *   - `desktop/src/features/agents/ui/modelCapabilities.ts`
- *   - `scripts/generated-model-capabilities-coverage.json` (full-table test fixture)
+ *   - `scripts/generated-model-capabilities-coverage.json` (snapshot/drift fixture — full-table resolver output, diff-checked by CI)
  *
  * The generator performs three ordered resolution steps (resolver contract, plan v4):
  *   1. Provider-qualified raw exact lookup — key is (provider, raw_model_id), matched
@@ -32,19 +32,28 @@ import { spawnSync } from "node:child_process";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..");
 const CHECK_MODE = process.argv.includes("--check");
+const CHECK_GOOSE_MODE = process.argv.includes("--check-goose");
 
 // Run content through rustfmt (stdin → stdout) if available; fall back to raw.
 // Uses hermit-pinned rustfmt from bin/ when present (same binary as pre-commit hook).
 function rustfmt(content) {
   const hermitBin = join(repoRoot, "bin", "rustfmt");
-  const rustfmtBin = existsSync(hermitBin) ? hermitBin : "rustfmt";
+  const hermitExists = existsSync(hermitBin);
+  const rustfmtBin = hermitExists ? hermitBin : "rustfmt";
   const result = spawnSync(rustfmtBin, ["--edition", "2021", "--emit", "stdout"], {
     input: content,
     encoding: "utf8",
     maxBuffer: 10 * 1024 * 1024,
   });
   if (result.status === 0 && result.stdout) return result.stdout;
-  // rustfmt unavailable or failed — return raw (CI's diff check will catch any drift)
+  if (hermitExists && result.status !== 0) {
+    // Hermit-pinned binary is present but failed — fail closed so CI catches drift.
+    const stderr = result.stderr ?? "";
+    throw new Error(`rustfmt (hermit-pinned) exited ${result.status}: ${stderr.trim()}`);
+  }
+  // rustfmt not available (PATH fallback also absent) — warn and return raw.
+  // CI's regen-diff gate will catch any drift.
+  process.stderr.write("warning: rustfmt not available; raw Rust output may not be formatter-stable\n");
   return content;
 }
 
@@ -65,11 +74,38 @@ const outputDirOverride = (() => {
 const manifestPath = manifestPathOverride ?? join(repoRoot, "scripts", "model-capabilities.json");
 const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
 
-// Validate registry_labels uniqueness
-const registryLabelKeys = Object.keys(manifest.registry_labels ?? {});
-const registryLabelSet = new Set(registryLabelKeys);
-if (registryLabelSet.size !== registryLabelKeys.length) {
-  throw new Error("registry_labels: duplicate endpoint IDs detected");
+// Validate registry_labels — must be an array of {id, label} objects with unique IDs.
+// JSON.parse() silently overwrites duplicate object keys, so an array is required for
+// structural duplicate detection.
+const registryLabelsArr = manifest.registry_labels ?? [];
+if (!Array.isArray(registryLabelsArr)) {
+  throw new Error("registry_labels: must be an array of {id, label} objects");
+}
+for (const entry of registryLabelsArr) {
+  if (!entry.id || typeof entry.id !== "string" || entry.id.trim() === "") {
+    throw new Error(`registry_labels: entry missing nonempty string "id": ${JSON.stringify(entry)}`);
+  }
+  if (!entry.label || typeof entry.label !== "string" || entry.label.trim() === "") {
+    throw new Error(`registry_labels: entry id="${entry.id}" missing nonempty string "label"`);
+  }
+  // Safe for code interpolation: reject double-quote, backslash, and control chars.
+  // (These characters would break emitted Rust/TS string literals.)
+  const unsafeId = entry.id.includes('"') || entry.id.includes("\\") ||
+    Array.from(entry.id).some((c) => c.charCodeAt(0) < 32);
+  if (unsafeId) {
+    throw new Error(`registry_labels: entry id="${entry.id}" contains unsafe characters`);
+  }
+  const unsafeLabel = entry.label.includes('"') || entry.label.includes("\\") ||
+    Array.from(entry.label).some((c) => c.charCodeAt(0) < 32);
+  if (unsafeLabel) {
+    throw new Error(`registry_labels: entry id="${entry.id}" label contains unsafe characters`);
+  }
+}
+const registryLabelIds = registryLabelsArr.map((e) => e.id);
+const registryLabelSet = new Set(registryLabelIds);
+if (registryLabelSet.size !== registryLabelIds.length) {
+  const dups = registryLabelIds.filter((id, i) => registryLabelIds.indexOf(id) !== i);
+  throw new Error(`registry_labels: duplicate endpoint IDs detected: ${dups.join(", ")}`);
 }
 
 // Validate databricks_v2_known_models uniqueness
@@ -79,6 +115,88 @@ if (knownModelsSet.size !== knownModels.length) {
   throw new Error(`databricks_v2_known_models: duplicate IDs detected: ${
     knownModels.filter((id, i) => knownModels.indexOf(id) !== i).join(", ")
   }`);
+}
+
+// ---------------------------------------------------------------------------
+// --check-goose: optional drift check against pinned goose upstream
+// ---------------------------------------------------------------------------
+//
+// Reads the goose source file at the pinned revision and verifies that
+// manifest.databricks_v2_known_models exactly matches the IDs declared there.
+//
+// Usage (non-CI, opt-in):
+//   node scripts/generate-model-capabilities.mjs --check-goose
+//
+// Pin metadata lives in manifest._sources.goose_known_models:
+//   "goose revision <SHA> (<path>:<lines>) — <ids>"
+//
+// The check fetches the raw file from github.com/block/goose via the GitHub
+// contents API and parses DATABRICKS_V2_KNOWN_MODELS from it.
+// ---------------------------------------------------------------------------
+
+if (CHECK_GOOSE_MODE) {
+  // Parse pin metadata from _sources
+  const pin = manifest._sources?.goose_known_models;
+  if (!pin) {
+    console.error("--check-goose: manifest._sources.goose_known_models is missing.");
+    process.exit(1);
+  }
+  const revMatch = pin.match(/revision\s+([0-9a-f]{7,40})/i);
+  const pathMatch = pin.match(/\(([^)]+\.rs):/);
+  if (!revMatch || !pathMatch) {
+    console.error(`--check-goose: could not parse revision/path from pin metadata: ${pin}`);
+    process.exit(1);
+  }
+  const pinnedRev = revMatch[1];
+  const goosePath = pathMatch[1]; // e.g. "crates/goose-providers/src/databricks_v2.rs"
+
+  // Fetch file content from GitHub API (no token required for public repos)
+  const url = `https://raw.githubusercontent.com/block/goose/${pinnedRev}/${goosePath}`;
+  let fileContent;
+  try {
+    const result = spawnSync("curl", ["-fsS", "--max-time", "15", url], {
+      encoding: "utf8",
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    if (result.status !== 0) {
+      console.error(`--check-goose: curl failed (exit ${result.status}): ${result.stderr?.trim()}`);
+      console.error(`  URL: ${url}`);
+      process.exit(1);
+    }
+    fileContent = result.stdout;
+  } catch (e) {
+    console.error(`--check-goose: fetch failed: ${e.message}`);
+    process.exit(1);
+  }
+
+  // Extract DATABRICKS_V2_KNOWN_MODELS from Rust source: parse &[&str] literal
+  // Pattern: pub const DATABRICKS_V2_KNOWN_MODELS: &[&str] = &[ "id1", "id2", ... ];
+  const constMatch = fileContent.match(
+    /DATABRICKS_V2_KNOWN_MODELS\s*:\s*&\[&str\]\s*=\s*&\[([\s\S]*?)\];/,
+  );
+  if (!constMatch) {
+    console.error(`--check-goose: could not find DATABRICKS_V2_KNOWN_MODELS in goose source at ${pinnedRev}:${goosePath}`);
+    process.exit(1);
+  }
+  const gooseIds = [...constMatch[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort();
+  const manifestIds = [...(manifest.databricks_v2_known_models ?? [])].sort();
+
+  const onlyInGoose = gooseIds.filter((id) => !manifestIds.includes(id));
+  const onlyInManifest = manifestIds.filter((id) => !gooseIds.includes(id));
+
+  if (onlyInGoose.length === 0 && onlyInManifest.length === 0) {
+    console.log(`--check-goose: OK — manifest matches goose@${pinnedRev} (${gooseIds.length} IDs)`);
+  } else {
+    if (onlyInGoose.length > 0) {
+      console.error(`--check-goose: DRIFT — IDs in goose@${pinnedRev} not in manifest: ${onlyInGoose.join(", ")}`);
+    }
+    if (onlyInManifest.length > 0) {
+      console.error(`--check-goose: DRIFT — IDs in manifest not in goose@${pinnedRev}: ${onlyInManifest.join(", ")}`);
+    }
+    console.error(`Pin: ${pin}`);
+    process.exit(1);
+  }
+  process.exit(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +422,7 @@ function resolve(provider, rawModelId) {
     const modeFromExact = exactRecord.thinking_mode !== undefined;
     const normFromExact = exactRecord.normalization_policy !== undefined;
     const effortDefaultFromExact = exactRecord.default_effort !== undefined;
+    const labelFromExact = exactRecord.registry_label !== undefined;
     const familyProv = familyResult
       ? { rule_id: familyResult._provenance.rule_id, rule_priority: familyResult._provenance.rule_priority }
       : null;
@@ -317,6 +436,7 @@ function resolve(provider, rawModelId) {
       _provenance: {
         source: "exact",
         exact_key: `${provider}::${rawModelId}`,
+        registry_label: labelFromExact ? "exact_record" : (familyProv ? `family:${familyProv.rule_id}@${familyProv.rule_priority}` : "absent"),
         supported_efforts: effortsFromExact ? "exact_record" : (familyProv ? `family:${familyProv.rule_id}@${familyProv.rule_priority}` : "fallback"),
         databricks_v2_wire_route: routeFromExact ? "exact_record" : (familyProv ? `family:${familyProv.rule_id}@${familyProv.rule_priority}` : "fallback"),
         thinking_mode: modeFromExact ? "exact_record" : (familyProv ? `family:${familyProv.rule_id}@${familyProv.rule_priority}` : "fallback"),
@@ -380,7 +500,10 @@ function getProviderFallback(provider, isBlank) {
 }
 
 // ---------------------------------------------------------------------------
-// Build full-table coverage fixture
+// Build full-table snapshot/drift fixture
+// Every (provider, model) pair that can be reached by any manifest rule is resolved
+// and written here. CI diffs this against the committed copy — any resolver output
+// change for any input shows up as a diff, catching silent behavior shifts.
 // ---------------------------------------------------------------------------
 
 const allEntries = [];
@@ -524,6 +647,7 @@ for (const rec of manifest.exact_records ?? []) {
         if (p.source !== "exact") return `// source: ${p.source}`;
         return [
           `// provenance: exact(${p.exact_key})`,
+          `//   registry_label: ${p.registry_label}`,
           `//   supported_efforts: ${p.supported_efforts}`,
           `//   databricks_v2_wire_route: ${p.databricks_v2_wire_route}`,
           `//   thinking_mode: ${p.thinking_mode}`,
@@ -786,8 +910,8 @@ ${manifest.databricks_v2_known_models
 /// Feeds the static registry tier of resolveModelLabel(). Final display label is determined
 /// by the three-tier precedence in resolveModelLabel() (discovered_name > registry_label > raw_id).
 pub const DATABRICKS_MODEL_NAMES: &[(&str, &str)] = &[
-${Object.entries(manifest.registry_labels ?? {})
-  .map(([id, label]) => `    ("${id}", "${label}"),`)
+${registryLabelsArr
+  .map(({ id, label }) => `    ("${id}", "${label}"),`)
   .join("\n")}
 ];
 `;
@@ -1141,8 +1265,8 @@ ${manifest.databricks_v2_known_models
 /** Databricks endpoint-ID to display-name registry. Generated from manifest registry_labels section.
  *  Feeds the static registry tier of resolveModelLabel(). */
 export const DATABRICKS_MODEL_NAMES: Map<string, string> = new Map([
-${Object.entries(manifest.registry_labels ?? {})
-  .map(([id, label]) => `  ["${id}", "${label}"],`)
+${registryLabelsArr
+  .map(({ id, label }) => `  ["${id}", "${label}"],`)
   .join("\n")}
 ]);
 
@@ -1294,7 +1418,7 @@ const outputs = [
       ? join(outputDirOverride, "generated-model-capabilities-coverage.json")
       : join(repoRoot, "scripts", "generated-model-capabilities-coverage.json"),
     content: JSON.stringify(allEntries, null, 2) + "\n",
-    label: "Coverage fixture",
+    label: "Coverage snapshot/drift fixture",
   },
 ];
 

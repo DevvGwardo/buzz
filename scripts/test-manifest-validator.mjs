@@ -312,4 +312,60 @@ test("schema-negative: family rule missing id is rejected", () => {
   );
 });
 
+// ---------------------------------------------------------------------------
+// Rule: duplicate registry_label IDs
+// ---------------------------------------------------------------------------
+test("schema-negative: duplicate registry_label ID is rejected", () => {
+  assertRejects(
+    "duplicate registry_label ID",
+    mutate((m) => {
+      // Array format — duplicate id is structurally detectable
+      m.registry_labels = [
+        { id: "databricks-gpt-5-5", label: "GPT-5.5" },
+        { id: "databricks-gpt-5-5", label: "GPT-5.5 duplicate" },
+      ];
+    }),
+    "duplicate",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Rule: registry_label entry missing id (empty string)
+// ---------------------------------------------------------------------------
+test("schema-negative: registry_label entry with empty id is rejected", () => {
+  assertRejects(
+    "registry_label empty id",
+    mutate((m) => {
+      m.registry_labels = [{ id: "", label: "Some Label" }];
+    }),
+    "id",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Rule: registry_label entry with unsafe characters in id
+// ---------------------------------------------------------------------------
+test("schema-negative: registry_label entry with unsafe id chars is rejected", () => {
+  assertRejects(
+    "registry_label unsafe id",
+    mutate((m) => {
+      m.registry_labels = [{ id: 'bad"id', label: "Some Label" }];
+    }),
+    "unsafe",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Rule: duplicate databricks_v2_known_models IDs
+// ---------------------------------------------------------------------------
+test("schema-negative: duplicate databricks_v2_known_models ID is rejected", () => {
+  assertRejects(
+    "duplicate known model ID",
+    mutate((m) => {
+      m.databricks_v2_known_models = ["databricks-gpt-5-5", "databricks-gpt-5-5"];
+    }),
+    "duplicate",
+  );
+});
+
 console.log("\nSchema-negative validator tests complete.");
