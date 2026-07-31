@@ -378,20 +378,26 @@ pub(crate) async fn restore_mesh_sharing(app: &AppHandle, state: &AppState) -> C
     let started = mesh_llm::DesktopMeshRuntime::start(request)
         .await
         .map_err(|error| format!("failed to restore Share Compute: {error:#}"))?;
-    if let Err(error) = wait_for_mesh_inference(&config.model_id).await {
-        let cleanup = started.stop().await;
-        if let Err(cleanup_error) = cleanup {
-            eprintln!(
-                "buzz-mesh: restored node failed inference readiness and cleanup was incomplete: {cleanup_error:#}"
-            );
-        }
-        return Err(format!("failed to restore Share Compute: {error}"));
-    }
+    // Install the restored runtime immediately: it is tracked by AppState from
+    // here on, so it can never be orphaned. Restoring a previously
+    // inference-ready node still has to load ~tens of GB of weights and may
+    // download package layers after the ports bind, and the readiness probe
+    // itself serializes behind any first inference. None of that is a failed
+    // restore — stopping the node and reporting failure (the old behaviour)
+    // tore down a node that was simply still warming up. The checkpoint stays
+    // armed (`enabled`), so a genuinely broken restore is retried next launch
+    // rather than silently turning Share Compute off.
     *runtime = Some(started);
     config.enabled = true;
     config.start_on_next_launch = false;
     save_mesh_sharing_config(app, &config)?;
     drop(runtime);
+    if let Err(error) = wait_for_mesh_inference(&config.model_id).await {
+        eprintln!(
+            "buzz-mesh: restored node is not inference-ready yet ({error}); \
+             leaving it to warm up without tearing it down"
+        );
+    }
     mesh_llm::publish_current_status_once(app, "restore").await;
     Ok(())
 }
@@ -496,25 +502,34 @@ pub async fn mesh_start_node(
             ));
         }
     };
-    if let Some(config) = sharing_config.as_ref() {
-        if let Err(error) = wait_for_mesh_inference(&config.model_id).await {
-            let cleanup = started.stop().await;
-            if let Err(cleanup_error) = &cleanup {
-                eprintln!(
-                    "buzz-mesh: started node failed inference readiness and cleanup was incomplete: {cleanup_error:#}"
-                );
-            }
-            drop(runtime);
-            app.request_restart();
-            return Err(format!(
-                "mesh node started but inference never became ready: {error}; Buzz is restarting to guarantee cleanup"
-            ));
-        }
-    }
+    // Install the runtime BEFORE probing inference readiness so it is always
+    // tracked by AppState and can never become an orphaned listener. The old
+    // code deferred the install until after the probe and, on a readiness
+    // timeout, stopped the node and restarted the whole app "to guarantee
+    // cleanup". But a readiness timeout is not a dead node: mesh binds its
+    // ports after primary weights load while package layers keep downloading,
+    // it serializes all ingress HTTP (including this readiness probe) behind
+    // any in-flight inference, and a cold download can run for minutes. In all
+    // of those the node is alive and progressing, so the restart turned
+    // ordinary startup latency into a whole-app restart loop. Tracking the
+    // runtime removes the orphan risk the restart was guarding against.
     *runtime = Some(started);
     drop(runtime);
     if let Some(config) = sharing_config.as_ref() {
-        save_mesh_sharing_config(&app, config)?;
+        match wait_for_mesh_inference(&config.model_id).await {
+            // Only arm launch-restoration once the exact inference path agents
+            // use has actually answered.
+            Ok(()) => save_mesh_sharing_config(&app, config)?,
+            // Loading weights, downloading layers, or busy serving an earlier
+            // turn — all expected, none is death. Leave the tracked node
+            // running and warming up; never stop it and never restart the app.
+            // Launch-restoration stays disarmed (still the pending checkpoint)
+            // until a later start confirms real inference.
+            Err(error) => eprintln!(
+                "buzz-mesh: node started but inference is not ready yet ({error}); \
+                 leaving it to warm up without a restart"
+            ),
+        }
     }
     mesh_llm::publish_current_status_once(&app, "start").await;
     Ok(status)

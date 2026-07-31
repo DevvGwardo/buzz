@@ -149,8 +149,25 @@ fn should_evict_after_probe(
     probe: MeshIngressProbe,
     consecutive: u32,
 ) -> bool {
-    urgency == MeshRecoveryUrgency::Foreground && probe == MeshIngressProbe::PortClosed
-        || consecutive >= DEAD_PROBE_EVICT_THRESHOLD
+    // Only a CLOSED port is evidence of death. A bound-but-HTTP-unresponsive
+    // port ("Unhealthy") is a BUSY node, not a dead one: mesh serializes all
+    // HTTP on the ingress — including the `/v1/models` liveness probe — behind
+    // in-flight inference, so a large-prompt turn on a big model leaves the
+    // control plane unresponsive for the whole turn (measured ~27s on a
+    // gemma-4-26B node) while TCP-connect keeps answering in ~0ms. Model load
+    // and package-layer download are unresponsive in exactly the same way.
+    // Evicting on any of those turns ordinary backpressure into a destructive
+    // whole-app restart loop, which is the regression this fixes. A genuinely
+    // wedged bound port cannot be distinguished from a busy one without a
+    // lock-free health endpoint on the ingress (tracked upstream in mesh-llm);
+    // until that exists we never evict a bound port and rely solely on the
+    // unambiguous closed-port signal.
+    match probe {
+        MeshIngressProbe::Live | MeshIngressProbe::Unhealthy => false,
+        MeshIngressProbe::PortClosed => {
+            urgency == MeshRecoveryUrgency::Foreground || consecutive >= DEAD_PROBE_EVICT_THRESHOLD
+        }
+    }
 }
 
 fn requires_process_restart(
@@ -491,6 +508,44 @@ mod tests {
     }
 
     #[test]
+    fn watchdog_closed_port_still_evicts_after_consecutive_streak() {
+        // A genuinely dead listener (crashed / released its port) must still be
+        // reclaimed — the closed-port signal is unchanged by this fix.
+        assert!(!should_evict_after_probe(
+            MeshRecoveryUrgency::Watchdog,
+            MeshIngressProbe::PortClosed,
+            1
+        ));
+        assert!(should_evict_after_probe(
+            MeshRecoveryUrgency::Watchdog,
+            MeshIngressProbe::PortClosed,
+            DEAD_PROBE_EVICT_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn busy_or_loading_bound_port_is_never_evicted() {
+        // The regression this fixes: mesh serializes all ingress HTTP (incl.
+        // the `/v1/models` liveness probe) behind in-flight inference, so a
+        // large-prompt turn, a model load, or a layer download leaves the port
+        // bound-but-unresponsive ("Unhealthy"). No probe streak, and no
+        // urgency, may evict such a node — doing so restarts a node that is
+        // alive and working.
+        for consecutive in [1, 2, 5, 100] {
+            for urgency in [
+                MeshRecoveryUrgency::Watchdog,
+                MeshRecoveryUrgency::Foreground,
+            ] {
+                assert!(
+                    !should_evict_after_probe(urgency, MeshIngressProbe::Unhealthy, consecutive),
+                    "a bound-but-busy port must never evict (urgency={urgency:?}, \
+                     consecutive={consecutive})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn probe_streak_is_scoped_to_runtime_identity() {
         let state = MeshRecoveryState::default();
         assert_eq!(state.record_dead_probe(7), 1);
@@ -569,5 +624,40 @@ mod tests {
             format!("{MESH_REARM_ERROR_SENTINEL}offline").starts_with(MESH_REARM_ERROR_SENTINEL)
         );
         assert!(!"user note: shared compute config".starts_with(MESH_REARM_ERROR_SENTINEL));
+    }
+
+    // Black-box proof of the classification the eviction rule stands on. A
+    // mesh node busy in inference (or loading, or downloading) keeps its
+    // ingress TCP port accepting connections in ~0ms while HTTP does not answer
+    // within the probe timeout — measured directly against a gemma-4-26B node:
+    // a concurrent `/v1/models` took ~27s, queued behind one in-flight turn.
+    // This stands up exactly that shape — a listener that accepts then never
+    // replies — and asserts the probe reads `Unhealthy` (busy), the verdict
+    // `should_evict_after_probe` now refuses to evict on. If this regressed to
+    // `PortClosed`, a busy node would again be misread as dead and restarted.
+    #[tokio::test]
+    async fn bound_but_stalled_http_classifies_as_unhealthy_not_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        // Accept and hold connections open without ever writing a response —
+        // the wire-level equivalent of a node serializing HTTP behind a turn.
+        let accept_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream); // keep the socket open, never respond
+            }
+        });
+
+        let probe = probe_mesh_ingress_at(&format!("http://127.0.0.1:{port}/v1")).await;
+        accept_task.abort();
+
+        assert_eq!(
+            probe,
+            MeshIngressProbe::Unhealthy,
+            "a TCP-bound port that stalls HTTP (a busy/loading node) must read \
+             Unhealthy, never PortClosed — the eviction fix depends on this"
+        );
     }
 }
