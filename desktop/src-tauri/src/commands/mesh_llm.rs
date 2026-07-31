@@ -516,19 +516,24 @@ pub async fn mesh_start_node(
     *runtime = Some(started);
     drop(runtime);
     if let Some(config) = sharing_config.as_ref() {
-        match wait_for_mesh_inference(&config.model_id).await {
-            // Only arm launch-restoration once the exact inference path agents
-            // use has actually answered.
-            Ok(()) => save_mesh_sharing_config(&app, config)?,
-            // Loading weights, downloading layers, or busy serving an earlier
-            // turn — all expected, none is death. Leave the tracked node
-            // running and warming up; never stop it and never restart the app.
-            // Launch-restoration stays disarmed (still the pending checkpoint)
-            // until a later start confirms real inference.
-            Err(error) => eprintln!(
+        // The node is installed and tracked, so Share Compute IS on for this
+        // session — persist the enabled config immediately, mirroring the
+        // restore path. A big model can take minutes to load weights and
+        // download layers, well past the readiness probe's deadline; gating the
+        // save on that probe (the previous behaviour) meant a slow first start
+        // served fine this session but silently came back OFF next launch,
+        // while a retry was rejected because the runtime already existed.
+        // Arming on install is safe: neither the watchdog (evicts only a closed
+        // port) nor restore (leaves a warming-up node alone) can turn a
+        // slow-but-alive node into a restart loop, and a config that genuinely
+        // cannot start fails earlier in `DesktopMeshRuntime::start`, before this
+        // point. The readiness probe below is now purely informational.
+        save_mesh_sharing_config(&app, config)?;
+        if let Err(error) = wait_for_mesh_inference(&config.model_id).await {
+            eprintln!(
                 "buzz-mesh: node started but inference is not ready yet ({error}); \
-                 leaving it to warm up without a restart"
-            ),
+                 leaving it to warm up (Share Compute stays armed for next launch)"
+            );
         }
     }
     mesh_llm::publish_current_status_once(&app, "start").await;
