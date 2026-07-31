@@ -364,8 +364,7 @@ pub(crate) async fn restore_mesh_sharing(app: &AppHandle, state: &AppState) -> C
     }
     // This is restoration of a previously inference-ready serving node. Keep
     // the enabled checkpoint armed while restoring so a transient startup
-    // failure does not silently turn Share Compute off. New starts remain
-    // disarmed in `mesh_start_node` until their first inference probe passes.
+    // failure does not silently turn Share Compute off.
     let request = mesh_llm::StartMeshNodeRequest {
         mode: mesh_llm::MeshNodeMode::Serve,
         model_id: Some(config.model_id.clone()),
@@ -473,9 +472,11 @@ pub async fn mesh_start_node(
     }
 
     if let Some(config) = sharing_config.as_ref() {
-        // Do not arm launch restoration until the exact inference path used by
-        // agents succeeds. Mesh may bind its ports after primary weights load
-        // while package layers are still downloading.
+        // Persist a DISARMED checkpoint to cover the window of the potentially
+        // long `start()` below: if Buzz exits before the runtime is installed
+        // and tracked, the next launch stays stopped rather than trying to
+        // restore a node that never came up. The enabled config is armed right
+        // after install succeeds.
         save_mesh_sharing_config(&app, &pending_new_start_checkpoint(config))?;
     }
 

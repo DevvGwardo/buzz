@@ -177,10 +177,11 @@ fn requires_process_restart(
     startup_in_progress || mode == crate::mesh_llm::MeshNodeMode::Serve
 }
 
-/// Probe and, when justified, remove one stale runtime. A closed port is
-/// decisive for a foreground agent start; watchdog and ambiguous/unhealthy
-/// ports require consecutive failures to avoid restarting on a transient load
-/// spike.
+/// Probe and, when justified, remove one stale runtime. Only a CLOSED port is
+/// treated as death: a foreground agent start evicts immediately, the watchdog
+/// after a short consecutive-failure streak. A bound-but-unresponsive
+/// ("Unhealthy") port is never evicted — it is a busy or still-loading node,
+/// not a dead one (see `should_evict_after_probe`).
 pub(crate) async fn recover_stale_mesh_runtime(
     state: &AppState,
     urgency: MeshRecoveryUrgency,
