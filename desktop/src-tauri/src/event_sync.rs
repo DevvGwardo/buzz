@@ -30,7 +30,7 @@ pub fn run_event_sync(app: &tauri::AppHandle, owner_keys: &nostr::Keys, db_path:
 /// ```text
 /// force_claim_in_progress()  →  migrate_legacy_retention_into()
 ///     →  spawn_event_sync_with_held_claim()  →  run_event_sync()
-///     →  run_boot_barrier_after_claim()  →  mark_ready / Unready
+///     →  run_boot_barrier_after_claim()  →  Ready / Unready
 /// ```
 ///
 /// This closes the `Unready` window that previously existed between

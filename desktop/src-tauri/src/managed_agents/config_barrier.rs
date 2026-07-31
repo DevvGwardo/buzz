@@ -90,44 +90,59 @@ pub(crate) async fn run_boot_barrier_after_claim(
     run_boot_barrier_enforcing(app, claim).await;
 }
 
+/// Outcome of a single barrier scope run.
+#[derive(Debug)]
+enum BarrierOutcome {
+    /// Decision pass completed; scope is ready for publication.
+    Success,
+    /// Workspace switched mid-flight; the old scope's barrier was abandoned.
+    /// The latch is left to its current owner — no transition is applied.
+    Abandoned,
+}
+
 /// Shared enforcement body: scope resolution, relay lookups, decision pass.
 ///
 /// Takes ownership of the `ReadinessClaim` RAII guard. On the success path,
-/// the guard is resolved before `mark_ready` sets the final state. On any
-/// error path (including panics), the guard's `Drop` impl resets to `Unready`
-/// — so a panic inside `run_boot_barrier_for_scope` can never leave the latch
-/// permanently wedged at `InProgress`.
+/// `claim.complete(db_path)` transitions the latch to `Ready` only if the
+/// claim's generation still matches (i.e., it has not been preempted by a
+/// concurrent `force_claim_in_progress`). On any error path (including panics
+/// and abandonment), the claim is dropped without calling `complete`, so the
+/// RAII guard resets to `Unready` — but only if this claim is still current.
+/// A preempted claim's drop is a structural no-op.
 async fn run_boot_barrier_enforcing(
     app: &tauri::AppHandle,
     claim: super::config_sync_readiness::ReadinessClaim,
 ) {
-    use super::config_sync_readiness;
-
     let state = app.state::<AppState>();
     let scope = match active_retention_scope(app, &state) {
         Ok(scope) => scope,
         Err(error) => {
             tracing::warn!(target: "buzz::config_sync", %error, "boot barrier skipped: no active scope");
-            // claim drops here → mark_unready via RAII
+            // claim drops here → Unready via RAII if still current gen
             return;
         }
     };
 
     match run_boot_barrier_for_scope(app, &state, &scope).await {
-        Ok(()) => {
-            // Resolve the claim so the RAII drop does not reset to Unready.
-            claim.resolve();
-            config_sync_readiness::mark_ready(scope.db_path.clone());
+        Ok(BarrierOutcome::Success) => {
+            // complete() transitions to Ready only if this claim's generation
+            // still matches — a preempted claim is a silent no-op.
             tracing::info!(
                 target: "buzz::config_sync",
                 db_path = %scope.db_path.display(),
                 "boot barrier complete; scope is ready for publication"
             );
+            claim.complete(scope.db_path);
+        }
+        Ok(BarrierOutcome::Abandoned) => {
+            tracing::info!(target: "buzz::config_sync", "boot barrier abandoned: workspace switched");
+            // Drop the claim without completing — RAII resets to Unready if
+            // still current gen, no-op if preempted. Either way, the latch
+            // is not certified Ready for an abandoned scope.
         }
         Err(error) => {
             tracing::warn!(target: "buzz::config_sync", %error, "boot barrier failed; scope stays closed for retry");
-            // claim drops here → mark_unready via RAII (explicit call would
-            // double-reset, but that is idempotent; RAII is the safety net).
+            // claim drops here → Unready via RAII if still current gen
         }
     }
 }
@@ -175,7 +190,7 @@ async fn run_boot_barrier_for_scope(
     app: &tauri::AppHandle,
     state: &AppState,
     scope: &RetentionScope,
-) -> Result<(), String> {
+) -> Result<BarrierOutcome, String> {
     let owner_pubkey = scope.owner_keys.public_key().to_hex();
 
     // Enumerate BEFORE the lookups: the set of coordinates to decide is the
@@ -238,7 +253,7 @@ async fn run_boot_barrier_for_scope(
             target: "buzz::config_sync",
             "boot barrier abandoned: workspace switched during relay lookups"
         );
-        return Ok(());
+        return Ok(BarrierOutcome::Abandoned);
     }
 
     let conn = open_retention_db(&scope.db_path)?;
@@ -260,7 +275,7 @@ async fn run_boot_barrier_for_scope(
     }
 
     run_decision_pass(&conn, &owner_pubkey, &states)?;
-    Ok(())
+    Ok(BarrierOutcome::Success)
 }
 
 /// Read the three record stores and enumerate their coordinates.

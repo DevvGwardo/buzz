@@ -15,6 +15,7 @@
 #![cfg(not(target_os = "windows"))]
 
 use nostr::{EventBuilder, JsonUtil, Kind, Tag};
+use std::path::PathBuf;
 use tempfile::tempdir;
 
 use crate::app_state::build_app_state;
@@ -166,7 +167,8 @@ fn test_in_progress_state_blocks_second_claim() {
         Some(ReadinessState::InProgress)
     );
 
-    first_claim.unwrap().resolve();
+    let path = PathBuf::from("/scope/db");
+    first_claim.unwrap().complete(path);
     config_sync_readiness::mark_unready(); // cleanup
 }
 
@@ -183,9 +185,9 @@ fn test_barrier_failure_resets_to_unready_for_retry() {
     let claim = config_sync_readiness::claim_in_progress();
     assert!(claim.is_some());
 
-    // Barrier error: dropping the claim without resolve() resets to Unready
-    // (RAII guard). Simulates run_boot_barrier_enforcing returning Err.
-    drop(claim); // intentional drop-without-resolve
+    // Barrier error: dropping the claim without complete() resets to Unready
+    // (RAII guard, generation matches). Simulates run_boot_barrier_enforcing returning Err.
+    drop(claim); // intentional drop-without-complete
 
     assert_eq!(
         config_sync_readiness::readiness_state(),
@@ -200,7 +202,8 @@ fn test_barrier_failure_resets_to_unready_for_retry() {
         "after failure, next claim must succeed so the retry can run"
     );
 
-    retry_claim.unwrap().resolve();
+    let path = PathBuf::from("/scope/db");
+    retry_claim.unwrap().complete(path);
     config_sync_readiness::mark_unready(); // cleanup
 }
 
@@ -258,8 +261,8 @@ async fn test_inline_barrier_cannot_certify_readiness_before_reconcile() {
         set_publish_blocked(&conn, KIND_PERSONA, &pubkey, "stale-agent", true)
             .expect("barrier gates stale row");
     }
-    claim.unwrap().resolve();
-    config_sync_readiness::mark_ready(db_path.clone());
+    claim.unwrap().complete(db_path.clone());
+    // latch is now Ready
 
     // Step 5: scope is Ready; flush runs but the row is blocked — 0 publish.
     assert!(
@@ -291,7 +294,7 @@ async fn test_inline_barrier_cannot_certify_readiness_before_reconcile() {
 //
 // End-to-end: spawn_event_sync claims InProgress → barrier fails (RAII drop
 // resets to Unready) → next tick re-claims InProgress → barrier succeeds
-// (mark_ready) → row publishes on the following flush call.
+// (claim.complete()) → row publishes on the following flush call.
 #[tokio::test]
 async fn test_retry_after_barrier_failure_publishes_when_ready() {
     config_sync_readiness::mark_unready();
@@ -312,11 +315,11 @@ async fn test_retry_after_barrier_failure_publishes_when_ready() {
     *state.relay_url_override.lock().unwrap() = Some(relay_url);
 
     // Phase 1: spawn_event_sync claims InProgress → barrier fails → drop
-    // resets to Unready via RAII.
+    // resets to Unready via RAII (generation matches, this is the current claim).
     {
         let claim = config_sync_readiness::claim_in_progress();
         assert!(claim.is_some());
-        // Simulate barrier error: drop without resolve().
+        // Simulate barrier error: drop without complete().
         drop(claim);
     }
 
@@ -333,8 +336,7 @@ async fn test_retry_after_barrier_failure_publishes_when_ready() {
         retry_claim.is_some(),
         "after mark_unready, claim must succeed for retry"
     );
-    retry_claim.unwrap().resolve();
-    config_sync_readiness::mark_ready(db_path.clone());
+    retry_claim.unwrap().complete(db_path.clone());
 
     // Row is unblocked — flush must publish it now that scope is Ready.
     let flushed = flush_pending_events(&db_path, &state).await.expect("flush");
@@ -411,9 +413,8 @@ async fn test_apply_workspace_flush_cannot_interleave_before_reconcile() {
             .expect("gate reconciled row");
     }
 
-    // Step 6: barrier completes — resolve claim and mark Ready.
-    claim.resolve();
-    config_sync_readiness::mark_ready(db_path.clone());
+    // Step 6: barrier completes — complete claim (transitions to Ready only if still current gen).
+    claim.complete(db_path.clone());
 
     // Step 7: flush runs — both rows are blocked, 0 published.
     let state = build_app_state();
@@ -437,6 +438,103 @@ async fn test_apply_workspace_flush_cannot_interleave_before_reconcile() {
         );
         assert!(row.pending_sync, "{d_tag}: gated row must stay pending");
     }
+
+    config_sync_readiness::mark_unready(); // cleanup
+}
+
+// ── (i) leg-1 end-to-end: stale flush barrier cannot publish after force-claim ─
+//
+// Paul's second bounce, leg 1: flush wins claim at t≈0, its inline barrier
+// completes its relay round-trips and calls `complete()`, but by that time
+// apply_workspace's `force_claim_in_progress` has bumped the generation. The
+// stale `complete()` is a structural no-op — latch stays InProgress (the
+// force-claim's generation). Rows retained AFTER the stale complete cannot
+// publish until the force-claim's own barrier passes.
+//
+// Deterministic interleaving:
+// 1. Flush wins claim at Unready → InProgress (gen 0).
+// 2. apply_workspace fires → force_claim bumps to gen 1, sets InProgress.
+//    Stale flush claim is now generation 0 in a generation-1 latch.
+// 3. Stale barrier "completes" its relay work and calls complete(path).
+//    Generation mismatch (0 ≠ 1) → no-op; latch stays InProgress.
+// 4. Rows retained by reconcile land in the DB (publish_blocked=false).
+// 5. Force-claim's barrier gates all rows (sets publish_blocked=true), then
+//    calls complete(path) with gen 1 → latch transitions to Ready.
+// 6. Flush runs: scope is Ready, but rows are blocked — 0 published.
+#[tokio::test]
+async fn test_stale_flush_barrier_complete_cannot_publish_after_force_claim() {
+    config_sync_readiness::mark_unready();
+
+    let keys = nostr::Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("retention.db");
+
+    // Step 1: flush wins the initial claim (gen 0).
+    let stale_flush_claim = config_sync_readiness::claim_in_progress().unwrap();
+    assert!(config_sync_readiness::is_in_progress());
+    let stale_gen = config_sync_readiness::current_generation();
+    assert_eq!(stale_gen, 0);
+
+    // Step 2: apply_workspace fires — force_claim bumps generation to 1.
+    let force_claim = config_sync_readiness::force_claim_in_progress();
+    assert_eq!(config_sync_readiness::current_generation(), 1);
+    assert!(config_sync_readiness::is_in_progress());
+
+    // Stale flush cannot claim again (force-claim holds InProgress).
+    assert!(config_sync_readiness::claim_in_progress().is_none());
+
+    // Step 3: stale barrier "finishes" and calls complete(path) — gen mismatch → no-op.
+    stale_flush_claim.complete(db_path.clone());
+    assert!(
+        config_sync_readiness::is_in_progress(),
+        "stale complete (gen 0 vs latch gen 1) must not certify Ready"
+    );
+    assert!(
+        !config_sync_readiness::is_ready_for(&db_path),
+        "latch must not be Ready after stale complete"
+    );
+
+    // Step 4: reconcile retains rows — these are the rows that would have
+    // escaped if the stale complete had succeeded.
+    {
+        let conn = open_retention_db(&db_path).expect("open db");
+        retain_pending(&conn, &keys, "post-reconcile-row");
+    }
+
+    // Stale barrier cannot certify again (latch is still InProgress gen 1).
+    assert!(config_sync_readiness::claim_in_progress().is_none());
+
+    // Step 5: force-claim's barrier gates all rows, then completes with gen 1 → Ready.
+    {
+        let conn = open_retention_db(&db_path).expect("open db for force barrier");
+        set_publish_blocked(&conn, KIND_PERSONA, &pubkey, "post-reconcile-row", true)
+            .expect("force barrier gates reconcile row");
+    }
+    force_claim.complete(db_path.clone());
+    assert!(
+        config_sync_readiness::is_ready_for(&db_path),
+        "force-claim complete must transition to Ready"
+    );
+
+    // Step 6: flush runs — scope is Ready but rows are blocked by the
+    // force-claim's barrier. 0 published.
+    let state = build_app_state();
+    *state.keys.lock().unwrap() = keys.clone();
+    *state.relay_url_override.lock().unwrap() = Some(spawn_stub_relay().await);
+
+    let flushed = flush_pending_events(&db_path, &state).await.expect("flush");
+    assert_eq!(
+        flushed, 0,
+        "rows retained after stale complete must not publish — force-claim's barrier gated them"
+    );
+
+    let conn = open_retention_db(&db_path).expect("reopen db");
+    let row = get_retained_event(&conn, KIND_PERSONA, &pubkey, "post-reconcile-row")
+        .unwrap()
+        .unwrap();
+    assert!(row.publish_blocked, "post-reconcile row must stay blocked");
+    assert!(row.pending_sync, "blocked row must stay pending");
 
     config_sync_readiness::mark_unready(); // cleanup
 }

@@ -11,7 +11,7 @@
 //!   apply_workspace (force)  ─────────────────────────►  InProgress (from any state)
 //!   flush retry (claim, only when Unready)  ───────────►  InProgress
 //!   run_boot_barrier success  ─────────────────────────►  Ready(db_path)
-//!   run_boot_barrier error / abandon  ─────────────────►  Unready
+//!   run_boot_barrier error / abandon  ─────────────────►  Unready (if still current gen)
 //!   flush: InProgress → skip tick; Ready(p) → publish
 //! ```
 //!
@@ -22,14 +22,27 @@
 //!   path.
 //!
 //! - [`force_claim_in_progress`] — preempting claim; transitions from **any**
-//!   state (including `InProgress` or `Ready`) to `InProgress`. Used by
-//!   `apply_workspace`, which invalidates whatever the prior scope certified.
+//!   state (including `InProgress` or `Ready`) to `InProgress` **and bumps
+//!   the generation counter**. Used by `apply_workspace`, which invalidates
+//!   whatever the prior scope certified.
 //!
-//! Both variants return a [`ReadinessClaim`] RAII guard. The guard resets the
-//! latch to `Unready` on drop unless [`ReadinessClaim::resolve`] has been
-//! called first. This ensures a panic inside the reconcile+barrier window
-//! always leaves the scope fail-closed and retryable rather than permanently
-//! wedged at `InProgress`.
+//! Both variants return a [`ReadinessClaim`] RAII guard that records the
+//! generation it was issued under. Latch mutations (`complete` and `Drop`)
+//! only take effect if the latch generation still matches the claim's. A
+//! preempted claim is a structural no-op — it cannot certify or clear
+//! readiness after `force_claim_in_progress` has invalidated it.
+//!
+//! # Ownership identity
+//!
+//! The generation counter is the ownership identity. When `force_claim_in_progress`
+//! bumps the generation, every outstanding claim from the previous generation
+//! becomes permanently inert: its `complete` call is a no-op, and its `Drop`
+//! does not reset the latch. This closes both legs of the preempted-claim race:
+//!
+//! - Leg 1 (stale barrier certifies Ready): stale claim's `complete()` sees
+//!   a generation mismatch → no-op → latch stays `InProgress`.
+//! - Leg 2 (stale drop destroys InProgress): stale claim's `Drop` sees a
+//!   generation mismatch → no-op → force-claim's `InProgress` is preserved.
 
 use std::path::{Path, PathBuf};
 
@@ -44,53 +57,92 @@ pub enum ReadinessState {
     Ready(PathBuf),
 }
 
+// ── Internal latch state ──────────────────────────────────────────────────────
+
+struct LatchState {
+    state: ReadinessState,
+    /// Monotonically-increasing generation. Incremented by every
+    /// `force_claim_in_progress` call. A claim records the generation it was
+    /// issued under; transitions are only applied when the current generation
+    /// matches the claim's, structurally invalidating all prior claims.
+    generation: u64,
+}
+
+impl LatchState {
+    const fn new() -> Self {
+        Self {
+            state: ReadinessState::Unready,
+            generation: 0,
+        }
+    }
+}
+
 // ── Process-global latch ──────────────────────────────────────────────────────
 
 #[cfg(not(test))]
-static READINESS: std::sync::Mutex<ReadinessState> = std::sync::Mutex::new(ReadinessState::Unready);
+static READINESS: std::sync::Mutex<LatchState> = std::sync::Mutex::new(LatchState::new());
 
 // In tests, each test thread gets an isolated latch so tests cannot interfere.
 #[cfg(test)]
 thread_local! {
-    static READINESS: std::sync::Mutex<ReadinessState> =
-        const { std::sync::Mutex::new(ReadinessState::Unready) };
+    static READINESS: std::sync::Mutex<LatchState> =
+        const { std::sync::Mutex::new(LatchState::new()) };
 }
 
 // ── Public interface ──────────────────────────────────────────────────────────
 
 /// RAII guard that holds the `InProgress` claim.
 ///
-/// Resets the latch to `Unready` on drop unless [`ReadinessClaim::resolve`]
-/// has been called first. This ensures a panic (or early return) inside the
-/// reconcile+barrier window always leaves the scope fail-closed and retryable.
+/// Owns a generation stamp matching the latch generation at the time the claim
+/// was issued. All latch mutations go through the claim:
+///
+/// - [`ReadinessClaim::complete`] — transitions to `Ready(db_path)` if and
+///   only if the latch generation still matches. Preempted claims are no-ops.
+/// - `Drop` — resets to `Unready` if and only if the latch generation still
+///   matches. A panic or early return in the reconcile+barrier window leaves
+///   the scope fail-closed and retryable, but only if this claim is still
+///   current. A preempted claim's drop is a no-op.
 ///
 /// Created by [`claim_in_progress`] or [`force_claim_in_progress`].
-#[must_use = "dropping a ReadinessClaim without calling resolve() resets latch to Unready"]
+#[must_use = "dropping a ReadinessClaim without calling complete() resets latch to Unready if still current generation"]
 pub struct ReadinessClaim {
-    resolved: bool,
+    generation: u64,
 }
 
 impl ReadinessClaim {
-    fn new() -> Self {
-        Self { resolved: false }
+    fn new(generation: u64) -> Self {
+        Self { generation }
     }
 
-    /// Mark the claim as explicitly resolved (either `mark_ready` or
-    /// `mark_unready` will handle the final state transition). Call this
-    /// before the explicit resolution to prevent the drop guard from
-    /// redundantly resetting to `Unready` again.
-    pub fn resolve(mut self) {
-        self.resolved = true;
-        // Drop runs immediately but the flag prevents the reset.
+    /// Transition the latch to `Ready(db_path)` if and only if this claim is
+    /// still current (latch generation matches). A preempted claim's call is
+    /// a silent no-op — the preemptor owns the latch now.
+    ///
+    /// Consumes the claim so that `Drop` does not also attempt a reset.
+    pub fn complete(self, db_path: PathBuf) {
+        let _ = with_lock(|latch| {
+            if latch.generation == self.generation {
+                latch.state = ReadinessState::Ready(db_path);
+            }
+            // Mismatch → preempted claim, no-op.
+        });
+        // Prevent Drop from resetting to Unready: we consumed self, so Drop
+        // will not run (the value is moved into this function's scope and the
+        // mem::forget below prevents it). We use mem::forget here because there
+        // is no other way to prevent Drop after consuming self.
+        std::mem::forget(self);
     }
 }
 
 impl Drop for ReadinessClaim {
     fn drop(&mut self) {
-        if !self.resolved {
-            // Panic or early return: leave the scope fail-closed and retryable.
-            mark_unready();
-        }
+        // Panic or early return: reset to Unready only if this claim is still
+        // current. A preempted claim (generation mismatch) is a no-op.
+        let _ = with_lock(|latch| {
+            if latch.generation == self.generation {
+                latch.state = ReadinessState::Unready;
+            }
+        });
     }
 }
 
@@ -100,76 +152,80 @@ impl Drop for ReadinessClaim {
 /// owns the reconcile+barrier run. Returns `None` if the state was already
 /// `InProgress` or `Ready` — the caller must not start a barrier.
 ///
-/// The returned guard resets to `Unready` on drop unless
-/// [`ReadinessClaim::resolve`] is called first.
+/// The returned guard's `Drop` resets to `Unready` only if the claim is
+/// still current (generation matches). Call [`ReadinessClaim::complete`] on
+/// success.
 pub fn claim_in_progress() -> Option<ReadinessClaim> {
-    let won = with_lock(|state| {
-        if *state == ReadinessState::Unready {
-            *state = ReadinessState::InProgress;
-            true
+    with_lock(|latch| {
+        if latch.state == ReadinessState::Unready {
+            latch.state = ReadinessState::InProgress;
+            Some(ReadinessClaim::new(latch.generation))
         } else {
-            false
+            None
         }
     })
-    .unwrap_or(false);
-    if won {
-        Some(ReadinessClaim::new())
-    } else {
-        None
-    }
+    .unwrap_or(None)
 }
 
 /// Preempting claim: transitions from **any** state (including `InProgress`
-/// or `Ready`) to `InProgress`.
+/// or `Ready`) to `InProgress` and **bumps the generation counter**.
 ///
 /// Used by `apply_workspace`, which invalidates whatever the prior scope
-/// certified. Because it transitions unconditionally, the flush loop will see
-/// `InProgress` immediately after this call and skip its tick — even if the
-/// prior scope was `Ready`.
+/// certified. Bumping the generation structurally invalidates all outstanding
+/// claims from the previous generation: their `complete` and `Drop` become
+/// no-ops, so a stale flush barrier cannot certify readiness or reset
+/// `InProgress` mid-migration.
 ///
-/// Returns a `ReadinessClaim` RAII guard (always succeeds).
+/// Returns a `ReadinessClaim` RAII guard stamped with the new generation
+/// (always succeeds).
 pub fn force_claim_in_progress() -> ReadinessClaim {
-    let _ = with_lock(|state| {
-        *state = ReadinessState::InProgress;
-    });
-    ReadinessClaim::new()
+    let gen = with_lock(|latch| {
+        latch.generation = latch.generation.wrapping_add(1);
+        latch.state = ReadinessState::InProgress;
+        latch.generation
+    })
+    .unwrap_or(0);
+    ReadinessClaim::new(gen)
 }
 
-/// Mark the scope `Ready` for the given `db_path`.
-pub fn mark_ready(db_path: PathBuf) {
-    let _ = with_lock(|state| {
-        *state = ReadinessState::Ready(db_path);
-    });
-}
-
-/// Reset to `Unready`. Called on barrier error, workspace switch, or any
-/// path that must leave the scope fail-closed.
+/// Reset to `Unready` unconditionally.
+///
+/// Use for test cleanup and exceptional reset paths only. Normal transitions
+/// go through [`ReadinessClaim::complete`] or the `Drop` impl.
+#[cfg(test)]
 pub fn mark_unready() {
-    let _ = with_lock(|state| {
-        *state = ReadinessState::Unready;
+    let _ = with_lock(|latch| {
+        latch.state = ReadinessState::Unready;
     });
 }
 
 /// `true` iff the scope is `Ready` for exactly `db_path`.
 pub fn is_ready_for(db_path: &Path) -> bool {
-    with_lock(|state| matches!(&*state, ReadinessState::Ready(p) if p == db_path)).unwrap_or(false)
+    with_lock(|latch| matches!(&latch.state, ReadinessState::Ready(p) if p == db_path))
+        .unwrap_or(false)
 }
 
 /// `true` iff a reconcile+barrier is currently in-flight.
 #[cfg(test)]
 pub fn is_in_progress() -> bool {
-    with_lock(|state| *state == ReadinessState::InProgress).unwrap_or(false)
+    with_lock(|latch| latch.state == ReadinessState::InProgress).unwrap_or(false)
 }
 
 /// Read a snapshot of the current state.
 pub fn readiness_state() -> Option<ReadinessState> {
-    with_lock(|state| state.clone()).ok()
+    with_lock(|latch| latch.state.clone()).ok()
+}
+
+/// Read the current generation counter (for tests only).
+#[cfg(test)]
+pub fn current_generation() -> u64 {
+    with_lock(|latch| latch.generation).unwrap_or(0)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 #[cfg(not(test))]
-fn with_lock<R>(f: impl FnOnce(&mut ReadinessState) -> R) -> Result<R, String> {
+fn with_lock<R>(f: impl FnOnce(&mut LatchState) -> R) -> Result<R, String> {
     READINESS
         .lock()
         .map(|mut g| f(&mut g))
@@ -177,7 +233,7 @@ fn with_lock<R>(f: impl FnOnce(&mut ReadinessState) -> R) -> Result<R, String> {
 }
 
 #[cfg(test)]
-fn with_lock<R>(f: impl FnOnce(&mut ReadinessState) -> R) -> Result<R, String> {
+fn with_lock<R>(f: impl FnOnce(&mut LatchState) -> R) -> Result<R, String> {
     READINESS.with(|m| m.lock().map(|mut g| f(&mut g)).map_err(|e| e.to_string()))
 }
 
@@ -195,23 +251,25 @@ mod tests {
     #[test]
     fn test_claim_in_progress_from_unready_succeeds() {
         mark_unready();
+        let path = PathBuf::from("/scope/db");
         let claim = claim_in_progress();
         assert!(claim.is_some(), "first claim must succeed");
         assert!(is_in_progress());
-        claim.unwrap().resolve();
+        claim.unwrap().complete(path);
         mark_unready(); // cleanup
     }
 
     #[test]
     fn test_claim_in_progress_is_single_flight() {
         mark_unready();
+        let path = PathBuf::from("/scope/db");
         let claim = claim_in_progress();
         assert!(claim.is_some(), "first claim wins");
         assert!(
             claim_in_progress().is_none(),
             "second claim rejected while InProgress"
         );
-        claim.unwrap().resolve();
+        claim.unwrap().complete(path);
         mark_unready(); // cleanup
     }
 
@@ -219,19 +277,19 @@ mod tests {
     fn test_claim_rejected_when_ready() {
         mark_unready();
         let path = PathBuf::from("/scope/db");
-        mark_ready(path.clone());
+        let claim = claim_in_progress().unwrap();
+        claim.complete(path.clone());
         assert!(claim_in_progress().is_none(), "cannot claim when Ready");
         assert!(is_ready_for(&path));
         mark_unready(); // cleanup
     }
 
     #[test]
-    fn test_mark_ready_then_is_ready_for() {
+    fn test_complete_sets_ready_for_path() {
         mark_unready();
         let path = PathBuf::from("/scope/db");
         let claim = claim_in_progress().unwrap();
-        claim.resolve();
-        mark_ready(path.clone());
+        claim.complete(path.clone());
         assert!(is_ready_for(&path));
         assert!(!is_ready_for(Path::new("/other/db")));
         mark_unready(); // cleanup
@@ -240,14 +298,14 @@ mod tests {
     #[test]
     fn test_mark_unready_resets_to_claimable() {
         mark_unready();
+        let path = PathBuf::from("/scope/db");
         let claim = claim_in_progress().unwrap();
-        claim.resolve();
+        claim.complete(path);
         mark_unready();
         assert_eq!(readiness_state(), Some(ReadinessState::Unready));
         let claim2 = claim_in_progress();
         assert!(claim2.is_some(), "after reset, claim must succeed");
-        claim2.unwrap().resolve();
-        mark_unready(); // cleanup
+        drop(claim2); // drop without complete → resets to Unready
     }
 
     #[test]
@@ -255,30 +313,28 @@ mod tests {
         mark_unready();
         let path = PathBuf::from("/scope/db");
         let claim = claim_in_progress().unwrap();
-        claim.resolve();
-        mark_ready(path.clone());
+        claim.complete(path.clone());
         assert!(is_ready_for(&path));
         mark_unready();
         assert!(!is_ready_for(&path));
         let claim2 = claim_in_progress().unwrap();
-        claim2.resolve();
-        mark_ready(path.clone());
+        claim2.complete(path.clone());
         assert!(is_ready_for(&path));
         mark_unready(); // cleanup
     }
 
     #[test]
-    fn test_claim_drop_without_resolve_resets_to_unready() {
+    fn test_claim_drop_without_complete_resets_to_unready() {
         mark_unready();
         {
             let _claim = claim_in_progress().unwrap();
             assert!(is_in_progress());
-            // drop without resolve
+            // drop without complete
         }
         assert_eq!(
             readiness_state(),
             Some(ReadinessState::Unready),
-            "dropped claim without resolve must reset to Unready"
+            "dropped claim without complete must reset to Unready"
         );
     }
 
@@ -286,16 +342,16 @@ mod tests {
     fn test_force_claim_preempts_ready() {
         mark_unready();
         let path = PathBuf::from("/scope/db");
-        mark_ready(path.clone());
+        let first = claim_in_progress().unwrap();
+        first.complete(path.clone());
         assert!(is_ready_for(&path));
         // force_claim must preempt Ready
-        let claim = force_claim_in_progress();
+        let fc = force_claim_in_progress();
         assert!(
             is_in_progress(),
             "force_claim must set InProgress even from Ready"
         );
-        claim.resolve();
-        mark_unready(); // cleanup
+        drop(fc); // cleanup via RAII
     }
 
     #[test]
@@ -303,12 +359,94 @@ mod tests {
         mark_unready();
         let first = claim_in_progress().unwrap();
         assert!(is_in_progress());
+        let gen_before = current_generation();
         // force_claim must preempt even an existing InProgress
         let second = force_claim_in_progress();
         assert!(is_in_progress());
-        // resolve the first claim (already replaced, no-op since resolved=true)
-        first.resolve();
-        second.resolve();
-        mark_unready(); // cleanup
+        let gen_after = current_generation();
+        assert_eq!(
+            gen_after,
+            gen_before + 1,
+            "force_claim must bump generation"
+        );
+        // first is now stale — its drop must be a no-op (generation mismatch)
+        drop(first);
+        assert!(
+            is_in_progress(),
+            "stale drop must not reset latch to Unready"
+        );
+        drop(second); // cleanup via RAII
+    }
+
+    // ── (g) stale-claim completion is a no-op ────────────────────────────────
+    //
+    // Setup: flush wins claim → force_claim preempts → stale claim calls
+    // complete() → latch stays InProgress; flush claim_in_progress still
+    // rejected (current owner is the force-claim generation).
+    #[test]
+    fn test_stale_claim_complete_is_noop() {
+        mark_unready();
+        let path = PathBuf::from("/scope/db");
+
+        // Flush wins the initial claim.
+        let stale_claim = claim_in_progress().unwrap();
+        let stale_gen = current_generation();
+
+        // apply_workspace force-claims, bumping the generation.
+        let force_claim = force_claim_in_progress();
+        let new_gen = current_generation();
+        assert_eq!(new_gen, stale_gen + 1, "generation must increment");
+        assert!(is_in_progress());
+
+        // Stale barrier finishes and tries to certify Ready — must be a no-op.
+        stale_claim.complete(path.clone());
+        assert!(
+            is_in_progress(),
+            "stale complete must not transition latch to Ready"
+        );
+        assert!(
+            !is_ready_for(&path),
+            "stale complete must not set Ready(path)"
+        );
+
+        // Force-claim's InProgress must still block a new flush claim.
+        assert!(
+            claim_in_progress().is_none(),
+            "flush claim must still be rejected after stale complete"
+        );
+
+        // Cleanup: force_claim still owns the latch.
+        drop(force_claim);
+        assert_eq!(readiness_state(), Some(ReadinessState::Unready));
+    }
+
+    // ── (h) stale-claim drop is a no-op ──────────────────────────────────────
+    //
+    // Setup: flush wins claim → force_claim preempts → stale claim is dropped
+    // unresolved → latch stays InProgress (force-claim still owns it).
+    #[test]
+    fn test_stale_claim_drop_is_noop() {
+        mark_unready();
+
+        // Flush wins the initial claim.
+        let stale_claim = claim_in_progress().unwrap();
+        let stale_gen = current_generation();
+
+        // apply_workspace force-claims.
+        let force_claim = force_claim_in_progress();
+        let new_gen = current_generation();
+        assert_eq!(new_gen, stale_gen + 1);
+        assert!(is_in_progress());
+
+        // Stale barrier errors out — its RAII drop must be a no-op.
+        drop(stale_claim);
+        assert!(
+            is_in_progress(),
+            "stale drop must not reset force-claim's InProgress to Unready"
+        );
+
+        // Cleanup.
+        drop(force_claim);
+        assert_eq!(readiness_state(), Some(ReadinessState::Unready));
     }
 }
