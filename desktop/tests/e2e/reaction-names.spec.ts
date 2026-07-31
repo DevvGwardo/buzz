@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
@@ -14,6 +15,23 @@ const MAX_REACTION_NAME =
 const MAX_REACTION_AVATAR_URL =
   "https://picsum.photos/seed/teammate-alice/96/96";
 const SHORT_REACTION_AVATAR_URL = "https://picsum.photos/seed/bob-avatar/96/96";
+const AVATAR_FIXTURES = new Map([
+  [
+    MAX_REACTION_AVATAR_URL,
+    fileURLToPath(
+      new URL(
+        "./fixtures/reaction-popover/teammate-alice.jpg",
+        import.meta.url,
+      ),
+    ),
+  ],
+  [
+    SHORT_REACTION_AVATAR_URL,
+    fileURLToPath(
+      new URL("./fixtures/reaction-popover/bob-avatar.jpg", import.meta.url),
+    ),
+  ],
+]);
 const SCREENSHOT_DIR =
   process.env.REACTION_POPOVER_SCREENSHOT_DIR ??
   "test-results/reaction-popover-screenshots";
@@ -55,6 +73,17 @@ async function capturePopover(
 }
 
 test.beforeEach(async ({ page }) => {
+  await page.route("https://picsum.photos/seed/**", async (route) => {
+    const fixturePath = AVATAR_FIXTURES.get(route.request().url());
+    if (!fixturePath) {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.fulfill({
+      body: fs.readFileSync(fixturePath),
+      contentType: "image/jpeg",
+    });
+  });
   await installMockBridge(page, {
     searchProfiles: [
       {
