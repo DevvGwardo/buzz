@@ -1,7 +1,7 @@
 //! Pocket callback-to-playback PCM assembly.
 
 use super::{
-    apply_fade_out, clamp_to_full_scale, FADE_OUT_SAMPLES, SAMPLE_RATE, SENTENCE_LEAD_IN_SAMPLES,
+    apply_fade_out, clamp_to_full_scale, CHUNK_LEAD_IN_SAMPLES, FADE_OUT_SAMPLES, SAMPLE_RATE,
 };
 
 /// Number of samples retained until the next Pocket callback.
@@ -88,11 +88,11 @@ impl PocketStreamAssembler {
 
         let needs_lead_in = self.queued_samples == 0 || playback_idle;
         let mut buffer = Vec::with_capacity(
-            usize::from(needs_lead_in) * SENTENCE_LEAD_IN_SAMPLES
+            usize::from(needs_lead_in) * CHUNK_LEAD_IN_SAMPLES
                 + emit_end.saturating_sub(emit_start),
         );
         if needs_lead_in {
-            buffer.extend(std::iter::repeat_n(0.0_f32, SENTENCE_LEAD_IN_SAMPLES));
+            buffer.extend(std::iter::repeat_n(0.0_f32, CHUNK_LEAD_IN_SAMPLES));
         }
         buffer.extend(
             self.pending[emit_start..emit_end]
@@ -137,15 +137,15 @@ impl PocketStreamAssembler {
         apply_fade_out(&mut audio);
 
         if !audio.is_empty() {
-            let trailing_silence_len = silence_buf_len.saturating_sub(SENTENCE_LEAD_IN_SAMPLES);
+            let trailing_silence_len = silence_buf_len.saturating_sub(CHUNK_LEAD_IN_SAMPLES);
             let needs_lead_in = self.queued_samples == 0 || playback_idle;
             let mut buffer = Vec::with_capacity(
-                usize::from(needs_lead_in) * SENTENCE_LEAD_IN_SAMPLES
+                usize::from(needs_lead_in) * CHUNK_LEAD_IN_SAMPLES
                     + audio.len()
                     + trailing_silence_len,
             );
             if needs_lead_in {
-                buffer.extend(std::iter::repeat_n(0.0_f32, SENTENCE_LEAD_IN_SAMPLES));
+                buffer.extend(std::iter::repeat_n(0.0_f32, CHUNK_LEAD_IN_SAMPLES));
             }
             buffer.extend(audio);
             buffer.extend(std::iter::repeat_n(0.0_f32, trailing_silence_len));

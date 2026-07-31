@@ -72,7 +72,7 @@ fn cumulative_multi_chunk_callbacks_reconstruct_final_pcm_once() {
     assert_eq!(assembler.callback_count, 2);
     assert_eq!(assembler.queued_samples, complete.len());
     let output = queued.concat();
-    let speech = &output[SENTENCE_LEAD_IN_SAMPLES..SENTENCE_LEAD_IN_SAMPLES + complete.len()];
+    let speech = &output[CHUNK_LEAD_IN_SAMPLES..CHUNK_LEAD_IN_SAMPLES + complete.len()];
     assert!(speech[..1000].iter().all(|sample| *sample == 0.25));
     assert!(speech[1000..1000 + (1000 - FADE_OUT_SAMPLES)]
         .iter()
@@ -97,7 +97,7 @@ fn pocket_streaming_queues_before_generation_finishes() {
         .expect("playback queue receives PCM before finish");
     assert_eq!(
         queued.len(),
-        SENTENCE_LEAD_IN_SAMPLES + 1000 - STREAM_TAIL_SAMPLES
+        CHUNK_LEAD_IN_SAMPLES + 1000 - STREAM_TAIL_SAMPLES
     );
 }
 
@@ -114,10 +114,10 @@ fn pocket_streaming_preserves_chunk_lead_in_while_playback_is_active() {
         .expect("stream first callback behind active playback");
 
     assert_eq!(queued.len(), 1);
-    assert!(queued[0][..SENTENCE_LEAD_IN_SAMPLES]
+    assert!(queued[0][..CHUNK_LEAD_IN_SAMPLES]
         .iter()
         .all(|sample| *sample == 0.0));
-    assert_eq!(queued[0][SENTENCE_LEAD_IN_SAMPLES], 0.25);
+    assert_eq!(queued[0][CHUNK_LEAD_IN_SAMPLES], 0.25);
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn pocket_streaming_preserves_quiet_speech_after_leading_silence() {
         .expect("finish stream");
 
     let output = queued.concat();
-    let speech = &output[SENTENCE_LEAD_IN_SAMPLES..];
+    let speech = &output[CHUNK_LEAD_IN_SAMPLES..];
     let quiet_start = speech
         .iter()
         .position(|sample| *sample == 0.005)
@@ -216,8 +216,8 @@ fn pocket_streaming_rearms_lead_in_after_playback_underrun() {
         .expect("queue decoder block after simulated drain");
 
     assert_eq!(queued.len(), 2);
-    assert!(queued[1][..SENTENCE_LEAD_IN_SAMPLES]
+    assert!(queued[1][..CHUNK_LEAD_IN_SAMPLES]
         .iter()
         .all(|sample| *sample == 0.0));
-    assert_eq!(queued[1][SENTENCE_LEAD_IN_SAMPLES], 0.25);
+    assert_eq!(queued[1][CHUNK_LEAD_IN_SAMPLES], 0.25);
 }

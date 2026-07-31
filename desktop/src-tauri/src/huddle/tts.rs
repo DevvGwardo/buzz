@@ -7,8 +7,8 @@
 //!   → bounded sync_channel (TEXT_QUEUE_DEPTH = 8)
 //!   → tts_worker thread (owns 1 Pocket TTS engine + 1 persistent Player)
 //!       1. Preprocess text
-//!       2. Split into sentences
-//!       3. Synthesize each sentence while decoder blocks become available
+//!       2. Split into natural model-valid chunks
+//!       3. Synthesize each chunk while decoder blocks become available
 //!       4. Queue monotonic PCM deltas while retaining the final fade suffix
 //!       5. Append each buffer to the persistent rodio Player (gapless)
 //!       6. While audio is draining, keep pulling queued text items and
@@ -51,7 +51,7 @@ use super::pocket::{
     load_text_to_speech, load_voice_style, SynthesisOutcome, DEFAULT_VOICE, SAMPLE_RATE,
     VOICE_FILE_EXT,
 };
-use super::preprocessing::{preprocess_for_tts, split_sentences};
+use super::preprocessing::preprocess_for_tts;
 #[path = "tts_streaming.rs"]
 mod streaming;
 #[cfg(test)]
@@ -111,37 +111,16 @@ const SYNTH_STEPS: usize = 1;
 /// the leading waveform is important.
 const FADE_OUT_SAMPLES: usize = (SAMPLE_RATE as f64 * 0.008) as usize;
 
-/// Length of the zero-sample cushion prepended before each synthesized
-/// sentence chunk, so the OS audio device / rodio mixer has a fully-quiet
-/// ramp-up window before the real onset hits.
+/// Zero-sample cushion prepended to every synthesis chunk (20 ms at 24 kHz).
 ///
-/// This used to be applied only before the first sentence of a whole response.
-/// That still left later sentence chunks vulnerable to first-syllable clipping
-/// when their first phoneme was soft (notably `I'm` / `I've`) and rodio crossed
-/// from an explicit silence buffer straight into non-zero speech. 20 ms ≈ 480
-/// samples is enough to cover a CoreAudio buffer turnover without being audible
-/// as latency. At sentence boundaries this lead-in is budgeted out of the
-/// existing inter-sentence pause, so it does not lengthen multi-sentence gaps.
-const SENTENCE_LEAD_IN_SAMPLES: usize = (SAMPLE_RATE as f64 * 0.020) as usize;
+/// Gives CoreAudio and the rodio mixer a quiet ramp before speech begins. At
+/// chunk boundaries, the cushion is budgeted from the existing inter-chunk
+/// pause so it does not lengthen multi-chunk gaps.
+const CHUNK_LEAD_IN_SAMPLES: usize = (SAMPLE_RATE as f64 * 0.020) as usize;
 
-/// Approximate character budget for one synthesis chunk.
-///
-/// Upstream pocket-tts groups sentences into chunks of up to
-/// `MAX_TOKEN_PER_CHUNK = 50` tokenizer tokens (`default_parameters.py`) —
-/// typically multi-sentence chunks — because every `generate()` call is an
-/// independent generation with a cold FlowLM start, and each chunk boundary
-/// is an exposed prosody seam (kyutai-labs/pocket-tts #151; the Kyutai team
-/// names chunk stitching as the reliability lever). Our previous
-/// sentence-per-call path created ~2–4× more seams than upstream.
-///
-/// This character budget performs only coarse sentence packing. The April
-/// engine applies its SentencePiece tokenizer afterward and refines every
-/// result at the bundle's exact 50-token boundary.
-const MAX_CHUNK_CHARS: usize = 200;
-
-/// Silence inserted between sentences by the TTS pipeline (seconds).
-/// Injected as a silent buffer between each synthesized sentence chunk.
-const INTER_SENTENCE_SILENCE: f32 = 0.1;
+/// Silence inserted between synthesis chunks by the TTS pipeline (seconds).
+/// Injected as a silent buffer between each synthesized chunk.
+const INTER_CHUNK_SILENCE: f32 = 0.1;
 
 type WorkerControlState = (
     Arc<AtomicBool>,
@@ -522,7 +501,7 @@ fn tts_worker(
             })
     };
     if let Err(ref e) = monitor {
-        // Degraded but functional: barge-in still works between sentences
+        // Degraded but functional: barge-in still works between chunks
         // via the worker's own checks, just not mid-synthesis.
         eprintln!("buzz-desktop: TTS barge-in monitor failed to spawn: {e}");
     }
@@ -535,7 +514,7 @@ fn tts_worker(
     // `tts_active` lifecycle: set on the first append while idle, cleared
     // whenever the player has fully drained — either in the idle timeout
     // arm or on item receipt before synthesis begins.
-    let silence_buf_len = (INTER_SENTENCE_SILENCE * SAMPLE_RATE as f32) as usize;
+    let silence_buf_len = (INTER_CHUNK_SILENCE * SAMPLE_RATE as f32) as usize;
     // `first_append` = "no audio queued since the player last went idle".
     // Flipped after the first streamed append; the idle branch below uses it
     // to decide when to drop `tts_active` and arm a fresh lead-in cushion for
@@ -661,17 +640,19 @@ fn tts_worker(
             continue;
         }
 
-        // Split into sentences, then group into synthesis chunks: the first
-        // sentence stays alone (fast time-to-first-audio), the rest pack
-        // greedily up to MAX_CHUNK_CHARS. Playback of each model unit overlaps
-        // synthesis of the next one. The Pocket engine applies its exact
-        // 50-token split; keeping those units within one playback chunk avoids
-        // adding fades and pauses at token-only boundaries.
-        let sentences: Vec<String> = split_sentences(&text)
-            .into_iter()
-            .filter(|s| !s.trim().is_empty())
-            .collect();
-        let chunks = group_sentences_into_chunks(&sentences, MAX_CHUNK_CHARS);
+        // The shared Pocket engine keeps a fitting first sentence separate for
+        // low time-to-first-audio, then packs later text at natural boundaries
+        // using the April tokenizer's exact 50-token limit. Decoder streaming
+        // starts playback within each resulting unit.
+        let chunks = match engine.split_text_into_chunks(&text) {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                eprintln!(
+                    "buzz-desktop: tts stage=synthesis status=failed reason=split route_id={route_id} error={error}"
+                );
+                continue;
+            }
+        };
         if chunks.is_empty() {
             eprintln!(
                 "buzz-desktop: tts stage=synthesis status=empty reason=no_chunks route_id={route_id}"
