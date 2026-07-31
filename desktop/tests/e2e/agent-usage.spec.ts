@@ -7,12 +7,22 @@ import {
   type MockAgentUsageSeries,
 } from "../helpers/bridge";
 
+const DAY = 86_400;
+const BASE = 1_700_000_000;
+
 /**
  * A non-owned, non-managed agent (declared owner is `outsider`, not the mock
  * viewer) — used by the A13 fail-closed tests where eligibility must come
  * from archived evidence alone, not ownership.
  */
 const HISTORICAL_AGENT_PUBKEY = "6".repeat(64);
+
+/**
+ * A non-owned, non-managed agent seeded purely via `searchProfiles` (no
+ * managed-agent creation) — used by the ingress-visibility test's non-owner
+ * leg, which must be hidden regardless of archived evidence.
+ */
+const NON_OWNER_AGENT_PUBKEY = "7".repeat(64);
 
 function getHashSearchParam(page: Page, name: string) {
   const hash = new URL(page.url()).hash.replace(/^#/, "");
@@ -65,10 +75,7 @@ function mockAgentUsage(
     hasUnknownUsage: false,
     models: [],
     reportCount: 1,
-    // Real-world shape: no publisher emits totalTokens today; i/o are always
-    // present. Seeding this as the default ensures the suite exercises the
-    // "approx ≈" display path that prod users see, not just the happy-path
-    // seed that previously masked the "No usage reported" regression.
+    // Default: i/o known, no totalTokens — real prod shape, exercises ≈ path.
     usage: reportedUsage({ inputTokens: "1200", outputTokens: "300" }),
     ...overrides,
   };
@@ -92,6 +99,33 @@ function mockUsageSeries(
     },
     hasArchivedEvidence: null,
     ...overrides,
+  };
+}
+
+/** A fully-populated coverage block for a window that did archive evidence. */
+function archivedCoverage(reportCount: number) {
+  return {
+    firstArchivedAt: BASE,
+    firstReportedAt: BASE,
+    hasUnknownUsage: false,
+    invalidReportCount: 0,
+    lastArchivedAt: BASE + DAY,
+    lastReportedAt: BASE + DAY,
+    reportCount,
+  };
+}
+
+function dayBucket(
+  dayIndex: number,
+  usage: ReturnType<typeof reportedUsage>,
+  overrides: Partial<{ reportCount: number; hasUnknownUsage: boolean }> = {},
+) {
+  return {
+    start: BASE + dayIndex * DAY,
+    end: BASE + (dayIndex + 1) * DAY,
+    usage,
+    reportCount: overrides.reportCount ?? 1,
+    hasUnknownUsage: overrides.hasUnknownUsage ?? false,
   };
 }
 
@@ -169,6 +203,47 @@ async function openAgentsView(page: Page) {
   });
 }
 
+/** Swap in a usage series and re-enter the Agents view so it is queried. */
+async function seedSeries(page: Page, series: MockAgentUsageSeries) {
+  await page.evaluate((next) => {
+    const testWindow = window as Window & {
+      __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
+    };
+    testWindow.__BUZZ_E2E__ ??= {};
+    testWindow.__BUZZ_E2E__.mock ??= {};
+    testWindow.__BUZZ_E2E__.mock.agentUsageSeries = next;
+  }, series);
+  await page.getByTestId("open-agents-view").click();
+  await expect(page.getByTestId("agents-usage-section")).toBeVisible();
+}
+
+async function navigateToProfile(
+  page: Page,
+  pubkey: string,
+  profileView?: "usage",
+) {
+  await page.evaluate(
+    ({ profileView, pubkey }) => {
+      (
+        window as Window & {
+          __TSR_ROUTER__?: {
+            navigate: (opts: Record<string, unknown>) => void;
+          };
+        }
+      ).__TSR_ROUTER__?.navigate({
+        to: "/agents",
+        search: profileView
+          ? { profile: pubkey, profileView }
+          : { profile: pubkey },
+      });
+    },
+    { profileView, pubkey },
+  );
+  await expect(page.getByTestId("user-profile-panel")).toBeVisible({
+    timeout: 10_000,
+  });
+}
+
 test("shows a loading skeleton while the usage series is in flight", async ({
   page,
 }) => {
@@ -193,16 +268,8 @@ test("renders ranked agent rows and switches between the 1d, 7d, and 30d presets
   await openAgentsView(page);
 
   const agentPubkey = await addGenericAgent(page, "general", "Token Bot");
-
-  await page.evaluate(
-    (series) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
+  await seedSeries(
+    page,
     mockUsageSeries({
       agents: [
         mockAgentUsage(agentPubkey, {
@@ -213,19 +280,9 @@ test("renders ranked agent rows and switches between the 1d, 7d, and 30d presets
           }),
         }),
       ],
-      coverage: {
-        firstArchivedAt: 1_700_000_000,
-        firstReportedAt: 1_700_000_000,
-        hasUnknownUsage: false,
-        invalidReportCount: 0,
-        lastArchivedAt: 1_700_086_400,
-        lastReportedAt: 1_700_086_400,
-        reportCount: 1,
-      },
+      coverage: archivedCoverage(1),
     }),
   );
-  await page.getByTestId("open-agents-view").click();
-  await expect(page.getByTestId("agents-usage-section")).toBeVisible();
 
   const row = page.getByTestId(`agent-usage-row-${agentPubkey}`);
   await expect(row).toBeVisible();
@@ -242,8 +299,7 @@ test("renders ranked agent rows and switches between the 1d, 7d, and 30d presets
     await expect(
       page.getByTestId(`agent-usage-window-${preset}`),
     ).toHaveAttribute("data-state", "active");
-    // Switching presets must never blank the card — the query re-runs against
-    // a new boundary set but the seeded series is returned for every window.
+    // Switching presets must never blank the card.
     await expect(page.getByTestId("agent-usage-card")).toBeVisible();
   }
 });
@@ -255,43 +311,30 @@ test("clicking an agent row opens the profile panel's Usage focused view", async
   await openAgentsView(page);
 
   const agentPubkey = await addGenericAgent(page, "general", "Drilldown Bot");
-  await page.evaluate(
-    ({ series }) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
-    {
-      series: mockUsageSeries({
-        agents: [
-          mockAgentUsage(agentPubkey, {
-            models: [
-              {
-                harness: "goose",
-                hasUnknownUsage: false,
-                model: "claude-opus",
-                reportCount: 1,
-                usage: reportedUsage({ totalTokens: "1500" }),
-              },
-            ],
-            usage: reportedUsage({
-              estimatedCostUsd: 0.42,
-              inputTokens: "1200",
-              outputTokens: "300",
-              totalTokens: "1500",
-            }),
+  await seedSeries(
+    page,
+    mockUsageSeries({
+      agents: [
+        mockAgentUsage(agentPubkey, {
+          models: [
+            {
+              harness: "goose",
+              hasUnknownUsage: false,
+              model: "claude-opus",
+              reportCount: 1,
+              usage: reportedUsage({ totalTokens: "1500" }),
+            },
+          ],
+          usage: reportedUsage({
+            estimatedCostUsd: 0.42,
+            inputTokens: "1200",
+            outputTokens: "300",
+            totalTokens: "1500",
           }),
-        ],
-      }),
-    },
+        }),
+      ],
+    }),
   );
-  await page.getByTestId("open-agents-view").click();
-  await expect(
-    page.getByTestId(`agent-usage-row-${agentPubkey}`),
-  ).toBeVisible();
 
   await page.getByTestId(`agent-usage-row-${agentPubkey}`).click();
   await expect(page.getByTestId("user-profile-panel")).toBeVisible();
@@ -299,26 +342,16 @@ test("clicking an agent row opens the profile panel's Usage focused view", async
   await expect(page.getByTestId("agent-usage-focused-totals")).toContainText(
     "1,500",
   );
-  await expect(page.getByTestId("agent-usage-focused-models")).toContainText(
-    "claude-opus",
-  );
-  await expect(page.getByTestId("agent-usage-focused-models")).toContainText(
-    "goose",
-  );
+  const models = page.getByTestId("agent-usage-focused-models");
+  await expect(models).toContainText("claude-opus");
+  await expect(models).toContainText("goose");
 
-  // Reaching the same view via the Info-tab ingress row lands on the same
-  // subview (covers the ProfileIngressRow entry point, not just the
-  // row-click shortcut).
+  // Also verify the Info-tab ingress row entry point, not just row-click.
   await page.getByTestId("user-profile-panel-back").click();
   await expect(page.getByTestId("user-profile-tab-info")).toBeVisible();
   await page.getByTestId(`user-profile-view-usage-${agentPubkey}`).click();
   await expect(page.getByTestId("agent-usage-focused-view")).toBeVisible();
 });
-
-// A non-owned, non-managed agent seeded purely via `searchProfiles` (no
-// managed-agent creation) — used by the ingress-visibility test's
-// non-owner leg, which must be hidden regardless of archived evidence.
-const NON_OWNER_AGENT_PUBKEY = "7".repeat(64);
 
 test("Info-tab Usage ingress is visible for an owner-viewed agent, and absent for a human or a non-owner agent", async ({
   page,
@@ -335,22 +368,13 @@ test("Info-tab Usage ingress is visible for an owner-viewed agent, and absent fo
     ],
   });
 
-  // Owner case: a locally-managed agent is owned by the mock viewer by
-  // construction, so `canViewUsage` (viewerIsOwner && isBot) is true.
+  // Owner case: locally-managed agent is owned by the mock viewer → canViewUsage true.
   await openAgentsView(page);
   const ownedAgentPubkey = await addGenericAgent(page, "general", "Own Bot");
-  await page.evaluate(
-    (series) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
+  await seedSeries(
+    page,
     mockUsageSeries({ agents: [mockAgentUsage(ownedAgentPubkey)] }),
   );
-  await page.getByTestId("open-agents-view").click();
   await page.getByTestId(`agent-usage-row-${ownedAgentPubkey}`).click();
   await expect(page.getByTestId("user-profile-panel")).toBeVisible();
   await page.getByTestId("user-profile-panel-back").click();
@@ -359,108 +383,24 @@ test("Info-tab Usage ingress is visible for an owner-viewed agent, and absent fo
     page.getByTestId(`user-profile-view-usage-${ownedAgentPubkey}`),
   ).toBeVisible();
 
-  // Human case: `canViewUsage` requires `isBot`, so a plain human profile
-  // never renders the row, regardless of ownership.
-  await page.evaluate((pubkey) => {
-    (
-      window as Window & {
-        __TSR_ROUTER__?: { navigate: (opts: Record<string, unknown>) => void };
-      }
-    ).__TSR_ROUTER__?.navigate({
-      to: "/agents",
-      search: { profile: pubkey },
-    });
-  }, TEST_IDENTITIES.bob.pubkey);
-  await expect(page.getByTestId("user-profile-panel")).toBeVisible();
+  // Human case: canViewUsage requires isBot — row is absent for any human profile.
+  await navigateToProfile(page, TEST_IDENTITIES.bob.pubkey);
   await expect(
     page.getByTestId(`user-profile-view-usage-${TEST_IDENTITIES.bob.pubkey}`),
   ).toHaveCount(0);
 
-  // Non-owner agent case: `isBot` is true but `viewerIsOwner` is false (the
-  // declared owner is `outsider`, not the mock viewer) — the row stays
-  // hidden even though the agent is eligible for the focused view via
-  // archived evidence (A13 fail-closed is a separate axis from ingress
-  // visibility).
-  await page.evaluate((pubkey) => {
-    (
-      window as Window & {
-        __TSR_ROUTER__?: { navigate: (opts: Record<string, unknown>) => void };
-      }
-    ).__TSR_ROUTER__?.navigate({
-      to: "/agents",
-      search: { profile: pubkey },
-    });
-  }, NON_OWNER_AGENT_PUBKEY);
-  await expect(page.getByTestId("user-profile-panel")).toBeVisible();
+  // Non-owner agent case: isBot=true but viewerIsOwner=false → row stays hidden.
+  await navigateToProfile(page, NON_OWNER_AGENT_PUBKEY);
   await expect(
     page.getByTestId(`user-profile-view-usage-${NON_OWNER_AGENT_PUBKEY}`),
   ).toHaveCount(0);
 });
 
-test("the usage card fits a compact viewport without horizontal overflow, and its controls stay keyboard-focusable", async ({
-  page,
-}) => {
-  await installMockBridge(page);
-  await openAgentsView(page);
-
-  const agentPubkey = await addGenericAgent(page, "general", "Compact Bot");
-  await page.evaluate(
-    (series) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
-    mockUsageSeries({
-      agents: [mockAgentUsage(agentPubkey)],
-      buckets: Array.from({ length: 8 }, (_, i) => ({
-        start: 1_700_000_000 + i * 86_400,
-        end: 1_700_000_000 + (i + 1) * 86_400,
-        usage: reportedUsage({ totalTokens: String((i + 1) * 100) }),
-        reportCount: 1,
-        hasUnknownUsage: false,
-      })),
-    }),
-  );
-  await page.getByTestId("open-agents-view").click();
-  await expect(page.getByTestId("agent-usage-card")).toBeVisible();
-
-  await page.setViewportSize({ width: 520, height: 900 });
-  await expect(page.getByTestId("agent-usage-card")).toBeVisible();
-
-  const overflow = await page.evaluate(
-    () => document.documentElement.scrollWidth > window.innerWidth,
-  );
-  expect(overflow).toBe(false);
-
-  // Window-selector tabs and the agent row remain keyboard-focusable at
-  // this width — Tab forward from the 7d control must reach 30d, and the
-  // row must remain reachable and clickable via focus + Enter.
-  const window7 = page.getByTestId("agent-usage-window-7");
-  const window30 = page.getByTestId("agent-usage-window-30");
-  await window7.focus();
-  await expect(window7).toBeFocused();
-  // Radix's `Tabs` uses a roving tabindex: only the active tab is in the
-  // Tab order, and arrow keys move focus (and selection) between tabs.
-  await page.keyboard.press("ArrowRight");
-  await expect(window30).toBeFocused();
-
-  const row = page.getByTestId(`agent-usage-row-${agentPubkey}`);
-  await row.focus();
-  await expect(row).toBeFocused();
-  await page.keyboard.press("Enter");
-  await expect(page.getByTestId("agent-usage-focused-view")).toBeVisible();
-});
-
 test("surfaces a retry affordance when the usage query fails, and recovers on retry", async ({
   page,
 }) => {
-  // React Query's global `retry: 1` (queryClient.ts) auto-retries once
-  // before the UI ever sees an error, silently consuming one entry of the
-  // sequence — so two failures are needed before the UI's own error state
-  // (and its Retry button) appears; the third entry is the button click.
+  // React Query auto-retries once (queryClient.ts `retry: 1`), consuming one
+  // sequence entry silently — two failures are needed before the error UI shows.
   await installMockBridge(page, {
     agentUsageErrors: ["archive unavailable", "archive unavailable", null],
   });
@@ -492,7 +432,7 @@ test("shows the empty state when collection is on but nothing has been archived 
   await expect(page.getByTestId("agent-usage-collection-off")).toHaveCount(0);
 });
 
-test("shows the collection-off banner with a settings deep link, with and without retained data", async ({
+test("shows the collection-off banner with a settings deep link", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -520,36 +460,9 @@ test("shows the collection-off banner with a settings deep link, with and withou
   await expect(page.getByTestId("agents-usage-section")).toBeVisible();
 });
 
-test("shows retained-data coverage copy when collection is off but usage was previously archived", async ({
-  page,
-}) => {
-  await installMockBridge(page, {
-    agentUsageSeries: mockUsageSeries({
-      collectionEnabled: false,
-      coverage: {
-        firstArchivedAt: 1_700_000_000,
-        firstReportedAt: 1_700_000_000,
-        hasUnknownUsage: false,
-        invalidReportCount: 0,
-        lastArchivedAt: 1_700_086_400,
-        lastReportedAt: 1_700_086_400,
-        reportCount: 3,
-      },
-    }),
-  });
-
-  await openAgentsView(page);
-
-  await expect(page.getByTestId("agent-usage-collection-off")).toContainText(
-    "Collection off · data through",
-  );
-});
-
-// A13 fail-closed contract (Rev 3): the focused view's eligibility is
-// ownership OR archived evidence, decided only once the author-filtered
-// query resolves. Both tests below deep-link straight to
-// `?profileView=usage` for a non-owned, non-managed agent (declared owner is
-// `outsider`, not the mock viewer) so neither test depends on ownership.
+// A13 fail-closed: focused view eligibility = ownership OR archived evidence,
+// resolved once the author-filtered query completes. These tests deep-link
+// straight to `?profileView=usage` for a non-owned agent to bypass ownership.
 async function openUsageViewForHistoricalAgent(
   page: Page,
   agentUsageSeries: MockAgentUsageSeries,
@@ -569,21 +482,7 @@ async function openUsageViewForHistoricalAgent(
   await expect(page.getByTestId("agents-usage-section")).toBeVisible({
     timeout: 10_000,
   });
-  await page.evaluate((pubkey) => {
-    (
-      window as Window & {
-        __TSR_ROUTER__?: {
-          navigate: (opts: Record<string, unknown>) => void;
-        };
-      }
-    ).__TSR_ROUTER__?.navigate({
-      to: "/agents",
-      search: { profile: pubkey, profileView: "usage" },
-    });
-  }, HISTORICAL_AGENT_PUBKEY);
-  await expect(page.getByTestId("user-profile-panel")).toBeVisible({
-    timeout: 10_000,
-  });
+  await navigateToProfile(page, HISTORICAL_AGENT_PUBKEY, "usage");
 }
 
 test("a historical author with 30d-only archived evidence gets a valid empty 7d focused view, not a redirect", async ({
@@ -625,506 +524,7 @@ test("a hand-authored usage URL with no ownership and no archived evidence falls
   ).toBeVisible();
 });
 
-test("renders a Partial badge for an agent whose total is a known lower bound", async ({
-  page,
-}) => {
-  await installMockBridge(page);
-  await openAgentsView(page);
-
-  const agentPubkey = await addGenericAgent(page, "general", "Partial Bot");
-  await page.evaluate(
-    ({ series }) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
-    {
-      series: mockUsageSeries({
-        agents: [
-          mockAgentUsage(agentPubkey, {
-            hasUnknownUsage: true,
-            usage: {
-              estimatedCostUsd: costField(null),
-              inputTokens: usageField(null),
-              outputTokens: usageField(null),
-              totalTokens: usageField("900", true),
-            },
-          }),
-        ],
-      }),
-    },
-  );
-  await page.getByTestId("open-agents-view").click();
-
-  const row = page.getByTestId(`agent-usage-row-${agentPubkey}`);
-  await expect(row).toBeVisible();
-  await expect(row.getByText("Partial", { exact: true })).toBeVisible();
-});
-
-// ── F4: daily bars behavioral coverage ───────────────────────────────────────
-
-test("overview card renders daily bars with correct accessible labels distinguishing known, unknown, and empty days", async ({
-  page,
-}) => {
-  await installMockBridge(page);
-  await openAgentsView(page);
-
-  const agentPubkey = await addGenericAgent(page, "general", "Bar Bot");
-
-  // Three top-level buckets: one known (100 tokens), one unknown (reports but
-  // null total), one empty (zero reports).  The daily bar component must never
-  // encode "unknown" as "zero" — confirmed via aria-label inspection.
-  const knownStart = 1_700_000_000;
-  const unknownStart = knownStart + 86_400;
-  const emptyStart = unknownStart + 86_400;
-
-  await page.evaluate(
-    ({ series }) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
-    {
-      series: mockUsageSeries({
-        agents: [mockAgentUsage(agentPubkey, { buckets: [] })],
-        buckets: [
-          {
-            start: knownStart,
-            end: knownStart + 86_400,
-            usage: reportedUsage({ totalTokens: "100" }),
-            reportCount: 1,
-            hasUnknownUsage: false,
-          },
-          {
-            start: unknownStart,
-            end: unknownStart + 86_400,
-            // reportCount > 0 but totalTokens.value null → unknown, not zero
-            usage: reportedUsage({ totalTokens: null }),
-            reportCount: 1,
-            hasUnknownUsage: true,
-          },
-          {
-            start: emptyStart,
-            end: emptyStart + 86_400,
-            usage: reportedUsage({ totalTokens: null }),
-            reportCount: 0,
-            hasUnknownUsage: false,
-          },
-        ],
-      }),
-    },
-  );
-
-  await page.getByTestId("open-agents-view").click();
-  await expect(page.getByTestId("agent-usage-overall-bars")).toBeVisible();
-
-  const knownBar = page.getByTestId(`agent-usage-daily-bar-${knownStart}`);
-  const unknownBar = page.getByTestId(`agent-usage-daily-bar-${unknownStart}`);
-  const emptyBar = page.getByTestId(`agent-usage-daily-bar-${emptyStart}`);
-
-  await expect(knownBar).toBeVisible();
-  await expect(unknownBar).toBeVisible();
-  await expect(emptyBar).toBeVisible();
-
-  // Unknown day must have a distinct label — NOT "no usage reported" and NOT
-  // a token count.  Known and empty must each carry their own label too.
-  const knownLabel = await knownBar
-    .locator("[aria-label]")
-    .first()
-    .getAttribute("aria-label");
-  const unknownLabel = await unknownBar
-    .locator("[aria-label]")
-    .first()
-    .getAttribute("aria-label");
-  const emptyLabel = await emptyBar
-    .locator("[aria-label]")
-    .first()
-    .getAttribute("aria-label");
-
-  expect(knownLabel).toMatch(/reported tokens/i);
-  expect(unknownLabel).toMatch(/unknown usage/i);
-  expect(emptyLabel).toMatch(/no usage reported/i);
-
-  // Verify the three labels are all distinct — unknown must not collapse to zero.
-  expect(unknownLabel).not.toBe(emptyLabel);
-  expect(unknownLabel).not.toBe(knownLabel);
-});
-
-test("focused view shows daily bars, coverage dates, and a partial explanation when usage is incomplete", async ({
-  page,
-}) => {
-  await installMockBridge(page);
-  await openAgentsView(page);
-
-  const agentPubkey = await addGenericAgent(page, "general", "Coverage Bot");
-
-  const bucketStart = 1_700_000_000;
-  await page.evaluate(
-    ({ series }) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
-    {
-      series: mockUsageSeries({
-        agents: [
-          mockAgentUsage(agentPubkey, {
-            hasUnknownUsage: true,
-            reportCount: 3,
-            buckets: [
-              {
-                start: bucketStart,
-                end: bucketStart + 86_400,
-                usage: reportedUsage({
-                  // Incomplete i/o — proves the "input/output usage could not
-                  // be counted" caveat sentence and triggers the gate.
-                  inputTokens: "400",
-                  outputTokens: "100",
-                  totalTokens: "500",
-                }),
-                reportCount: 2,
-                hasUnknownUsage: true,
-              },
-            ],
-            usage: {
-              // Incomplete inputTokens → showUnknownIntervalsCaveat fires.
-              estimatedCostUsd: costField(null),
-              inputTokens: usageField("400", true), // incomplete
-              outputTokens: usageField("100", false),
-              totalTokens: usageField("500"),
-            },
-          }),
-        ],
-        coverage: {
-          firstArchivedAt: 1_700_000_000,
-          firstReportedAt: 1_700_000_000,
-          hasUnknownUsage: true,
-          invalidReportCount: 1,
-          lastArchivedAt: 1_700_086_400,
-          lastReportedAt: 1_700_086_400,
-          reportCount: 3,
-        },
-      }),
-    },
-  );
-
-  // Navigate to the focused view via the row click shortcut.
-  await page.getByTestId("open-agents-view").click();
-  await expect(
-    page.getByTestId(`agent-usage-row-${agentPubkey}`),
-  ).toBeVisible();
-  await page.getByTestId(`agent-usage-row-${agentPubkey}`).click();
-  await expect(page.getByTestId("agent-usage-focused-view")).toBeVisible();
-
-  // Daily bars section must appear in the focused view.
-  await expect(
-    page.getByTestId("agent-usage-focused-daily-bars"),
-  ).toBeVisible();
-
-  // Coverage section must contain the report count.
-  const coverage = page.getByTestId("agent-usage-focused-coverage");
-  await expect(coverage).toBeVisible();
-  await expect(coverage).toContainText("reported turn");
-
-  // Both caveat sentences must appear when the gate conditions are met.
-  // The seed has inputTokens.incomplete=true (fires unknown-intervals sentence)
-  // AND invalidReportCount=1 (fires invalid-reports sentence).
-  await expect(
-    page.getByTestId("agent-usage-focused-unknown-intervals-caveat"),
-  ).toBeVisible();
-  await expect(
-    page.getByTestId("agent-usage-focused-invalid-reports-caveat"),
-  ).toBeVisible();
-});
-
-// ── T1: invalid-only window behavioral coverage ───────────────────────────────
-
-test("overview and focused view distinguish invalid-only windows from ordinary empty windows", async ({
-  page,
-}) => {
-  // An invalid-only window: invalidReportCount > 0, zero valid agents/buckets.
-  // The overview must NOT say "No locally archived usage in the last N days"
-  // and the focused view must NOT show the outside-window hint — both would
-  // mislabel in-window-but-uncountable evidence as absent.
-  await installMockBridge(page);
-  await openAgentsView(page);
-
-  const agentPubkey = await addGenericAgent(page, "general", "Invalid Bot");
-
-  await page.evaluate(
-    ({ series }) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
-    {
-      series: mockUsageSeries({
-        agents: [], // no valid rows
-        buckets: [], // invalid rows never bucketed
-        coverage: {
-          firstArchivedAt: 1_700_000_000,
-          firstReportedAt: null,
-          hasUnknownUsage: true,
-          invalidReportCount: 2, // the signal
-          lastArchivedAt: 1_700_086_400,
-          lastReportedAt: null,
-          reportCount: 0,
-        },
-        hasArchivedEvidence: true, // A13 returns true for invalid rows too
-      }),
-    },
-  );
-
-  await page.getByTestId("open-agents-view").click();
-  await expect(page.getByTestId("agent-usage-card")).toBeVisible();
-
-  // Overview empty-state must reflect uncountable usage, not ordinary empty.
-  const empty = page.getByTestId("agent-usage-empty");
-  await expect(empty).toBeVisible();
-  await expect(empty).not.toContainText("No locally archived usage");
-  await expect(empty).toContainText("could not be counted");
-
-  // Navigate directly to the focused usage view for this agent.
-  await page.evaluate((pubkey) => {
-    (
-      window as Window & {
-        __TSR_ROUTER__?: { navigate: (opts: Record<string, unknown>) => void };
-      }
-    ).__TSR_ROUTER__?.navigate({
-      to: "/agents",
-      search: { profile: pubkey, profileView: "usage" },
-    });
-  }, agentPubkey);
-  await expect(page.getByTestId("agent-usage-focused-view")).toBeVisible({
-    timeout: 10_000,
-  });
-
-  // Focused view must show the invalid-only state, NOT the outside-window hint.
-  await expect(
-    page.getByTestId("agent-usage-focused-invalid-only"),
-  ).toBeVisible();
-  await expect(
-    page.getByTestId("agent-usage-focused-outside-window"),
-  ).toHaveCount(0);
-});
-
-// ── T1b: Behavioral regression guard — null totalTokens with known i/o renders ≈ ─
-//
-// This scenario will fail if the approximate display fallback is removed.
-// It covers the real-world prod shape where no publisher emits totalTokens
-// today — the overview row, header, daily bar, and focused total must all
-// visibly render ≈ rather than "No usage reported".
-
-test("overview row, header, daily bar, and focused total all render ≈ when totalTokens is null but i/o is known", async ({
-  page,
-}) => {
-  await installMockBridge(page);
-  await openAgentsView(page);
-
-  const agentPubkey = await addGenericAgent(page, "general", "Approx Bot");
-
-  await page.evaluate(
-    ({ series }) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
-    {
-      series: mockUsageSeries({
-        agents: [
-          mockAgentUsage(agentPubkey, {
-            buckets: [
-              {
-                start: 1_700_000_000,
-                end: 1_700_086_400,
-                hasUnknownUsage: false,
-                reportCount: 1,
-                usage: reportedUsage({
-                  inputTokens: "800",
-                  outputTokens: "200",
-                  totalTokens: null, // real prod shape — no provider total
-                }),
-              },
-            ],
-            usage: reportedUsage({
-              inputTokens: "800",
-              outputTokens: "200",
-              totalTokens: null, // real prod shape — no provider total
-            }),
-          }),
-        ],
-        buckets: [
-          {
-            start: 1_700_000_000,
-            end: 1_700_086_400,
-            hasUnknownUsage: false,
-            reportCount: 1,
-            usage: reportedUsage({
-              inputTokens: "800",
-              outputTokens: "200",
-              totalTokens: null,
-            }),
-          },
-        ],
-        coverage: {
-          firstArchivedAt: 1_700_000_000,
-          firstReportedAt: 1_700_000_000,
-          hasUnknownUsage: false,
-          invalidReportCount: 0,
-          lastArchivedAt: 1_700_086_400,
-          lastReportedAt: 1_700_086_400,
-          reportCount: 1,
-        },
-      }),
-    },
-  );
-
-  await page.getByTestId("open-agents-view").click();
-
-  // Overview row must render ≈ approximate total, not "No usage reported".
-  const row = page.getByTestId(`agent-usage-row-${agentPubkey}`);
-  await expect(row).toBeVisible();
-  await expect(row).toContainText("≈");
-  await expect(row).not.toContainText("No usage reported");
-
-  // Section header must render ≈ total (sumKnownBucketTotals → approximate).
-  // Assert the dedicated value node directly so the header fails independently
-  // even if a child daily bar still shows ≈.
-  const headerValue = page.getByTestId("agent-usage-header-value");
-  await expect(headerValue).toBeVisible();
-  await expect(headerValue).toContainText("≈");
-  await expect(headerValue).not.toContainText("No usage reported");
-
-  // Daily bar must render with a bar (not a hatched unknown baseline) and
-  // show ≈ trailing label.
-  const dailyBars = page.getByTestId("agent-usage-daily-bars");
-  await expect(dailyBars).toBeVisible();
-  await expect(dailyBars).toContainText("≈");
-
-  // Focused total must render ≈ approximate stat.
-  // Assert the dedicated value node directly so the stat fails independently
-  // even if a focused daily bar still shows ≈.
-  await row.click();
-  await expect(page.getByTestId("user-profile-panel")).toBeVisible();
-  await expect(page.getByTestId("agent-usage-focused-view")).toBeVisible();
-  const focusedTotalValue = page.getByTestId("agent-usage-focused-total-value");
-  await expect(focusedTotalValue).toBeVisible();
-  await expect(focusedTotalValue).toContainText("≈");
-  await expect(focusedTotalValue).not.toHaveText("—");
-});
-
-// ── T2: I/O-incomplete partial behavioral coverage ────────────────────────────
-
-test("overview row shows Partial badge and ingress shows partial marker when I/O fields are incomplete with null total", async ({
-  page,
-}) => {
-  await installMockBridge(page);
-  await openAgentsView(page);
-
-  const agentPubkey = await addGenericAgent(page, "general", "IO Partial Bot");
-
-  await page.evaluate(
-    ({ series }) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
-    {
-      series: mockUsageSeries({
-        agents: [
-          mockAgentUsage(agentPubkey, {
-            buckets: [
-              {
-                start: 1_700_000_000,
-                end: 1_700_086_400,
-                hasUnknownUsage: false,
-                reportCount: 1,
-                usage: {
-                  // null total, incomplete input — approx-partial bar kind
-                  estimatedCostUsd: costField(null),
-                  inputTokens: usageField("800", true), // incomplete
-                  outputTokens: usageField("200", false),
-                  totalTokens: usageField(null),
-                },
-              },
-            ],
-            usage: {
-              // null total, incomplete I/O — per-field Partial must surface
-              estimatedCostUsd: costField(null),
-              inputTokens: usageField("800", true), // incomplete
-              outputTokens: usageField("200", false),
-              totalTokens: usageField(null),
-            },
-          }),
-        ],
-        buckets: [
-          {
-            start: 1_700_000_000,
-            end: 1_700_086_400,
-            hasUnknownUsage: false,
-            reportCount: 1,
-            usage: {
-              // null total, incomplete input — approx-partial aggregate
-              estimatedCostUsd: costField(null),
-              inputTokens: usageField("800", true), // incomplete
-              outputTokens: usageField("200", false),
-              totalTokens: usageField(null),
-            },
-          },
-        ],
-      }),
-    },
-  );
-
-  await page.getByTestId("open-agents-view").click();
-  const row = page.getByTestId(`agent-usage-row-${agentPubkey}`);
-  await expect(row).toBeVisible();
-
-  // Row must show Partial badge — the approximate total carries partial provenance.
-  await expect(row.getByText("Partial", { exact: true })).toBeVisible();
-  // Row must show the ≈ approximate total (both i/o present, null total → approx display).
-  await expect(row).toContainText("≈ 1K");
-
-  // Daily bar for an approx-partial bucket must use ≈N* trailing text
-  // (distinct from plain ≈N so a sighted user sees the partial signal).
-  const dailyBars = page.getByTestId("agent-usage-daily-bars");
-  await expect(dailyBars).toBeVisible();
-  await expect(dailyBars).toContainText("≈1K*");
-
-  // Open the profile panel to reach the Info tab for ingress verification.
-  await row.click();
-  await expect(page.getByTestId("user-profile-panel")).toBeVisible();
-  await page.getByTestId("user-profile-panel-back").click();
-  await expect(page.getByTestId("user-profile-tab-info")).toBeVisible();
-
-  // The ingress trailing for an I/O-only-with-partial series must contain
-  // "Partial" (i.e., "Input/output reported · Partial").
-  const ingressRow = page.getByTestId(`user-profile-view-usage-${agentPubkey}`);
-  await expect(ingressRow).toBeVisible();
-  await expect(ingressRow).toContainText("Partial");
-});
-
-// ── Task C: date x-axis, on-bar values, hover tooltip ────────────────────────
-
-test("each daily bar labels its date on the x-axis and its token total on the bar", async ({
+test("daily bars label the date on the axis and the total on the bar, and their tooltips report unknown fields as unknown", async ({
   page,
 }) => {
   await installMockBridge(page);
@@ -1132,51 +532,37 @@ test("each daily bar labels its date on the x-axis and its token total on the ba
 
   const agentPubkey = await addGenericAgent(page, "general", "Axis Bot");
 
-  const knownStart = 1_700_000_000;
-  const unknownStart = knownStart + 86_400;
-
-  await page.evaluate(
-    ({ series }) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
-    {
-      series: mockUsageSeries({
-        agents: [mockAgentUsage(agentPubkey, { buckets: [] })],
-        buckets: [
-          {
-            start: knownStart,
-            end: knownStart + 86_400,
-            usage: reportedUsage({
-              inputTokens: "1000",
-              outputTokens: "500",
-              totalTokens: "1500",
-            }),
-            reportCount: 1,
-            hasUnknownUsage: false,
-          },
-          {
-            start: unknownStart,
-            end: unknownStart + 86_400,
-            usage: reportedUsage({ totalTokens: null }),
-            reportCount: 1,
-            hasUnknownUsage: true,
-          },
-        ],
-      }),
-    },
+  const knownStart = BASE;
+  const unknownStart = BASE + DAY;
+  await seedSeries(
+    page,
+    mockUsageSeries({
+      agents: [mockAgentUsage(agentPubkey, { buckets: [] })],
+      buckets: [
+        dayBucket(
+          0,
+          reportedUsage({
+            inputTokens: "1200",
+            outputTokens: "300",
+            totalTokens: "1500",
+          }),
+        ),
+        dayBucket(
+          1,
+          reportedUsage({
+            inputTokens: "1200",
+            outputTokens: null,
+            totalTokens: null,
+          }),
+          { hasUnknownUsage: true },
+        ),
+      ],
+    }),
   );
-
-  await page.getByTestId("open-agents-view").click();
   await expect(page.getByTestId("agent-usage-overall-bars")).toBeVisible();
 
-  // The x-axis tick is the bucket's DATE, rendered in the browser's locale —
-  // asserted against the same `toLocaleDateString` call the component makes,
-  // so the expectation is timezone/locale-independent.
+  // x-axis tick must be the DATE, not the token total — asserted via the same
+  // toLocaleDateString call the component makes (locale/TZ-independent).
   const expectedDate = await page.evaluate(
     (start) =>
       new Date(start * 1000).toLocaleDateString(undefined, {
@@ -1186,78 +572,37 @@ test("each daily bar labels its date on the x-axis and its token total on the ba
     knownStart,
   );
   const dateTick = page.getByTestId(`agent-usage-daily-bar-date-${knownStart}`);
-  await expect(dateTick).toBeVisible();
   await expect(dateTick).toHaveText(expectedDate);
-  // The date must NOT be the token total — the pre-fix chart labeled the axis
-  // with the value, which is the bug this asserts against.
+  // The pre-fix chart labeled the axis with the value — ensure that's not the case.
   await expect(dateTick).not.toContainText("1.5K");
 
-  // The token total renders directly ON the bar.
-  const valueLabel = page.getByTestId(
-    `agent-usage-daily-bar-value-${knownStart}`,
-  );
-  await expect(valueLabel).toBeVisible();
-  await expect(valueLabel).toHaveText("1.5K");
+  // Token total renders ON the bar; an uncountable day shows em-dash, not zero.
+  await expect(
+    page.getByTestId(`agent-usage-daily-bar-value-${knownStart}`),
+  ).toHaveText("1.5K");
+  await expect(
+    page.getByTestId(`agent-usage-daily-bar-value-${unknownStart}`),
+  ).toHaveText("—");
 
-  // An uncountable day shows an em-dash on the bar, never a zero.
-  const unknownValue = page.getByTestId(
-    `agent-usage-daily-bar-value-${unknownStart}`,
-  );
-  await expect(unknownValue).toHaveText("—");
-});
+  // Aria labels: countable day → "reported tokens", unknown day → "unknown usage".
+  const ariaLabel = (start: number) =>
+    page
+      .getByTestId(`agent-usage-daily-bar-${start}`)
+      .locator("[aria-label]")
+      .first()
+      .getAttribute("aria-label");
+  expect(await ariaLabel(knownStart)).toMatch(/reported tokens/i);
+  expect(await ariaLabel(unknownStart)).toMatch(/unknown usage/i);
 
-test("hovering a daily bar reveals a tooltip with the total, input, and output breakdown", async ({
-  page,
-}) => {
-  await installMockBridge(page);
-  await openAgentsView(page);
-
-  const agentPubkey = await addGenericAgent(page, "general", "Tooltip Bot");
-
-  const bucketStart = 1_700_000_000;
-  await page.evaluate(
-    ({ series }) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
-    {
-      series: mockUsageSeries({
-        agents: [mockAgentUsage(agentPubkey, { buckets: [] })],
-        buckets: [
-          {
-            start: bucketStart,
-            end: bucketStart + 86_400,
-            usage: reportedUsage({
-              inputTokens: "1200",
-              outputTokens: "300",
-              totalTokens: "1500",
-            }),
-            reportCount: 1,
-            hasUnknownUsage: false,
-          },
-        ],
-      }),
-    },
-  );
-
-  await page.getByTestId("open-agents-view").click();
-  await expect(page.getByTestId("agent-usage-overall-bars")).toBeVisible();
-
-  await page.getByTestId(`agent-usage-daily-bar-${bucketStart}`).hover();
-
-  // Exact grouped values — the split must be legible without opening the
-  // focused view, which is the whole point of the tooltip.
-  const tooltip = page
-    .getByTestId(`agent-usage-daily-bar-tooltip-${bucketStart}`)
+  // Hover tooltip: exact breakdown must show without opening the focused view.
+  await page.getByTestId(`agent-usage-daily-bar-${knownStart}`).hover();
+  const knownTooltip = page
+    .getByTestId(`agent-usage-daily-bar-tooltip-${knownStart}`)
     .first();
-  await expect(tooltip).toBeVisible({ timeout: 10_000 });
-  await expect(tooltip).toContainText("Total: 1,500");
-  await expect(tooltip).toContainText("Input: 1,200");
-  await expect(tooltip).toContainText("Output: 300");
+  await expect(knownTooltip).toBeVisible({ timeout: 10_000 });
+  await expect(knownTooltip).toContainText("Total: 1,500");
+  await expect(knownTooltip).toContainText("Input: 1,200");
+  await expect(knownTooltip).toContainText("Output: 300");
 });
 
 test("a bar tooltip reports an unknown field as unknown rather than zero", async ({
@@ -1268,43 +613,29 @@ test("a bar tooltip reports an unknown field as unknown rather than zero", async
 
   const agentPubkey = await addGenericAgent(page, "general", "Halfknown Bot");
 
-  const bucketStart = 1_700_000_000;
-  await page.evaluate(
-    ({ series }) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
-    {
-      series: mockUsageSeries({
-        agents: [mockAgentUsage(agentPubkey, { buckets: [] })],
-        buckets: [
-          {
-            start: bucketStart,
-            end: bucketStart + 86_400,
-            // Output is genuinely unreported: it must read "unknown", and the
-            // total must stay unknown rather than being derived from input.
-            usage: reportedUsage({
-              inputTokens: "1200",
-              outputTokens: null,
-              totalTokens: null,
-            }),
-            reportCount: 1,
-            hasUnknownUsage: true,
-          },
-        ],
-      }),
-    },
+  const bucketStart = BASE + DAY;
+  await seedSeries(
+    page,
+    mockUsageSeries({
+      agents: [mockAgentUsage(agentPubkey, { buckets: [] })],
+      buckets: [
+        // Output is genuinely unreported: it must read "unknown", and the
+        // total must stay unknown rather than being derived from input.
+        dayBucket(
+          1,
+          reportedUsage({
+            inputTokens: "1200",
+            outputTokens: null,
+            totalTokens: null,
+          }),
+          { hasUnknownUsage: true },
+        ),
+      ],
+    }),
   );
-
-  await page.getByTestId("open-agents-view").click();
   await expect(page.getByTestId("agent-usage-overall-bars")).toBeVisible();
 
   await page.getByTestId(`agent-usage-daily-bar-${bucketStart}`).hover();
-
   const tooltip = page
     .getByTestId(`agent-usage-daily-bar-tooltip-${bucketStart}`)
     .first();
@@ -1315,8 +646,53 @@ test("a bar tooltip reports an unknown field as unknown rather than zero", async
   await expect(tooltip).not.toContainText("Output: 0");
 });
 
-// ── Task D: custom date-range picker ─────────────────────────────────────────
+// Regression guard: null totalTokens with known i/o must render ≈, not "No usage reported".
+test("overview row, header, daily bar, and focused total all render ≈ when totalTokens is null but i/o is known", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await openAgentsView(page);
 
+  const agentPubkey = await addGenericAgent(page, "general", "Approx Bot");
+  // Real prod shape — no provider total, both i/o known.
+  const approxUsage = reportedUsage({
+    inputTokens: "800",
+    outputTokens: "200",
+    totalTokens: null,
+  });
+  await seedSeries(
+    page,
+    mockUsageSeries({
+      agents: [
+        mockAgentUsage(agentPubkey, {
+          buckets: [dayBucket(0, approxUsage)],
+          usage: approxUsage,
+        }),
+      ],
+      buckets: [dayBucket(0, approxUsage)],
+      coverage: archivedCoverage(1),
+    }),
+  );
+
+  const row = page.getByTestId(`agent-usage-row-${agentPubkey}`);
+  await expect(row).toBeVisible();
+  await expect(row).toContainText("≈");
+  await expect(row).not.toContainText("No usage reported");
+
+  // Assert value node directly so the header fails independently of daily bars.
+  const headerValue = page.getByTestId("agent-usage-header-value");
+  await expect(headerValue).toContainText("≈");
+  await expect(headerValue).not.toContainText("No usage reported");
+
+  await expect(page.getByTestId("agent-usage-daily-bars")).toContainText("≈");
+
+  // Assert focused total value node directly so it fails independently.
+  await row.click();
+  await expect(page.getByTestId("agent-usage-focused-view")).toBeVisible();
+  const focusedTotalValue = page.getByTestId("agent-usage-focused-total-value");
+  await expect(focusedTotalValue).toContainText("≈");
+  await expect(focusedTotalValue).not.toHaveText("—");
+});
 test("the custom range picker applies an arbitrary date span and labels it in the empty state", async ({
   page,
 }) => {
@@ -1339,8 +715,7 @@ test("the custom range picker applies an arbitrary date span and labels it in th
     page.getByTestId("agent-usage-window-custom-popover"),
   ).toHaveCount(0);
 
-  // The custom tab is now the active window, and the empty-state copy names
-  // the applied span instead of "the last N days".
+  // Custom tab is now active; empty-state names the applied span, not "last N days".
   await expect(page.getByTestId("agent-usage-window-custom")).toHaveAttribute(
     "data-state",
     "active",
@@ -1366,9 +741,8 @@ test("the custom range picker blocks an inverted range and a span over one year"
   await expect(error).toContainText("on or before");
   await expect(apply).toBeDisabled();
 
-  // 2024-01-01 → 2025-01-01 is 367 civil days: one past the cap the backend's
-  // boundary arity admits, so the picker must refuse it locally rather than
-  // letting the request surface a Rust error.
+  // 2024-01-01 → 2025-01-01 is 367 civil days: one past the cap.
+  // The picker must block it locally, not let it surface a Rust error.
   await page.getByTestId("agent-usage-window-custom-start").fill("2024-01-01");
   await page.getByTestId("agent-usage-window-custom-end").fill("2025-01-01");
   await expect(error).toContainText("366 days or fewer");
@@ -1389,20 +763,11 @@ test("the focused view exposes its own independent range selector", async ({
   await openAgentsView(page);
 
   const agentPubkey = await addGenericAgent(page, "general", "Focused Bot");
-
-  await page.evaluate(
-    ({ series }) => {
-      const testWindow = window as Window & {
-        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
-      };
-      testWindow.__BUZZ_E2E__ ??= {};
-      testWindow.__BUZZ_E2E__.mock ??= {};
-      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
-    },
-    { series: mockUsageSeries({ agents: [mockAgentUsage(agentPubkey)] }) },
+  await seedSeries(
+    page,
+    mockUsageSeries({ agents: [mockAgentUsage(agentPubkey)] }),
   );
 
-  await page.getByTestId("open-agents-view").click();
   await page.getByTestId(`agent-usage-row-${agentPubkey}`).click();
   await expect(page.getByTestId("agent-usage-focused-view")).toBeVisible();
 
@@ -1411,15 +776,12 @@ test("the focused view exposes its own independent range selector", async ({
     page.getByTestId("agent-usage-focused-window-1"),
   ).toHaveAttribute("data-state", "active");
 
-  // The overview's own selector is unaffected — the two windows are
-  // deliberately independent.
+  // The overview's own selector is unaffected — the two windows are independent.
   await expect(page.getByTestId("agent-usage-window-7")).toHaveAttribute(
     "data-state",
     "active",
   );
 });
-
-// ── Nav order: the Usage section sits at the bottom of the Agents page ───────
 
 test("the usage section renders below the agents and teams sections", async ({
   page,

@@ -1,14 +1,8 @@
 /**
- * Fake-timer proof for the M4-frozen midnight-rollover contract:
- * `useLocalDayBoundaries` schedules exactly one `setTimeout` per local
- * midnight, and each fire both rebuilds the boundary set (so the query key
- * changes) AND reschedules the next fire — never `setInterval`, which would
- * drift across DST.
- *
- * Uses the same minimal DOM shim + `react-dom/client` `createRoot`/`act`
- * harness pattern as `useAnchoredScroll.lifecycle.test.mjs`, combined with
- * `node:test`'s `mock.timers` (as used in `activeAgentTurnsStore.test.mjs`)
- * to drive the wall clock deterministically across the rollover boundary.
+ * Fake-timer proof for `useLocalDayBoundaries`: verifies it schedules exactly
+ * one `setTimeout` per local midnight, rebuilding boundaries and rescheduling
+ * the next fire each time — never `setInterval` (which would drift across DST).
+ * Uses `node:test`'s `mock.timers` to drive the wall clock deterministically.
  */
 
 import assert from "node:assert/strict";
@@ -28,9 +22,7 @@ function installDOMShim() {
     removeEventListener(type, listener) {
       this.listeners.set(
         type,
-        (this.listeners.get(type) ?? []).filter(
-          (current) => current !== listener,
-        ),
+        (this.listeners.get(type) ?? []).filter((l) => l !== listener),
       );
     }
 
@@ -57,19 +49,15 @@ function installDOMShim() {
     get ownerDocument() {
       return globalThis.document;
     }
-
     get firstChild() {
       return this.children[0] ?? null;
     }
-
     get lastChild() {
       return this.children.at(-1) ?? null;
     }
-
     get nextSibling() {
       return null;
     }
-
     get nodeValue() {
       return null;
     }
@@ -144,9 +132,8 @@ function installDOMShim() {
     configurable: true,
     value: globalThis,
   });
-  // Never route through the mocked `setTimeout` — React's scheduler falls
-  // back to a real `MessageChannel` (present natively in Node), so mocking
-  // only `setTimeout`/`Date` below cannot stall a commit.
+  // React's scheduler uses MessageChannel (native in Node) as a fallback, so
+  // mocking setTimeout/Date cannot stall commits — rAF just needs to exist.
   globalThis.requestAnimationFrame = (callback) => setTimeout(callback, 0);
   globalThis.cancelAnimationFrame = (id) => clearTimeout(id);
   globalThis.CSS = { escape: (value) => value };
@@ -168,242 +155,192 @@ function Harness({ onBoundaries, range }) {
 
 const SEVEN_DAY_RANGE = { kind: "preset", days: 7 };
 
-test("useLocalDayBoundaries reschedules across two local-midnight rollovers, rebuilding boundaries each time", async () => {
-  // One minute before local midnight, so the first scheduled `setTimeout`
-  // fires quickly under `mock.timers`.
-  const beforeMidnight = new Date(2026, 5, 15, 23, 59, 0);
-  mock.timers.enable({
-    apis: ["setTimeout", "Date"],
-    now: beforeMidnight.getTime(),
-  });
+/** Local midnight as unix seconds, the unit the hook emits. */
+function midnight(year, monthIndex, day) {
+  return Math.floor(
+    new Date(year, monthIndex, day, 0, 0, 0, 0).getTime() / 1_000,
+  );
+}
 
-  try {
-    let latest = null;
-    const captured = [];
-    const onBoundaries = (boundaries) => {
-      latest = boundaries;
-    };
-
-    const root = createRoot(document.createElement("div"));
+/**
+ * Mounts the hook with `initialRange` and calls `run` with a live view:
+ * `boundaries` = newest emission, `renders` = emission count,
+ * `render(range)` re-renders, `tick(ms)` advances the mocked clock.
+ */
+async function withMountedHook(initialRange, run) {
+  const emissions = [];
+  const root = createRoot(document.createElement("div"));
+  const render = async (range) => {
     await act(async () => {
       root.render(
-        React.createElement(Harness, { onBoundaries, range: SEVEN_DAY_RANGE }),
+        React.createElement(Harness, {
+          onBoundaries: (boundaries) => emissions.push(boundaries),
+          range,
+        }),
       );
     });
+  };
 
-    assert.equal(latest.length, 8, "7-day window yields 8 boundaries");
-    captured.push(latest);
-
-    // Advance 1 minute — crosses the Jun 16 local midnight. The single
-    // scheduled `setTimeout` must fire, bump `rolloverTick`, and rebuild the
-    // boundary set (React flushes the resulting state update inside `act`).
-    await act(async () => {
-      mock.timers.tick(60_000);
+  try {
+    await render(initialRange);
+    await run({
+      emissions,
+      get boundaries() {
+        return emissions.at(-1);
+      },
+      get renders() {
+        return emissions.length;
+      },
+      render,
+      unmount: async () => {
+        await act(async () => {
+          root.unmount();
+        });
+      },
+      /** Advance the mocked wall clock, flushing any React work it triggers. */
+      tick: async (ms) => {
+        await act(async () => {
+          mock.timers.tick(ms);
+        });
+      },
     });
-
-    assert.notDeepEqual(
-      latest,
-      captured[0],
-      "boundaries must rebuild after the first midnight rollover fires",
-    );
-    assert.equal(latest.length, 8, "boundary count is unchanged by a rollover");
-    const juneSeventeenTomorrow = Math.floor(
-      new Date(2026, 5, 17, 0, 0, 0, 0).getTime() / 1_000,
-    );
-    assert.equal(
-      latest.at(-1),
-      juneSeventeenTomorrow,
-      "newest boundary must shift forward to tomorrow of the new window",
-    );
-    captured.push(latest);
-
-    // Advance a full day — crosses the Jun 17 local midnight. This only
-    // fires if the first rollover's effect RESCHEDULED a fresh `setTimeout`
-    // rather than firing once and going silent.
-    await act(async () => {
-      mock.timers.tick(24 * 60 * 60 * 1000);
-    });
-
-    assert.notDeepEqual(
-      latest,
-      captured[1],
-      "boundaries must rebuild again after the second midnight rollover fires, proving the timer rescheduled itself",
-    );
-    const juneEighteenTomorrow = Math.floor(
-      new Date(2026, 5, 18, 0, 0, 0, 0).getTime() / 1_000,
-    );
-    assert.equal(
-      latest.at(-1),
-      juneEighteenTomorrow,
-      "newest boundary must shift forward again after the rescheduled rollover",
-    );
-
+  } finally {
     await act(async () => {
       root.unmount();
     });
+  }
+}
+
+/** Runs `fn` with the wall clock frozen one minute before a local midnight. */
+async function atOneMinuteToMidnight(fn) {
+  mock.timers.enable({
+    apis: ["setTimeout", "Date"],
+    now: new Date(2026, 5, 15, 23, 59, 0).getTime(),
+  });
+  try {
+    await fn();
   } finally {
     mock.timers.reset();
   }
+}
+
+test("useLocalDayBoundaries reschedules across two local-midnight rollovers, rebuilding boundaries each time", async () => {
+  await atOneMinuteToMidnight(async () => {
+    await withMountedHook(SEVEN_DAY_RANGE, async (hook) => {
+      assert.equal(
+        hook.boundaries.length,
+        8,
+        "7-day window yields 8 boundaries",
+      );
+      const initial = hook.boundaries;
+
+      // Crosses the Jun 16 local midnight. The single scheduled `setTimeout`
+      // must fire, bump `rolloverTick`, and rebuild the boundary set.
+      await hook.tick(60_000);
+
+      assert.notDeepEqual(
+        hook.boundaries,
+        initial,
+        "boundaries must rebuild after the first midnight rollover fires",
+      );
+      assert.equal(
+        hook.boundaries.length,
+        8,
+        "boundary count is unchanged by a rollover",
+      );
+      assert.equal(
+        hook.boundaries.at(-1),
+        midnight(2026, 5, 17),
+        "newest boundary must shift forward to tomorrow of the new window",
+      );
+      const afterFirst = hook.boundaries;
+
+      // Crossing the Jun 17 local midnight only fires if the first rollover's
+      // effect RESCHEDULED a fresh `setTimeout` rather than going silent.
+      await hook.tick(24 * 60 * 60 * 1_000);
+
+      assert.notDeepEqual(
+        hook.boundaries,
+        afterFirst,
+        "boundaries must rebuild again after the second rollover, proving the timer rescheduled itself",
+      );
+      assert.equal(
+        hook.boundaries.at(-1),
+        midnight(2026, 5, 18),
+        "newest boundary must shift forward again after the rescheduled rollover",
+      );
+    });
+  });
 });
 
 test("useLocalDayBoundaries clears its scheduled timeout on unmount (no post-unmount rollover)", async () => {
-  const beforeMidnight = new Date(2026, 5, 15, 23, 59, 0);
-  mock.timers.enable({
-    apis: ["setTimeout", "Date"],
-    now: beforeMidnight.getTime(),
-  });
+  await atOneMinuteToMidnight(async () => {
+    await withMountedHook(SEVEN_DAY_RANGE, async (hook) => {
+      const rendersAtUnmount = hook.renders;
+      await hook.unmount();
 
-  try {
-    let renderCount = 0;
-    const onBoundaries = () => {
-      renderCount++;
-    };
+      // Crossing the midnight the pending timeout targeted must not throw or
+      // invoke a setState-after-unmount path — `clearTimeout` in the effect's
+      // cleanup must have already cancelled it.
+      await hook.tick(60_000);
 
-    const root = createRoot(document.createElement("div"));
-    await act(async () => {
-      root.render(
-        React.createElement(Harness, { onBoundaries, range: SEVEN_DAY_RANGE }),
+      assert.equal(
+        hook.renders,
+        rendersAtUnmount,
+        "no render (and no error) after the component unmounted",
       );
     });
-    const countAtUnmount = renderCount;
-
-    await act(async () => {
-      root.unmount();
-    });
-
-    // Crossing the midnight the pending timeout targeted must not throw or
-    // invoke a setState-after-unmount path — `clearTimeout` in the effect's
-    // cleanup must have already cancelled it.
-    await act(async () => {
-      mock.timers.tick(60_000);
-    });
-
-    assert.equal(
-      renderCount,
-      countAtUnmount,
-      "no render (and no error) after the component unmounted",
-    );
-  } finally {
-    mock.timers.reset();
-  }
+  });
 });
 
 test("useLocalDayBoundaries returns the same boundary array when re-rendered with an equal range literal", async () => {
-  const captured = [];
-  const onBoundaries = (boundaries) => {
-    captured.push(boundaries);
-  };
+  await withMountedHook({ kind: "preset", days: 7 }, async (hook) => {
+    // A fresh object literal each render — the memo must key on the range's
+    // fields, not its identity, or every render would refetch.
+    await hook.render({ kind: "preset", days: 7 });
 
-  const root = createRoot(document.createElement("div"));
-  try {
-    await act(async () => {
-      // A fresh object literal each render — the memo must key on the range's
-      // fields, not its identity, or every render would refetch.
-      root.render(
-        React.createElement(Harness, {
-          onBoundaries,
-          range: { kind: "preset", days: 7 },
-        }),
-      );
-    });
-    await act(async () => {
-      root.render(
-        React.createElement(Harness, {
-          onBoundaries,
-          range: { kind: "preset", days: 7 },
-        }),
-      );
-    });
-
-    assert.ok(captured.length >= 2, "component rendered at least twice");
+    assert.ok(hook.renders >= 2, "component rendered at least twice");
     assert.equal(
-      captured.at(-1),
-      captured[0],
+      hook.boundaries,
+      hook.emissions[0],
       "an equal range literal must reuse the memoized boundary array",
     );
-  } finally {
-    await act(async () => {
-      root.unmount();
-    });
-  }
+  });
 });
 
 test("useLocalDayBoundaries rebuilds when the range changes to a custom range", async () => {
-  let latest = null;
-  const onBoundaries = (boundaries) => {
-    latest = boundaries;
-  };
+  await withMountedHook(SEVEN_DAY_RANGE, async (hook) => {
+    assert.equal(hook.boundaries.length, 8);
 
-  const root = createRoot(document.createElement("div"));
-  try {
-    await act(async () => {
-      root.render(
-        React.createElement(Harness, {
-          onBoundaries,
-          range: SEVEN_DAY_RANGE,
-        }),
-      );
-    });
-    assert.equal(latest.length, 8);
-
-    await act(async () => {
-      root.render(
-        React.createElement(Harness, {
-          onBoundaries,
-          range: {
-            kind: "custom",
-            startDate: "2026-01-01",
-            endDate: "2026-01-03",
-          },
-        }),
-      );
+    await hook.render({
+      kind: "custom",
+      startDate: "2026-01-01",
+      endDate: "2026-01-03",
     });
 
     assert.equal(
-      latest.length,
+      hook.boundaries.length,
       4,
       "a 3-day custom range yields 4 boundaries closing the final day",
     );
     assert.equal(
-      latest[0],
-      Math.floor(new Date(2026, 0, 1).getTime() / 1_000),
+      hook.boundaries[0],
+      midnight(2026, 0, 1),
       "first boundary opens the requested start date in local time",
     );
-  } finally {
-    await act(async () => {
-      root.unmount();
-    });
-  }
+  });
 });
 
 test("useLocalDayBoundaries returns no boundaries for an invalid custom range", async () => {
-  let latest = null;
-  const onBoundaries = (boundaries) => {
-    latest = boundaries;
+  // Inverted range — `useAgentUsageSeries` gates its query on
+  // `boundaries.length >= 2`, so this must issue no request rather than one
+  // the backend would reject.
+  const invertedRange = {
+    kind: "custom",
+    startDate: "2026-03-10",
+    endDate: "2026-03-01",
   };
-
-  const root = createRoot(document.createElement("div"));
-  try {
-    await act(async () => {
-      root.render(
-        React.createElement(Harness, {
-          onBoundaries,
-          // Inverted range — `useAgentUsageSeries` gates its query on
-          // `boundaries.length >= 2`, so this must issue no request rather
-          // than one the backend would reject.
-          range: {
-            kind: "custom",
-            startDate: "2026-03-10",
-            endDate: "2026-03-01",
-          },
-        }),
-      );
-    });
-
-    assert.deepEqual(latest, []);
-  } finally {
-    await act(async () => {
-      root.unmount();
-    });
-  }
+  await withMountedHook(invertedRange, async (hook) => {
+    assert.deepEqual(hook.boundaries, []);
+  });
 });
