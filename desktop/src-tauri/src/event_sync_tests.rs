@@ -299,3 +299,85 @@ fn migrate_teams_supersedes_future_dated_head() {
     assert_eq!(row.created_at, future + 1);
     assert!(row.pending_sync);
 }
+
+// ── Reconcile-retry: full transition reaches pending row and certifies Ready ──
+//
+// Pass-3 Fix 1 coverage: the flush loop's `Unready` arm now spawns the full
+// reconcile+barrier transition (not barrier-only). This test verifies the
+// invariant the fix must hold:
+//
+//   reconcile leg fails → scope stays `Unready` (claim dropped via RAII)
+//   retry → claim → reconcile runs → disk edit reaches a pending row
+//          → claim.complete → scope is `Ready`
+//
+// The test does not call `flush_active_pending_events` (needs AppHandle), but
+// exercises the same building-blocks in sequence:
+//   `claim_in_progress` → `migrate_personas_in_dir` → `claim.complete`
+// This is the exact sequence that `spawn_event_sync_with_held_claim` runs
+// (modulo the async wrapper), so the test validates the component contract.
+//
+// Concretely: a persona's disk edit must not be lost when reconcile fails on
+// the first attempt. The barrier-only retry path that preceded this fix would
+// certify `Ready` without re-queueing the edit, stranding it for the session.
+#[test]
+fn test_reconcile_failure_retry_with_full_transition_certifies_and_enqueues() {
+    use crate::managed_agents::{
+        config_sync_readiness::{self, ReadinessState},
+        retention::{get_retained_event, open_retention_db},
+    };
+    use buzz_core_pkg::kind::KIND_PERSONA;
+
+    config_sync_readiness::mark_unready();
+
+    let keys = nostr::Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let base = tempfile::tempdir().unwrap();
+    let db_path = base.path().join("retention.db");
+    write_base_personas(base.path(), &one_persona());
+
+    // Step 1: first attempt — claim InProgress, reconcile "fails" (claim dropped
+    // via RAII before complete). Scope returns to Unready.
+    {
+        let claim = config_sync_readiness::claim_in_progress().expect("must claim from Unready");
+        // Simulated reconcile failure: drop without calling complete().
+        drop(claim);
+    }
+    assert_eq!(
+        config_sync_readiness::readiness_state(),
+        Some(ReadinessState::Unready),
+        "dropped claim (reconcile failure) must leave scope Unready"
+    );
+
+    // Step 2: retry — claim again, run the full reconcile, complete the claim.
+    // This is what the fixed flush-loop Unready arm now spawns.
+    {
+        let claim = config_sync_readiness::claim_in_progress()
+            .expect("Unready scope must allow a retry claim");
+
+        // Full reconcile (personas leg) — the disk edit is now queued.
+        let migrated = migrate_personas_in_dir_at(base.path(), &keys, &db_path).expect("reconcile");
+        assert_eq!(migrated, 1, "reconcile must queue the disk persona");
+
+        // Barrier phase (simulated: no relay in this unit test). In production
+        // this is `run_boot_barrier_after_claim`; here we just certify Ready
+        // to prove the claim path is wired correctly.
+        claim.complete(db_path.clone());
+    }
+
+    // Step 3: scope must be Ready and the disk edit must be pending.
+    assert!(
+        config_sync_readiness::is_ready_for(&db_path),
+        "retry claim.complete must transition scope to Ready"
+    );
+
+    let conn = open_retention_db(&db_path).expect("open db");
+    let row = get_retained_event(&conn, KIND_PERSONA, &pubkey, "code-reviewer")
+        .expect("db query")
+        .expect("row must exist after reconcile");
+    assert!(
+        row.pending_sync,
+        "disk edit must be pending after successful reconcile on retry"
+    );
+
+    config_sync_readiness::mark_unready(); // cleanup
+}

@@ -247,9 +247,15 @@ pub async fn flush_pending_events(
 ///
 /// - `Ready(path)` matching the active scope → flush proceeds.
 /// - `InProgress` → a reconcile+barrier is in-flight; skip this tick.
-/// - `Unready` → no barrier has claimed the slot; run the barrier inline
-///   (which will claim `InProgress`, run, and set `Ready` or `Unready`).
-///   A barrier failure skips this tick; the next tick retries.
+/// - `Unready` → no barrier has claimed the slot; attempt to claim and spawn
+///   the full reconcile+barrier transition (`run_event_sync` + barrier),
+///   then skip this tick. The spawned task transitions to `Ready` or
+///   `Unready`; the next tick retries.
+///
+/// Running the FULL transition on `Unready` (not barrier-only) is load-bearing:
+/// if a previous reconcile leg failed the scope is left `Unready`, and
+/// certifying `Ready` via a barrier-only pass would skip the failed leg's disk
+/// edits entirely — a fail-forever loss for those coordinates this session.
 pub async fn flush_active_pending_events(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -273,19 +279,37 @@ pub async fn flush_active_pending_events(
             return Ok(0);
         }
         _ => {
-            // Unready (or None if lock poisoned). Run the barrier inline;
-            // claim_in_progress inside run_boot_barrier is the CAS guard.
-            crate::managed_agents::config_barrier::run_boot_barrier(app).await;
-
-            // Re-check after the barrier attempt.
-            if !config_sync_readiness::is_ready_for(&scope.db_path) {
-                tracing::info!(
-                    target: "buzz::config_sync",
-                    db_path = %scope.db_path.display(),
-                    "flush skipped: boot barrier has not completed for this scope"
-                );
-                return Ok(0);
+            // Unready (or None if lock poisoned). Attempt to claim and spawn
+            // the FULL reconcile+barrier transition. A barrier-only retry is
+            // insufficient: if reconcile failed on the prior attempt, only
+            // the full transition re-queues the failed leg's disk edits.
+            // `claim_in_progress` is the CAS guard — if another caller raced
+            // us to the claim, the spawned task already covers this tick.
+            match config_sync_readiness::claim_in_progress() {
+                Some(claim) => {
+                    crate::event_sync::spawn_event_sync_with_held_claim(
+                        app.clone(),
+                        scope.owner_keys,
+                        scope.db_path.clone(),
+                        claim,
+                    );
+                }
+                None => {
+                    // Raced to InProgress by another caller; that task covers this.
+                    tracing::debug!(
+                        target: "buzz::config_sync",
+                        db_path = %scope.db_path.display(),
+                        "flush: claim lost to concurrent caller; skipping this tick"
+                    );
+                }
             }
+
+            tracing::info!(
+                target: "buzz::config_sync",
+                db_path = %scope.db_path.display(),
+                "flush skipped: boot reconcile+barrier spawned for this scope"
+            );
+            return Ok(0);
         }
     }
 

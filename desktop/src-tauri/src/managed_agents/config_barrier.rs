@@ -45,33 +45,6 @@ use super::{
 use crate::app_state::AppState;
 use buzz_core_pkg::kind::{KIND_MANAGED_AGENT, KIND_PERSONA, KIND_TEAM};
 
-/// Run the boot barrier for the active scope.
-///
-/// Attempts to claim the `Unready → InProgress` transition. If another
-/// caller already owns it (state is `InProgress` or `Ready`), this returns
-/// immediately — the in-flight or completed barrier is sufficient.
-///
-/// On success, marks the scope `Ready`, allowing the flush loop to publish
-/// for that scope. On any error, resets to `Unready` so the scope stays
-/// fail-closed until a later retry succeeds.
-///
-/// Called from the flush loop (retry path, only when `Unready`). The
-/// `claim_in_progress` CAS ensures at most one barrier runs at a time.
-/// `spawn_event_sync` calls [`run_boot_barrier_after_claim`] instead, which
-/// assumes the caller already holds `InProgress` and skips the CAS.
-pub async fn run_boot_barrier(app: &tauri::AppHandle) {
-    use super::config_sync_readiness;
-
-    // Single-flight: only the first caller to claim InProgress runs the
-    // barrier. If the state is already InProgress (spawn_event_sync's
-    // reconcile is in-flight) or Ready, skip.
-    let Some(claim) = config_sync_readiness::claim_in_progress() else {
-        return;
-    };
-
-    run_boot_barrier_enforcing(app, claim).await;
-}
-
 /// Execute the barrier enforcement assuming the caller already claimed
 /// `InProgress`.
 ///
@@ -91,8 +64,8 @@ pub(crate) async fn run_boot_barrier_after_claim(
 }
 
 /// Outcome of a single barrier scope run.
-#[derive(Debug)]
-enum BarrierOutcome {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BarrierOutcome {
     /// Decision pass completed; scope is ready for publication.
     Success,
     /// Workspace switched mid-flight; the old scope's barrier was abandoned.
@@ -277,11 +250,30 @@ async fn run_boot_barrier_for_scope(
 
     // Phase 4 — generation-gate the enforcement phase.
     //
-    // A preempted barrier that has stale relay evidence (e.g. it observed
-    // `HeadState::Absent` for a coordinate the current barrier just parked)
-    // must not overwrite the current barrier's gate decisions. The check runs
-    // while `managed_agents_store_lock` is held, so the generation cannot
-    // change between this check and the `run_decision_pass` write below.
+    // `enforce_decision_pass` checks `claim.is_current()` while
+    // `managed_agents_store_lock` is held (i.e., right here), so the
+    // generation cannot change between the check and the `run_decision_pass`
+    // write below. A preempted barrier returns `Abandoned` without writing.
+    enforce_decision_pass(claim, &conn, &owner_pubkey, &states)
+}
+
+/// Generation-gated enforcement phase: check claim currency, write gate
+/// decisions, return outcome.
+///
+/// Extracted from [`run_boot_barrier_for_scope`] as a named seam so tests can
+/// drive the enforcement phase directly and prove that removing the
+/// `is_current()` guard causes them to fail. Without this seam, a test of
+/// the guard can only mirror the `if stale_claim.is_current()` conditional
+/// manually — which stays green even when the production guard is removed.
+///
+/// Caller must hold `managed_agents_store_lock` around this call so the
+/// generation cannot change between the currency check and the write.
+pub(crate) fn enforce_decision_pass(
+    claim: &super::config_sync_readiness::ReadinessClaim,
+    conn: &rusqlite::Connection,
+    owner_pubkey: &str,
+    states: &[super::config_sync::CoordinateState],
+) -> Result<BarrierOutcome, String> {
     if !claim.is_current() {
         tracing::info!(
             target: "buzz::config_sync",
@@ -290,7 +282,7 @@ async fn run_boot_barrier_for_scope(
         return Ok(BarrierOutcome::Abandoned);
     }
 
-    run_decision_pass(&conn, &owner_pubkey, &states)?;
+    run_decision_pass(conn, owner_pubkey, states)?;
     Ok(BarrierOutcome::Success)
 }
 

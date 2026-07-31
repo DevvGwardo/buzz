@@ -380,9 +380,12 @@ pub async fn import_identity(
         // OLD owner's scope, and the new owner's scope was never certified.
         //
         // Mirrors `apply_workspace`'s force-claim sequence. The legacy-
-        // migration step is skipped here — only the keys changed, not the
-        // relay or scope database, so there is nothing to adopt from a
-        // pre-scoping global store.
+        // migration step is skipped here: a stranded legacy row for the
+        // imported identity will be adopted by the next boot's `apply_workspace`
+        // (consequence bounded to this import session). The scope database DOES
+        // change on key swap — `scoped_retention_db_path` hashes the owner
+        // pubkey — so the reconcile below is necessary to queue the new
+        // owner's disk projections for the new scope.
         {
             match crate::managed_agents::retention::active_retention_scope(
                 &app_handle,

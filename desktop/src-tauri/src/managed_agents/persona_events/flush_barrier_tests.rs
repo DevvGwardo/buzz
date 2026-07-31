@@ -451,28 +451,32 @@ async fn test_apply_workspace_flush_cannot_interleave_before_reconcile() {
 // test (i) only verified that `complete()` is a no-op; it never drove a
 // stale barrier all the way through enforcement.
 //
-// This test exercises the enforcement seam directly: stale barrier S builds a
+// This test drives the enforcement seam directly: stale barrier S builds a
 // `CoordinateState` from stale relay evidence (the exact CRITICAL cell —
 // `HeadState::Absent` sees cell-3 `PublishLocalEdit`, opening a gate the
-// current barrier parked) and calls `run_decision_pass` while gated by the
-// `is_current()` check. The generation guard must block the write.
+// current barrier parked) and calls `enforce_decision_pass` — the same
+// function `run_boot_barrier_for_scope` calls at Phase 4 (under the store
+// lock). Because the test drives the production helper rather than mirroring
+// the guard manually, removing the `is_current()` check from
+// `enforce_decision_pass` causes this test to fail.
 //
 // Deterministic sequence:
 // 1. Flush wins claim (gen 0). Its barrier observes `HeadState::Absent` for
 //    the coordinate — stale evidence that would decide `PublishLocalEdit`.
 // 2. apply_workspace force-claims (gen 1). The current barrier observes
 //    `HeadState::Present` and decides `Park(NoBaselineWithHead)`.
-// 3. Current barrier (gen 1) runs `run_decision_pass` → sets
+// 3. Current barrier (gen 1) runs `enforce_decision_pass` → sets
 //    `publish_blocked = true`. Certifies Ready(path).
 // 4. Stale barrier (gen 0) resumes enforcement with its stale evidence.
-//    Before calling `run_decision_pass`, the generation guard (`is_current()`)
-//    returns false — write is blocked. `publish_blocked` must remain `true`.
+//    Calls `enforce_decision_pass` → `is_current()` returns false → write
+//    is blocked. `publish_blocked` must remain `true`.
 // 5. Vacuity proof: without the guard, the stale pass WOULD clear the flag
 //    (verified on a scratch db so the real store is never mutated by the test).
 #[test]
 fn test_stale_barriers_decision_pass_cannot_alter_publish_blocked() {
     use crate::managed_agents::{
         canonical_projection::CanonicalProjection,
+        config_barrier::{enforce_decision_pass, BarrierOutcome},
         config_sync::{local_state, plan, run_decision_pass, CoordinateState},
         decision::{Decision, Head, HeadState, TombstoneEvidence},
         head_lookup::Coordinate,
@@ -554,8 +558,9 @@ fn test_stale_barriers_decision_pass_cannot_alter_publish_blocked() {
     let force_claim = config_sync_readiness::force_claim_in_progress();
     assert_eq!(config_sync_readiness::current_generation(), 1);
 
-    // Step 3: current barrier (gen 1) runs its pass — Present head + no baseline
-    // → Park(NoBaselineWithHead) → publish_blocked = true. Certifies Ready.
+    // Step 3: current barrier (gen 1) runs its pass via enforce_decision_pass
+    // — Present head + no baseline → Park(NoBaselineWithHead) → publish_blocked = true.
+    // Certifies Ready.
     {
         let current_observation = {
             let conn = open_retention_db(&db_path).expect("open db for current observation");
@@ -577,7 +582,8 @@ fn test_stale_barriers_decision_pass_cannot_alter_publish_blocked() {
             .unwrap()
         };
         let current_conn = open_retention_db(&db_path).expect("open db for current pass");
-        run_decision_pass(
+        let outcome = enforce_decision_pass(
+            &force_claim,
             &current_conn,
             &pubkey,
             &[CoordinateState {
@@ -586,6 +592,11 @@ fn test_stale_barriers_decision_pass_cannot_alter_publish_blocked() {
             }],
         )
         .expect("current barrier enforces");
+        assert_eq!(
+            outcome,
+            BarrierOutcome::Success,
+            "current claim must succeed"
+        );
     }
     assert!(
         is_publish_blocked(
@@ -600,24 +611,20 @@ fn test_stale_barriers_decision_pass_cannot_alter_publish_blocked() {
     force_claim.complete(db_path.clone());
     assert!(config_sync_readiness::is_ready_for(&db_path));
 
-    // Step 4: stale barrier (gen 0) resumes enforcement.
+    // Step 4: stale barrier (gen 0) resumes enforcement via enforce_decision_pass.
     //
-    // The enforcement seam: `run_boot_barrier_for_scope` calls `claim.is_current()`
-    // while holding `managed_agents_store_lock`, and returns `Abandoned` without
-    // calling `run_decision_pass` when it returns false.
-    //
-    // We reproduce that guard here: `is_current()` must return false.
-    assert!(
-        !stale_claim.is_current(),
-        "stale claim (gen 0) must not be current after force_claim bumped to gen 1"
-    );
-
-    // Enforcement seam: the stale barrier only calls run_decision_pass if
-    // is_current() returns true. Since it doesn't, the write is blocked.
-    // This is the invariant the production guard enforces.
-    if stale_claim.is_current() {
-        let conn = open_retention_db(&db_path).expect("open db for stale enforcement");
-        run_decision_pass(&conn, &pubkey, &stale_states).expect("stale pass");
+    // This drives the PRODUCTION helper — not a manual mirror of is_current().
+    // Deleting the is_current() guard from enforce_decision_pass causes this test
+    // to fail: the stale pass clears publish_blocked, and the assert below fires.
+    {
+        let stale_conn = open_retention_db(&db_path).expect("open db for stale enforcement");
+        let outcome = enforce_decision_pass(&stale_claim, &stale_conn, &pubkey, &stale_states)
+            .expect("enforce returns Ok even on Abandoned");
+        assert_eq!(
+            outcome,
+            BarrierOutcome::Abandoned,
+            "stale claim (gen 0) must be Abandoned by enforce_decision_pass"
+        );
     }
 
     // Vacuity companion: confirm the stale pass WOULD have cleared the flag
@@ -659,7 +666,7 @@ fn test_stale_barriers_decision_pass_cannot_alter_publish_blocked() {
             d_tag,
         )
         .unwrap(),
-        "publish_blocked must remain true: stale barrier's run_decision_pass was blocked by the generation guard"
+        "publish_blocked must remain true: stale barrier's enforce_decision_pass returned Abandoned"
     );
 
     // Stale claim drops (gen mismatch → latch no-op; force-claim already certified Ready).

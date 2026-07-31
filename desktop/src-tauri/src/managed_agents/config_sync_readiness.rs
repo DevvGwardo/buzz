@@ -10,8 +10,8 @@
 //! ```text
 //!   apply_workspace (force)  ─────────────────────────►  InProgress (from any state)
 //!   flush retry (claim, only when Unready)  ───────────►  InProgress
-//!   run_boot_barrier success  ─────────────────────────►  Ready(db_path)
-//!   run_boot_barrier error / abandon  ─────────────────►  Unready (if still current gen)
+//!   boot barrier success  ─────────────────────────────►  Ready(db_path)
+//!   boot barrier error / abandon  ─────────────────────►  Unready (if still current gen)
 //!   flush: InProgress → skip tick; Ready(p) → publish
 //! ```
 //!
@@ -44,7 +44,10 @@
 //! - Leg 2 (stale drop destroys InProgress): stale claim's `Drop` sees a
 //!   generation mismatch → no-op → force-claim's `InProgress` is preserved.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+#[cfg(test)]
+use std::path::Path;
 
 /// The current readiness state for the active scope's publication gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +214,7 @@ pub fn mark_unready() {
 }
 
 /// `true` iff the scope is `Ready` for exactly `db_path`.
+#[cfg(test)]
 pub fn is_ready_for(db_path: &Path) -> bool {
     with_lock(|latch| matches!(&latch.state, ReadinessState::Ready(p) if p == db_path))
         .unwrap_or(false)
