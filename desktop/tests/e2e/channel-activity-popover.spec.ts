@@ -348,6 +348,9 @@ test.describe("channel activity hover preview", () => {
       "second-inbox-thread-for-hover",
     ];
     await page.goto("/");
+    await page.getByTestId("channel-general").click();
+    await expect(page.getByTestId("chat-title")).toHaveText("general");
+    await page.getByRole("button", { name: "Inbox", exact: true }).click();
     await expect(page.getByTestId("home-inbox-list")).toBeVisible();
     await page.waitForFunction(
       () =>
@@ -434,6 +437,31 @@ test.describe("channel activity hover preview", () => {
       "font-weight",
       "600",
     );
+    for (const [index, itemId] of inboxItemIds.entries()) {
+      const inboxRow = page.getByTestId(`home-inbox-item-${itemId}`);
+      await inboxRow.hover();
+      await inboxRow.getByRole("button", { name: "Mark as read" }).click();
+      if (index === 0) {
+        await expect(page.getByTestId("channel-general")).toHaveCSS(
+          "font-weight",
+          "600",
+        );
+      }
+    }
+    await expect(page.getByTestId("channel-general")).not.toHaveCSS(
+      "font-weight",
+      "600",
+    );
+    for (const itemId of inboxItemIds) {
+      const inboxRow = page.getByTestId(`home-inbox-item-${itemId}`);
+      await inboxRow.hover();
+      await inboxRow.getByRole("button", { name: "Mark unread" }).click();
+    }
+
+    await expect(page.getByTestId("channel-general")).toHaveCSS(
+      "font-weight",
+      "600",
+    );
     await expect(page.getByTestId("channel-unread-dot-general")).toBeVisible();
     await page.getByTestId("channel-general").click();
     await expect(page.getByTestId("chat-title")).toHaveText("general");
@@ -456,6 +484,21 @@ test.describe("channel activity hover preview", () => {
     await expect(popover.getByTestId(/^channel-activity-item-/)).toHaveCount(1);
     await expect(popover).not.toContainText("Older Inbox thread reopened");
     await expect(page.getByTestId("channel-unread-dot-general")).toBeVisible();
+    await expect(page.getByTestId("channel-general")).toHaveCSS(
+      "font-weight",
+      "600",
+    );
+
+    const remainingRow = popover.getByTestId(/^channel-activity-item-/).first();
+    await remainingRow.hover();
+    await remainingRow.getByRole("button", { name: "Mark as read" }).click();
+    await expect(page.getByTestId("channel-unread-dot-general")).toHaveCount(0);
+    await page.getByTestId("channel-random").click();
+    await expect(page.getByTestId("chat-title")).toHaveText("random");
+    await expect(page.getByTestId("channel-general")).not.toHaveCSS(
+      "font-weight",
+      "600",
+    );
   });
 
   test("surfaces future replies after the user reacts to a thread root", async ({
