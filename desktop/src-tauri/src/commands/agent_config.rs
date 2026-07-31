@@ -275,27 +275,6 @@ pub struct BakedEnvEntry {
     pub masked: bool,
 }
 
-/// Returns `true` when a baked-env key is safe to display unmasked in the UI.
-///
-/// This uses an explicit allowlist of keys that are known safe (non-secret).
-/// Any key NOT in this set is masked — default-deny for a security surface.
-///
-/// Allowlist (case-insensitive):
-/// - `BUZZ_AGENT_PROVIDER`, `BUZZ_AGENT_MODEL` — agent runtime selection
-/// - `BUZZ_AGENT_THINKING_EFFORT` — non-secret enum (none/minimal/low/medium/high/xhigh/max)
-/// - `DATABRICKS_HOST`, `DATABRICKS_MODEL` — Block non-secret defaults
-fn is_safe_to_reveal(key: &str) -> bool {
-    const SAFE_KEYS: &[&str] = &[
-        "BUZZ_AGENT_PROVIDER",
-        "BUZZ_AGENT_MODEL",
-        "BUZZ_AGENT_THINKING_EFFORT",
-        "DATABRICKS_HOST",
-        "DATABRICKS_MODEL",
-    ];
-    let upper = key.to_ascii_uppercase();
-    SAFE_KEYS.iter().any(|safe| upper == *safe)
-}
-
 /// Expose the baked build env to the frontend with values shown, but any
 /// key not in the safe-to-reveal allowlist has its value replaced by `••••••`.
 ///
@@ -312,7 +291,7 @@ pub fn get_baked_build_env() -> Vec<BakedEnvEntry> {
         .into_iter()
         .filter(|(_, v)| !v.is_empty())
         .map(|(key, value)| {
-            let masked = !is_safe_to_reveal(&key);
+            let masked = !crate::managed_agents::is_safe_to_reveal(&key);
             let display_value = if masked {
                 "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}".to_string()
             } else {
@@ -974,7 +953,7 @@ mod tests {
         map.iter()
             .filter(|(_, v)| !v.is_empty())
             .map(|(k, v)| {
-                let masked = !super::is_safe_to_reveal(k);
+                let masked = !crate::managed_agents::is_safe_to_reveal(k);
                 BakedEnvEntry {
                     key: k.to_string(),
                     value: if masked {
@@ -1084,28 +1063,38 @@ mod tests {
     #[test]
     fn baked_env_allowlist_is_case_insensitive() {
         // Known-safe keys — case-insensitive match must allow them.
-        assert!(super::is_safe_to_reveal("buzz_agent_provider"));
-        assert!(super::is_safe_to_reveal("BUZZ_AGENT_PROVIDER"));
-        assert!(super::is_safe_to_reveal("buzz_agent_model"));
-        assert!(super::is_safe_to_reveal("BUZZ_AGENT_MODEL"));
-        assert!(super::is_safe_to_reveal("buzz_agent_thinking_effort"));
-        assert!(super::is_safe_to_reveal("BUZZ_AGENT_THINKING_EFFORT"));
-        assert!(super::is_safe_to_reveal("databricks_host"));
-        assert!(super::is_safe_to_reveal("DATABRICKS_HOST"));
-        assert!(super::is_safe_to_reveal("databricks_model"));
-        assert!(super::is_safe_to_reveal("DATABRICKS_MODEL"));
+        assert!(crate::managed_agents::is_safe_to_reveal(
+            "buzz_agent_provider"
+        ));
+        assert!(crate::managed_agents::is_safe_to_reveal(
+            "BUZZ_AGENT_PROVIDER"
+        ));
+        assert!(crate::managed_agents::is_safe_to_reveal("buzz_agent_model"));
+        assert!(crate::managed_agents::is_safe_to_reveal("BUZZ_AGENT_MODEL"));
+        assert!(crate::managed_agents::is_safe_to_reveal(
+            "buzz_agent_thinking_effort"
+        ));
+        assert!(crate::managed_agents::is_safe_to_reveal(
+            "BUZZ_AGENT_THINKING_EFFORT"
+        ));
+        assert!(crate::managed_agents::is_safe_to_reveal("databricks_host"));
+        assert!(crate::managed_agents::is_safe_to_reveal("DATABRICKS_HOST"));
+        assert!(crate::managed_agents::is_safe_to_reveal("databricks_model"));
+        assert!(crate::managed_agents::is_safe_to_reveal("DATABRICKS_MODEL"));
         // Keys NOT in the allowlist — masked regardless of naming pattern.
-        assert!(!super::is_safe_to_reveal("my_api_key"));
-        assert!(!super::is_safe_to_reveal("GITHUB_TOKEN"));
-        assert!(!super::is_safe_to_reveal("DB_SECRET"));
-        assert!(!super::is_safe_to_reveal("DB_PASSWORD"));
+        assert!(!crate::managed_agents::is_safe_to_reveal("my_api_key"));
+        assert!(!crate::managed_agents::is_safe_to_reveal("GITHUB_TOKEN"));
+        assert!(!crate::managed_agents::is_safe_to_reveal("DB_SECRET"));
+        assert!(!crate::managed_agents::is_safe_to_reveal("DB_PASSWORD"));
         // Bare names that old heuristic (contains("_TOKEN") etc.) would have missed.
-        assert!(!super::is_safe_to_reveal("APIKEY"));
-        assert!(!super::is_safe_to_reveal("TOKEN"));
-        assert!(!super::is_safe_to_reveal("SECRET"));
-        assert!(!super::is_safe_to_reveal("PASSWORD"));
-        assert!(!super::is_safe_to_reveal("PRIVATE_KEY"));
+        assert!(!crate::managed_agents::is_safe_to_reveal("APIKEY"));
+        assert!(!crate::managed_agents::is_safe_to_reveal("TOKEN"));
+        assert!(!crate::managed_agents::is_safe_to_reveal("SECRET"));
+        assert!(!crate::managed_agents::is_safe_to_reveal("PASSWORD"));
+        assert!(!crate::managed_agents::is_safe_to_reveal("PRIVATE_KEY"));
         // Unknown key → masked by default.
-        assert!(!super::is_safe_to_reveal("SOME_UNKNOWN_KEY"));
+        assert!(!crate::managed_agents::is_safe_to_reveal(
+            "SOME_UNKNOWN_KEY"
+        ));
     }
 }

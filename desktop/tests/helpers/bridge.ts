@@ -56,6 +56,20 @@ type MockManagedAgentSeed = {
   lastError?: string | null;
   lastErrorCode?: number | null;
   needsRestart?: boolean;
+  /** Restart diff entries for the mock agent. Only meaningful when needsRestart is true. */
+  restartDiff?: Array<{
+    field: string;
+    change:
+      | { kind: "value"; before: unknown; after: unknown }
+      | {
+          kind: "text";
+          before_chars: number | null;
+          after_chars: number | null;
+        }
+      | { kind: "masked"; before: string | null; after: string | null }
+      | { kind: "added" }
+      | { kind: "removed" };
+  }>;
   autoRestartOnConfigChange?: boolean;
   respondTo?: "owner-only" | "allowlist" | "anyone";
   respondToAllowlist?: string[];
