@@ -112,6 +112,7 @@ export function ChannelScreen({
     unfollowThread,
     isFollowingThread,
     isNotifiedForThread,
+    recordThreadInteraction,
     isThreadMuted,
     readStateVersion,
   } = useAppShell();
@@ -262,7 +263,6 @@ export function ChannelScreen({
     resolvedMessages,
     threadReplyEvents,
   );
-
   const messageEventProfilePubkeys = useMessageEventProfilePubkeys(
     resolvedMessages,
     threadReplyEvents,
@@ -474,6 +474,7 @@ export function ChannelScreen({
     openThreadMessages: threadPanelData.visibleReplies,
     getChannelReadAt,
     getMessageReadAt,
+    markChannelRead,
     markChannelUnread,
     markMessageRead,
     isThreadMuted,
@@ -508,6 +509,7 @@ export function ChannelScreen({
     getFirstReplyIdForMessage,
     getReplyDescendantIdsForMessage,
     markRevealedRepliesRead,
+    recordThreadInteraction,
     openThreadHeadId: effectiveOpenThreadHeadId,
     onOptimisticOpenThreadHeadIdChange: setOptimisticOpenThreadHeadId,
     onRequestEmptyEditDelete: setEmptyDeleteId,
@@ -688,7 +690,6 @@ export function ChannelScreen({
     threadReplyTargetId,
     threadReplyTargetMessage,
   });
-
   const hasAuxiliaryPanel = Boolean(
     effectiveOpenThreadHeadId ||
       openAgentSessionPubkey ||

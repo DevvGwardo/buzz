@@ -9,8 +9,8 @@ import {
   countUnreadBadgeObservedEvents,
   countUnreadHighPriorityObservedEvents,
   countUnreadObservedEvents,
+  hasUnreadTopLevelObservedEvent,
   makeObservedUnreadEvent,
-  mapsEqual,
   observedUnreadEventReadAt,
   recordObservedUnreadEvent,
   type ObservedUnreadEvent,
@@ -33,6 +33,7 @@ import {
 import type { RelayClient } from "@/shared/api/relayClientSession";
 import type { Channel, RelayEvent } from "@/shared/api/types";
 import { CHANNEL_MESSAGE_EVENT_KINDS } from "@/shared/constants/kinds";
+import { useStableMap, useStableSet } from "@/shared/hooks/useStableReference";
 import { normalizeRelayUrl } from "@/features/profile/lib/selfProfileStorage";
 import { DM_NOTIFIABLE_EVENT_KINDS } from "./isDmNotifiableKind";
 import {
@@ -123,14 +124,6 @@ export function resolveChannelReadMarker(
 
 export function resolveObservedUnreadRootId(tags: string[][]): string | null {
   return isBroadcastReply(tags) ? null : getThreadReference(tags).rootId;
-}
-
-function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
-  if (a.size !== b.size) return false;
-  for (const item of a) {
-    if (!b.has(item)) return false;
-  }
-  return true;
 }
 
 export function useUnreadChannels(
@@ -473,6 +466,22 @@ export function useUnreadChannels(
         bumpMembershipVersion();
       }
       bumpLatestVersion();
+    },
+    [normalizedPubkey],
+  );
+
+  const recordThreadInteraction = React.useCallback(
+    (rootId: string) => {
+      const normalizedRootId = rootId.trim();
+      if (!normalizedRootId) return;
+      const target = participatedRootIdsRef.current;
+      const sizeBefore = target.size;
+      target.add(normalizedRootId);
+      if (target.size === sizeBefore) return;
+      if (normalizedPubkey !== null) {
+        participationStore.write(normalizedPubkey, target);
+      }
+      bumpMembershipVersion();
     },
     [normalizedPubkey],
   );
@@ -830,6 +839,7 @@ export function useUnreadChannels(
       if (!isReadStateReady) {
         return {
           unreadChannelIds: new Set<string>(),
+          topLevelUnreadChannelIds: new Set<string>(),
           highPriorityUnreadChannelIds: new Set<string>(),
           unreadChannelCounts: new Map<string, number>(),
           unreadChannelNotificationCount: 0,
@@ -837,6 +847,7 @@ export function useUnreadChannels(
       }
 
       const unread = new Set<string>();
+      const topLevelUnread = new Set<string>();
       const highPriority = new Set<string>();
       const counts = new Map<string, number>();
       let unreadChannelNotificationCount = 0;
@@ -847,6 +858,7 @@ export function useUnreadChannels(
         if (Object.hasOwn(forcedUnreadRef.current, channel.id)) {
           // Forced-unread is dot tier only — not high-priority.
           unread.add(channel.id);
+          topLevelUnread.add(channel.id);
           counts.set(channel.id, 1);
           unreadChannelNotificationCount += 1;
           continue;
@@ -873,6 +885,11 @@ export function useUnreadChannels(
         if (unreadCount === 0) continue;
 
         unread.add(channel.id);
+        if (
+          hasUnreadTopLevelObservedEvent(observedEvents, readAtForObservedEvent)
+        ) {
+          topLevelUnread.add(channel.id);
+        }
         const badgeCount = countUnreadBadgeObservedEvents(
           observedEvents,
           readAtForObservedEvent,
@@ -900,6 +917,7 @@ export function useUnreadChannels(
 
       return {
         unreadChannelIds: unread,
+        topLevelUnreadChannelIds: topLevelUnread,
         highPriorityUnreadChannelIds: highPriority,
         unreadChannelCounts: counts,
         unreadChannelNotificationCount,
@@ -914,37 +932,14 @@ export function useUnreadChannels(
       readStateVersion,
     ]);
 
-  // Stabilize Set references: only replace when contents actually change,
-  // so downstream memos don't re-run on every render when sets are equal.
-  const prevUnreadRef = React.useRef<ReadonlySet<string>>(new Set());
-  const prevHighPriorityRef = React.useRef<ReadonlySet<string>>(new Set());
-  const prevUnreadCountsRef = React.useRef<ReadonlyMap<string, number>>(
-    new Map(),
+  const unreadChannelIds = useStableSet(rawUnread.unreadChannelIds);
+  const topLevelUnreadChannelIds = useStableSet(
+    rawUnread.topLevelUnreadChannelIds,
   );
-
-  const unreadChannelIds = setsEqual(
-    rawUnread.unreadChannelIds,
-    prevUnreadRef.current,
-  )
-    ? prevUnreadRef.current
-    : rawUnread.unreadChannelIds;
-  prevUnreadRef.current = unreadChannelIds;
-
-  const highPriorityUnreadChannelIds = setsEqual(
+  const highPriorityUnreadChannelIds = useStableSet(
     rawUnread.highPriorityUnreadChannelIds,
-    prevHighPriorityRef.current,
-  )
-    ? prevHighPriorityRef.current
-    : rawUnread.highPriorityUnreadChannelIds;
-  prevHighPriorityRef.current = highPriorityUnreadChannelIds;
-
-  const unreadChannelCounts = mapsEqual(
-    rawUnread.unreadChannelCounts,
-    prevUnreadCountsRef.current,
-  )
-    ? prevUnreadCountsRef.current
-    : rawUnread.unreadChannelCounts;
-  prevUnreadCountsRef.current = unreadChannelCounts;
+  );
+  const unreadChannelCounts = useStableMap(rawUnread.unreadChannelCounts);
   const unreadChannelNotificationCount =
     rawUnread.unreadChannelNotificationCount;
 
@@ -992,6 +987,7 @@ export function useUnreadChannels(
 
   return {
     unreadChannelIds,
+    topLevelUnreadChannelIds,
     unreadChannelCounts,
     highPriorityUnreadChannelIds,
     unreadChannelNotificationCount,
@@ -1009,6 +1005,7 @@ export function useUnreadChannels(
     participatedRootIds,
     authoredRootIds,
     mentionedRootIds,
+    recordThreadInteraction,
     threadActivityItems: projectActivityForScope(
       threadActivityScopeRef.current,
       currentActivityScope,

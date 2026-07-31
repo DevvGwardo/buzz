@@ -15,7 +15,7 @@ import { useMarkAsReadShortcuts } from "@/app/useMarkAsReadShortcuts";
 import { useSettingsShortcuts } from "@/app/useSettingsShortcuts";
 import { useAppShellDesktopNotifications } from "@/app/useAppShellDesktopNotifications";
 import { useAppShellLifecycleEffects } from "@/app/useAppShellLifecycleEffects";
-import { useThreadActivityFeedItems } from "@/app/useThreadActivityFeedItems";
+import { useChannelActivityProjection } from "@/app/useChannelActivityProjection";
 import { useTauriWindowDrag } from "@/app/useTauriWindowDrag";
 import { useWebviewZoomShortcuts } from "@/app/useWebviewZoomShortcuts";
 import {
@@ -26,7 +26,6 @@ import {
   useOpenDmMutation,
 } from "@/features/channels/hooks";
 import { useUnreadChannels } from "@/features/channels/useUnreadChannels";
-import { msgContextKey } from "@/features/channels/readState/readStateFormat";
 import { useMembershipNotifications } from "@/features/channels/useMembershipNotifications";
 import { useFeedItemState } from "@/features/home/useFeedItemState";
 import { useThreadFollows } from "@/features/messages/lib/useThreadFollows";
@@ -328,6 +327,7 @@ export function AppShell() {
     markChannelRead,
     markChannelUnread,
     unreadChannelIds,
+    topLevelUnreadChannelIds,
     unreadChannelCounts,
     highPriorityUnreadChannelIds,
     unreadChannelNotificationCount,
@@ -338,6 +338,7 @@ export function AppShell() {
     participatedRootIds,
     authoredRootIds,
     mentionedRootIds,
+    recordThreadInteraction,
     threadActivityItems,
     mutedRootIds,
     muteThread,
@@ -356,54 +357,26 @@ export function AppShell() {
     followedRootIds,
   });
 
-  const getThreadReadAt = React.useCallback(
-    (rootId: string, channelId?: string | null) => {
-      const threadReadAt = getOwnReadAt(`thread:${rootId}`);
-      if (!channelId) {
-        return threadReadAt;
-      }
-
-      const channelReadAt = getChannelReadAt(channelId);
-      if (threadReadAt === null) {
-        return channelReadAt;
-      }
-      if (channelReadAt === null) {
-        return threadReadAt;
-      }
-      return Math.max(threadReadAt, channelReadAt);
-    },
-    [getChannelReadAt, getOwnReadAt],
-  );
-
-  const markThreadRead = React.useCallback(
-    (rootId: string, timestamp: number) => {
-      markChannelRead(
-        `thread:${rootId}`,
-        new Date(timestamp * 1_000).toISOString(),
-      );
-    },
-    [markChannelRead],
-  );
-
-  // Per-message read frontier (LP4 v3): effective(msg:<id>) folds through the
-  // channel, so a channel-read clears messages older than the top-level frontier.
-  const getMessageReadAt = React.useCallback(
-    (messageId: string) => getChannelReadAt(msgContextKey(messageId)),
-    [getChannelReadAt],
-  );
-  const markMessageRead = React.useCallback(
-    (messageId: string, timestamp: number) =>
-      markChannelRead(
-        msgContextKey(messageId),
-        new Date(timestamp * 1_000).toISOString(),
-      ),
-    [markChannelRead],
-  );
-  const threadActivityFeedItems = useThreadActivityFeedItems(
+  const {
+    getThreadReadAt,
+    markThreadRead,
+    getMessageReadAt,
+    markMessageRead,
+    threadActivityFeedItems,
+    locallyUnreadFeedItems,
+    unreadThreadFeedItems,
+    unreadThreadChannelIds,
+  } = useChannelActivityProjection({
+    channels,
+    feed: homeFeedQuery.data?.feed,
+    unreadFeedItemIds: feedItemState.unreadSet,
+    getChannelReadAt,
+    getOwnReadAt,
+    markChannelRead,
+    readStateVersion,
     threadActivityItems,
     mutedRootIds,
-    channels,
-  );
+  });
 
   // Badge count consumes the shared NIP-RS read-state from useUnreadChannels.
   const { homeBadgeCount, homeBadgeCountExcludingHighPriority } =
@@ -728,9 +701,15 @@ export function AppShell() {
             unfollowThread: handleUnfollowThread,
             isFollowingThread,
             isNotifiedForThread,
+            recordThreadInteraction,
             isThreadMuted: (rootId) => mutedRootIds.has(rootId),
             threadActivityItems,
             threadActivityFeedItems,
+            locallyUnreadFeedItems,
+            unreadThreadFeedItems,
+            unreadThreadChannelIds,
+            topLevelUnreadChannelIds,
+            hasSidebarUnreadProjections: true,
             feedItemState,
             onOpenSettings: handleOpenSettings,
           }}

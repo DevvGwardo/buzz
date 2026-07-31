@@ -26,13 +26,15 @@ type UseHomeInboxReadStateOptions = {
     channelId: string,
     readAt: string | null | undefined,
   ) => void;
+  /** Force a channel's unread indicator without rolling back its NIP-RS marker. */
+  markChannelUnread: (channelId: string) => void;
   /** Advance the thread read marker to the given unix-seconds timestamp. */
   markThreadRead: (rootId: string, timestamp: number) => void;
   /** Advance a reply's per-message read marker to the given unix-seconds timestamp. */
   markMessageRead: (messageId: string, timestamp: number) => void;
   /** Local fallback: mark a non-channel item done. */
   markDoneLocal: (id: string) => void;
-  /** Local inbox row override: mark an item unread without touching the channel. */
+  /** Local inbox row override: mark an item unread alongside its channel emphasis. */
   markUnreadLocal: (id: string) => void;
   /** Local fallback: undo a non-channel item done. */
   undoDoneLocal: (id: string) => void;
@@ -114,8 +116,8 @@ export function resolveInboxItemReadAt(
  * "Mark as read" on channel-backed items is routed through `markChannelRead`;
  * thread rows advance the same per-message markers as the channel thread
  * panel, plus the aggregate `thread:<root>` marker for compatibility. "Mark
- * unread" is item-local: it only reopens the specific inbox row and must not
- * light up the channel.
+ * unread" keeps its per-item local override and also restores the source
+ * channel's forced-unread indicator so channel surfaces agree with Inbox.
  */
 export function useHomeInboxReadState({
   items,
@@ -126,6 +128,7 @@ export function useHomeInboxReadState({
   localDoneSet,
   localUnreadSet = EMPTY_ITEM_SET,
   markChannelRead,
+  markChannelUnread,
   markThreadRead,
   markMessageRead,
   markDoneLocal,
@@ -230,8 +233,17 @@ export function useHomeInboxReadState({
     (itemId: string) => {
       undoDoneLocal(itemId);
       markUnreadLocal(itemId);
+      const item = itemById.get(itemId);
+      const channelId = item?.item.channelId ?? null;
+      // The Inbox override owns the durable thread dot, while the channel force
+      // restores timeline-level emphasis after the user leaves the channel.
+      // Opening the channel clears the bolding but leaves the thread dot until
+      // the thread itself is opened or marked read.
+      if (channelId && item) {
+        markChannelUnread(channelId);
+      }
     },
-    [markUnreadLocal, undoDoneLocal],
+    [itemById, markChannelUnread, markUnreadLocal, undoDoneLocal],
   );
 
   return { effectiveDoneSet, markItemRead, markItemUnread };

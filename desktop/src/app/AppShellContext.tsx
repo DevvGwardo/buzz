@@ -43,9 +43,25 @@ type AppShellContextValue = {
   unfollowThread: (rootId: string) => void;
   isFollowingThread: (rootId: string) => boolean;
   isNotifiedForThread: (rootId: string) => boolean;
+  recordThreadInteraction: (rootId: string) => void;
   isThreadMuted: (rootId: string) => boolean;
   threadActivityItems: ThreadActivityItem[];
   threadActivityFeedItems: FeedItem[];
+  // Home-feed items explicitly reopened from Inbox. Kept separate from live
+  // thread activity so older rows can be projected into channel hover cards
+  // without duplicating the Home feed itself.
+  locallyUnreadFeedItems: FeedItem[];
+  // Thread rows that remain unread until their own message/thread marker is
+  // advanced. Unlike the broad channel unread set, this includes the active
+  // channel so simply landing in it does not hide the wayfinding signal.
+  unreadThreadFeedItems: FeedItem[];
+  unreadThreadChannelIds: ReadonlySet<string>;
+  // Ordinary unread channel-level activity. Sidebar rows use this for text
+  // emphasis only; thread activity owns the dot.
+  topLevelUnreadChannelIds: ReadonlySet<string>;
+  // Lets isolated component tests retain the legacy hasUnread fallback while
+  // the mounted shell uses the split projections above.
+  hasSidebarUnreadProjections: boolean;
   feedItemState: FeedItemState;
   // Open the Settings panel at the given section. Available on all surfaces
   // that render under AppShell (channel, home, projects, pulse, agents).
@@ -71,9 +87,15 @@ const AppShellContext = React.createContext<AppShellContextValue>({
   unfollowThread: () => {},
   isFollowingThread: () => false,
   isNotifiedForThread: () => false,
+  recordThreadInteraction: () => {},
   isThreadMuted: () => false,
   threadActivityItems: [],
   threadActivityFeedItems: [],
+  locallyUnreadFeedItems: [],
+  unreadThreadFeedItems: [],
+  unreadThreadChannelIds: EMPTY_SET,
+  topLevelUnreadChannelIds: EMPTY_SET,
+  hasSidebarUnreadProjections: false,
   feedItemState: {
     doneSet: EMPTY_SET,
     markDone: () => {},

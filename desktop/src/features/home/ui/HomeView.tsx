@@ -239,8 +239,10 @@ export function HomeView({
     getMessageReadAt,
     feedItemState,
     markChannelRead,
+    markChannelUnread,
     markMessageRead,
     markThreadRead,
+    recordThreadInteraction,
     readStateVersion,
   } = useAppShell();
   const { doneSet, markDone, markUnread, undoDone, undoUnread, unreadSet } =
@@ -384,6 +386,7 @@ export function HomeView({
       localDoneSet: doneSet,
       localUnreadSet: unreadSet,
       markChannelRead,
+      markChannelUnread,
       markMessageRead,
       markThreadRead,
       markDoneLocal: markDone,
@@ -861,6 +864,13 @@ export function HomeView({
                         eventId: message.id,
                         remove,
                       });
+                      if (!remove) {
+                        recordThreadInteraction(
+                          selectedItem?.conversationId ??
+                            message.rootId ??
+                            message.id,
+                        );
+                      }
                       await threadContext.refreshReactions();
                       await channelMessagesQuery.refetch();
                       onRefresh();
