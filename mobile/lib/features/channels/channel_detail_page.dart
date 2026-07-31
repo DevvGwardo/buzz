@@ -159,6 +159,10 @@ class ChannelDetailPage extends HookConsumerWidget {
         channel;
     final resolvedChannel =
         detailsAsync.whenData(baseChannel.mergeDetails).value ?? baseChannel;
+    final showsComposer =
+        !resolvedChannel.isForum &&
+        resolvedChannel.isMember &&
+        !resolvedChannel.isArchived;
     final messagesNotifier = ref.read(
       channelMessagesProvider(channel.id).notifier,
     );
@@ -376,7 +380,9 @@ class ChannelDetailPage extends HookConsumerWidget {
                               isArchived: resolvedChannel.isArchived,
                               appBarTitleContentHeight:
                                   appBarTitleContentHeight,
-                              composerBottomInset: composerDockHeight.value,
+                              composerBottomInset: showsComposer
+                                  ? composerDockHeight.value
+                                  : 0,
                             );
                           },
                         ),
@@ -400,9 +406,7 @@ class ChannelDetailPage extends HookConsumerWidget {
               ],
             ],
           ),
-          if (!resolvedChannel.isForum &&
-              resolvedChannel.isMember &&
-              !resolvedChannel.isArchived)
+          if (showsComposer)
             Align(
               alignment: Alignment.bottomCenter,
               child: ComposerDockSizeReporter(
