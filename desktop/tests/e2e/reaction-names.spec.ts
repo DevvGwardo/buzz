@@ -13,8 +13,9 @@ const BOB_PUBKEY =
 const MAX_REACTION_NAME =
   "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl";
 const MAX_REACTION_AVATAR_URL =
-  "https://picsum.photos/seed/teammate-alice/96/96";
-const SHORT_REACTION_AVATAR_URL = "https://picsum.photos/seed/bob-avatar/96/96";
+  "https://cdn.example.test/avatars/teammate-alice.jpg";
+const SHORT_REACTION_AVATAR_URL =
+  "https://cdn.example.test/avatars/bob-avatar.jpg";
 const AVATAR_FIXTURES = new Map([
   [
     MAX_REACTION_AVATAR_URL,
@@ -73,7 +74,7 @@ async function capturePopover(
 }
 
 test.beforeEach(async ({ page }) => {
-  await page.route("https://picsum.photos/seed/**", async (route) => {
+  await page.route("https://cdn.example.test/avatars/**", async (route) => {
     const fixturePath = AVATAR_FIXTURES.get(route.request().url());
     if (!fixturePath) {
       await route.abort("blockedbyclient");
