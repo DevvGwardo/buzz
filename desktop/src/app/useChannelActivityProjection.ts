@@ -1,7 +1,10 @@
 import * as React from "react";
 
 import { useThreadActivityFeedItems } from "@/app/useThreadActivityFeedItems";
-import { msgContextKey } from "@/features/channels/readState/readStateFormat";
+import {
+  maxReadAt,
+  msgContextKey,
+} from "@/features/channels/readState/readStateFormat";
 import type { ThreadActivityItem } from "@/features/channels/useUnreadChannels";
 import { isThreadReply } from "@/features/messages/lib/threading";
 import type { Channel, FeedItem, HomeFeed } from "@/shared/api/types";
@@ -24,6 +27,16 @@ type UseChannelActivityProjectionOptions = {
   threadActivityItems: ThreadActivityItem[];
   mutedRootIds: ReadonlySet<string>;
 };
+
+export function resolveChannelActivityFeedItemReadAt(
+  item: Pick<FeedItem, "channelId" | "id">,
+  getOwnReadAt: ReadTimestamp,
+): number | null {
+  return maxReadAt(
+    getOwnReadAt(msgContextKey(item.id)),
+    item.channelId ? getOwnReadAt(item.channelId) : null,
+  );
+}
 
 export function useChannelActivityProjection({
   channels,
@@ -94,10 +107,11 @@ export function useChannelActivityProjection({
       (item) =>
         isThreadReply(item.tags) &&
         (unreadFeedItemIds.has(item.id) ||
-          item.createdAt > (getMessageReadAt(item.id) ?? 0)),
+          item.createdAt >
+            (resolveChannelActivityFeedItemReadAt(item, getOwnReadAt) ?? 0)),
     );
   }, [
-    getMessageReadAt,
+    getOwnReadAt,
     locallyUnreadFeedItems,
     readStateVersion,
     threadActivityFeedItems,

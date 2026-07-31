@@ -317,17 +317,24 @@ export function ChannelActivityPopover({
     }
   }, [hasContent]);
 
-  const handleMarkRead = React.useCallback(
+  const clearUnreadOverride = React.useCallback(
     (item: InboxItem) => {
       for (const itemId of getGroupedInboxItemIds(item)) {
         undoUnread(itemId);
       }
+    },
+    [undoUnread],
+  );
+
+  const handleMarkRead = React.useCallback(
+    (item: InboxItem) => {
+      clearUnreadOverride(item);
       for (const reply of item.groupItems) {
         markMessageRead(reply.id, reply.createdAt);
       }
       markThreadRead(item.conversationId, item.latestActivityAt);
     },
-    [markMessageRead, markThreadRead, undoUnread],
+    [clearUnreadOverride, markMessageRead, markThreadRead],
   );
 
   if (!hasContent) {
@@ -392,6 +399,7 @@ export function ChannelActivityPopover({
                     key={item.conversationId}
                     onMarkRead={() => handleMarkRead(item)}
                     onOpen={() => {
+                      clearUnreadOverride(item);
                       setOpen(false);
                       void goChannel(channel.id, {
                         messageId: item.id,

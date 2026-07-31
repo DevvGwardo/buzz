@@ -439,11 +439,23 @@ test.describe("channel activity hover preview", () => {
     await expect(page.getByTestId("chat-title")).toHaveText("general");
     await expect(page.getByTestId("channel-unread-dot-general")).toBeVisible();
     await page.mouse.move(900, 680);
-    const popover = await openActivityPopover(page);
+    let popover = await openActivityPopover(page);
     await expect(popover.getByTestId(/^channel-activity-item-/)).toHaveCount(2);
     await expect(popover).toContainText("Older Inbox thread reopened");
     await expect(popover).toContainText("A second Inbox thread reopened");
     await expect(popover.getByText("Thread", { exact: true })).toHaveCount(2);
+
+    await popover
+      .getByTestId(/^channel-activity-item-/)
+      .filter({ hasText: "Older Inbox thread reopened" })
+      .getByRole("button", { name: /Open thread/ })
+      .click();
+    await expect(popover).toBeHidden();
+    await page.mouse.move(900, 680);
+    popover = await openActivityPopover(page);
+    await expect(popover.getByTestId(/^channel-activity-item-/)).toHaveCount(1);
+    await expect(popover).not.toContainText("Older Inbox thread reopened");
+    await expect(page.getByTestId("channel-unread-dot-general")).toBeVisible();
   });
 
   test("surfaces future replies after the user reacts to a thread root", async ({
