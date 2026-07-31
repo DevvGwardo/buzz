@@ -138,7 +138,7 @@ const EXACT_RECORDS = new Map<string, CapabilityResult>([
   ["databricks_v2::databricks-gpt-5-6-sol", {
       registryLabel: "GPT-5.6 Sol",
       thinkingMode: "none",
-      supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"] as const,
+      supportedEfforts: ["low", "medium", "high", "max"] as const,
       defaultEffort: "medium",
       databricksV2WireRoute: "openai-responses",
       normalizationPolicy: "openai-standard",

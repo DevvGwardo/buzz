@@ -150,11 +150,9 @@ pub fn lookup_exact(provider: &str, raw_model_id: &str) -> Option<CapabilityResu
                 registry_label: Some("GPT-5.6 Sol"),
                 thinking_mode: ThinkingMode::None,
                 supported_efforts: Cow::Borrowed(&[
-                    ThinkingEffort::None,
                     ThinkingEffort::Low,
                     ThinkingEffort::Medium,
                     ThinkingEffort::High,
-                    ThinkingEffort::XHigh,
                     ThinkingEffort::Max,
                 ]),
                 default_effort: Some(ThinkingEffort::Medium),

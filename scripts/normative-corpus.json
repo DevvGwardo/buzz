@@ -400,9 +400,9 @@
     "id": "resolver-exact-efforts-plus-family-route",
     "provider": "databricks_v2",
     "raw_model_id": "databricks-gpt-5-6-sol",
-    "_note": "Exact record with efforts from models.dev. Route materialized from gpt5-6 family rule (openai-responses). Must return both, complete.",
+    "_note": "Exact record with efforts from models.dev (low|medium|high|max — provider-advertised, no none/xhigh). Route materialized from gpt5-6 family rule (openai-responses). Must return both, complete.",
     "expect": {
-      "supported_efforts": ["none", "low", "medium", "high", "xhigh", "max"],
+      "supported_efforts": ["low", "medium", "high", "max"],
       "databricks_v2_wire_route": "openai-responses"
     }
   },

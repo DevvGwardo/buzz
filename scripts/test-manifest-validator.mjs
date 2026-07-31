@@ -368,4 +368,32 @@ test("schema-negative: duplicate databricks_v2_known_models ID is rejected", () 
   );
 });
 
+// ---------------------------------------------------------------------------
+// Rule: unsafe characters in match_value (family rule)
+// ---------------------------------------------------------------------------
+test("schema-negative: family rule match_value with unsafe chars is rejected", () => {
+  assertRejects(
+    "family rule match_value with backslash",
+    mutate((m) => {
+      // Inject a backslash into an existing rule's match_value — would break Rust string literal
+      const rule = m.family_rules.find((r) => r.id === "anthropic-manual-budget-claude3");
+      rule.match_value = "claude-3\\evil";
+    }),
+    "unsafe",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Rule: unsafe characters in known-model ID
+// ---------------------------------------------------------------------------
+test("schema-negative: databricks_v2_known_models ID with unsafe chars is rejected", () => {
+  assertRejects(
+    "known-model ID with double-quote",
+    mutate((m) => {
+      m.databricks_v2_known_models = ['databricks-gpt-5-5', 'bad"id'];
+    }),
+    "unsafe",
+  );
+});
+
 console.log("\nSchema-negative validator tests complete.");

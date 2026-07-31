@@ -90,6 +90,7 @@ for (const entry of registryLabelsArr) {
   }
   // Safe for code interpolation: reject double-quote, backslash, and control chars.
   // (These characters would break emitted Rust/TS string literals.)
+  // Checked via requireSafeString() below (shared validator defined after knownModels block).
   const unsafeId = entry.id.includes('"') || entry.id.includes("\\") ||
     Array.from(entry.id).some((c) => c.charCodeAt(0) < 32);
   if (unsafeId) {
@@ -115,6 +116,58 @@ if (knownModelsSet.size !== knownModels.length) {
   throw new Error(`databricks_v2_known_models: duplicate IDs detected: ${
     knownModels.filter((id, i) => knownModels.indexOf(id) !== i).join(", ")
   }`);
+}
+
+// ---------------------------------------------------------------------------
+// Shared string-safety validator
+// ---------------------------------------------------------------------------
+//
+// All manifest strings that end up inside generated Rust or TypeScript string literals
+// must not contain double-quote, backslash, or control characters — any of these would
+// break the emitted source or allow injection. One shared check prevents the same class
+// of defect from appearing at scattered emission sites.
+//
+// Usage: requireSafeString(value, "context.path") — throws on violation.
+// ---------------------------------------------------------------------------
+
+function requireSafeString(value, context) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${context}: must be a nonempty string, got ${JSON.stringify(value)}`);
+  }
+  const hasUnsafe = value.includes('"') || value.includes("\\") ||
+    Array.from(value).some((c) => c.charCodeAt(0) < 32);
+  if (hasUnsafe) {
+    throw new Error(`${context}: contains unsafe characters (double-quote, backslash, or control chars): ${JSON.stringify(value)}`);
+  }
+}
+
+// Validate all manifest strings that end up in generated Rust/TS string literals.
+// family_tokens → Rust FAMILY_TOKENS array and TS FAMILY_TOKENS constant
+for (const tok of manifest.family_tokens ?? []) {
+  requireSafeString(tok, "family_tokens[]");
+}
+
+// databricks_v2_known_models IDs → Rust/TS DATABRICKS_V2_KNOWN_MODELS array
+for (const id of knownModels) {
+  requireSafeString(id, "databricks_v2_known_models[]");
+}
+
+// exact_records → Rust lookup_exact() match arms and TS EXACT_RECORDS map keys
+for (const rec of manifest.exact_records ?? []) {
+  requireSafeString(rec.provider ?? "", `exact_records[${rec.raw_model_id}].provider`);
+  requireSafeString(rec.raw_model_id ?? "", `exact_records[${rec.raw_model_id}].raw_model_id`);
+}
+
+// family_rules → Rust/TS lookup_by_family_rules() match-expression strings
+for (const rule of manifest.family_rules ?? []) {
+  requireSafeString(rule.id ?? "", `family_rules[${rule.id}].id`);
+  requireSafeString(rule.match_value ?? "", `family_rules[${rule.id}].match_value`);
+  for (const alias of rule.match_aliases ?? []) {
+    requireSafeString(alias, `family_rules[${rule.id}].match_aliases[]`);
+  }
+  for (const provider of rule.providers ?? []) {
+    requireSafeString(provider, `family_rules[${rule.id}].providers[]`);
+  }
 }
 
 // ---------------------------------------------------------------------------

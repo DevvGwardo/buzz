@@ -46,24 +46,46 @@ const jsRunnerPath = join(repoRoot, "scripts", "run-corpus.mjs");
 
 const originalManifest = readFileSync(manifestPath, "utf8");
 
-function runTsCorpus() {
+/**
+ * Run the TS corpus and return:
+ *   { kind: "passed" }                          — all vectors pass (mutation survived)
+ *   { kind: "killed", output }                  — nonzero exit AND at least one expectedKiller ID
+ *                                                  appears in stdout/stderr ("FAIL  <id>" line)
+ *   { kind: "error", output }                   — nonzero exit but NO expected corpus output
+ *                                                  (import error, missing file, syntax error, etc.)
+ */
+function runTsCorpus(expectedKillers) {
+  let result;
   try {
-    const result = spawnSync(
+    result = spawnSync(
       process.execPath,
       ["--experimental-strip-types", jsRunnerPath],
       { cwd: repoRoot, encoding: "utf8" },
     );
-    if (result.status === 0) return { passed: true };
-    const output = (result.stdout ?? "") + (result.stderr ?? "");
-    return { passed: false, output };
   } catch (e) {
-    return { passed: false, output: e.message };
+    return { kind: "error", output: `spawn error: ${e.message}` };
   }
+  if (result.status === 0) return { kind: "passed" };
+  const output = (result.stdout ?? "") + (result.stderr ?? "");
+  // A genuine corpus kill produces "FAIL  <vector-id>" lines.
+  // An infrastructure failure (import error, syntax error) produces no such lines.
+  const hasCorpusFailure = expectedKillers.some((id) => output.includes(`FAIL  ${id}`));
+  if (hasCorpusFailure) return { kind: "killed", output };
+  return { kind: "error", output };
 }
 
-function runRustCorpus() {
+/**
+ * Run the Rust corpus and return:
+ *   { kind: "passed" }                          — all vectors pass
+ *   { kind: "killed", output }                  — nonzero exit AND at least one expectedKiller ID
+ *                                                  appears in the panic output ("[<id>]" format)
+ *   { kind: "error", output }                   — nonzero exit but NO expected corpus output
+ *                                                  (compile error, missing cargo, linker error, etc.)
+ */
+function runRustCorpus(expectedKillers) {
+  let result;
   try {
-    const result = spawnSync(
+    result = spawnSync(
       "cargo",
       [
         "test",
@@ -74,12 +96,15 @@ function runRustCorpus() {
       ],
       { cwd: repoRoot, encoding: "utf8", env: { ...process.env, RUST_BACKTRACE: "0" } },
     );
-    if (result.status === 0) return { passed: true };
-    const output = (result.stdout ?? "") + (result.stderr ?? "");
-    return { passed: false, output };
   } catch (e) {
-    return { passed: false, output: e.message };
+    return { kind: "error", output: `spawn error: ${e.message}` };
   }
+  if (result.status === 0) return { kind: "passed" };
+  const output = (result.stdout ?? "") + (result.stderr ?? "");
+  // The Rust corpus runner panics with "[<vector-id>] <axis>: got..." messages.
+  const hasCorpusFailure = expectedKillers.some((id) => output.includes(`[${id}]`));
+  if (hasCorpusFailure) return { kind: "killed", output };
+  return { kind: "error", output };
 }
 
 function regen() {
@@ -176,25 +201,41 @@ for (const mut of mutations) {
 
     // TS interpreter
     process.stdout.write(`    TS  ... `);
-    const tsResult = runTsCorpus();
-    const tsKilled = !tsResult.passed;
-    process.stdout.write(tsKilled ? "killed ✓\n" : "SURVIVED ✗\n");
-    if (VERBOSE && !tsKilled) process.stdout.write(`      ${tsResult.output}\n`);
+    const tsResult = runTsCorpus(mut.expectedKillers);
+    const tsKilled = tsResult.kind === "killed";
+    const tsError = tsResult.kind === "error";
+    if (tsKilled) {
+      process.stdout.write("killed ✓\n");
+    } else if (tsError) {
+      process.stdout.write(`ERROR (infrastructure failure — not a corpus kill)\n`);
+      if (VERBOSE) process.stdout.write(`      ${tsResult.output}\n`);
+    } else {
+      process.stdout.write("SURVIVED ✗\n");
+      if (VERBOSE) process.stdout.write(`      ${tsResult.output ?? ""}\n`);
+    }
 
     // Rust interpreter
     process.stdout.write(`    Rust... `);
-    const rustResult = runRustCorpus();
-    const rustKilled = !rustResult.passed;
-    process.stdout.write(rustKilled ? "killed ✓\n" : "SURVIVED ✗\n");
-    if (VERBOSE && !rustKilled) process.stdout.write(`      ${rustResult.output}\n`);
+    const rustResult = runRustCorpus(mut.expectedKillers);
+    const rustKilled = rustResult.kind === "killed";
+    const rustError = rustResult.kind === "error";
+    if (rustKilled) {
+      process.stdout.write("killed ✓\n");
+    } else if (rustError) {
+      process.stdout.write(`ERROR (infrastructure failure — not a corpus kill)\n`);
+      if (VERBOSE) process.stdout.write(`      ${rustResult.output}\n`);
+    } else {
+      process.stdout.write("SURVIVED ✗\n");
+      if (VERBOSE) process.stdout.write(`      ${rustResult.output ?? ""}\n`);
+    }
 
     const killed = tsKilled && rustKilled;
     if (!killed) allKilled = false;
-    results.push({ ...mut, killed, tsKilled, rustKilled });
+    results.push({ ...mut, killed, tsKilled, rustKilled, tsError, rustError });
   } catch (e) {
     process.stdout.write(`    ERROR: ${e.message}\n`);
     allKilled = false;
-    results.push({ ...mut, killed: false, tsKilled: false, rustKilled: false, output: e.message });
+    results.push({ ...mut, killed: false, tsKilled: false, rustKilled: false, tsError: true, rustError: true, output: e.message });
   } finally {
     restore();
     regen(); // restore generated files
@@ -203,9 +244,16 @@ for (const mut of mutations) {
 
 console.log("");
 const killed = results.filter(r => r.killed).length;
-console.log(`Mutation results: ${killed}/${results.length} killed (both interpreters)`);
+const errored = results.filter(r => r.tsError || r.rustError).length;
+console.log(`Mutation results: ${killed}/${results.length} killed (both interpreters)` +
+  (errored > 0 ? `, ${errored} ERROR (infrastructure failure — see output above)` : ""));
 
 if (!allKilled) {
+  const hasErrors = results.some(r => r.tsError || r.rustError);
+  if (hasErrors) {
+    console.error("ERROR: Infrastructure failures prevented some mutations from being verified as killed.");
+    console.error("       Run with --verbose to see the full output for ERROR entries.");
+  }
   console.error("ERROR: Some mutations survived — corpus does not kill all resolver faults.");
   process.exit(1);
 }

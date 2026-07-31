@@ -619,7 +619,7 @@
       "source": "models.dev reasoning_options: low|medium|high (family rule adds none+xhigh \u2014 adopt provider-advertised)",
       "_reconciliation": "adopt",
       "_reconciliation_note": "models.dev advertises low|medium|high. Family rule (gpt5-4) adds none+xhigh. Provider-advertised wins per plan F1 policy.",
-      "_reconciliation_doc": "https://models.dev (queried 2025-07-30): databricks-gpt-5-4-mini reasoning_options=[low,medium,high]"
+      "_reconciliation_doc": "https://models.dev/api.json (retrieved 2026-07-31, SHA-256 d5a4974cd69f19b0f67713acaa6bb3b16e920defdc07ecbdf6b0a936181bb0e0): providers.databricks.models[\"databricks-gpt-5-4-mini\"].reasoning_options=[{\"type\":\"effort\",\"values\":[\"low\",\"medium\",\"high\"]}]"
     },
     {
       "provider": "databricks_v2",
@@ -633,24 +633,22 @@
       "source": "models.dev reasoning_options: low|medium|high",
       "_reconciliation": "adopt",
       "_reconciliation_note": "models.dev advertises low|medium|high. Same as gpt-5-4-mini. Adopt.",
-      "_reconciliation_doc": "https://models.dev (queried 2025-07-30): databricks-gpt-5-4-nano reasoning_options=[low,medium,high]"
+      "_reconciliation_doc": "https://models.dev/api.json (retrieved 2026-07-31, SHA-256 d5a4974cd69f19b0f67713acaa6bb3b16e920defdc07ecbdf6b0a936181bb0e0): providers.databricks.models[\"databricks-gpt-5-4-nano\"].reasoning_options=[{\"type\":\"effort\",\"values\":[\"low\",\"medium\",\"high\"]}]"
     },
     {
       "provider": "databricks_v2",
       "raw_model_id": "databricks-gpt-5-6-sol",
       "registry_label": "GPT-5.6 Sol",
       "supported_efforts_override": [
-        "none",
         "low",
         "medium",
         "high",
-        "xhigh",
         "max"
       ],
-      "source": "models.dev reasoning_options: includes max. Family rule adds none+max \u2014 consistent, adopt.",
+      "source": "models.dev reasoning_options: low|medium|high|max (family rule adds none+xhigh \u2014 provider-advertised wins per plan F1)",
       "_reconciliation": "adopt",
-      "_reconciliation_note": "models.dev advertises including max. Family rule gpt5-6 has max. Consistent. Adopt.",
-      "_reconciliation_doc": "https://models.dev (queried 2025-07-30): databricks-gpt-5-6-sol reasoning_options=[none,low,medium,high,xhigh,max]"
+      "_reconciliation_note": "models.dev advertises [low, medium, high, max]. Family rule (gpt5-6) has none+xhigh+max; sol endpoint does not expose none or xhigh. Provider-advertised wins.",
+      "_reconciliation_doc": "https://models.dev/api.json (retrieved 2026-07-31, SHA-256 d5a4974cd69f19b0f67713acaa6bb3b16e920defdc07ecbdf6b0a936181bb0e0): providers.databricks.models[\"databricks-gpt-5-6-sol\"].reasoning_options=[{\"type\":\"effort\",\"values\":[\"low\",\"medium\",\"high\",\"max\"]}]"
     },
     {
       "provider": "databricks_v2",

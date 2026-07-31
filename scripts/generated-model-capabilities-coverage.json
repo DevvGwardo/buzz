@@ -1903,11 +1903,9 @@
       "registry_label": "GPT-5.6 Sol",
       "thinking_mode": "none",
       "supported_efforts": [
-        "none",
         "low",
         "medium",
         "high",
-        "xhigh",
         "max"
       ],
       "default_effort": "medium",
