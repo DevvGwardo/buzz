@@ -407,6 +407,16 @@
     }
   },
   {
+    "id": "dbv2-gpt5-5-exact-override",
+    "provider": "databricks_v2",
+    "raw_model_id": "databricks-gpt-5-5",
+    "_note": "Exact record adopts models.dev advertised set [low,medium,high]. Family rule (gpt5-5) has none+xhigh — provider-advertised wins per plan F1.",
+    "expect": {
+      "supported_efforts": ["low", "medium", "high"],
+      "databricks_v2_wire_route": "openai-responses"
+    }
+  },
+  {
     "_group": "Blank vs concrete-unknown per provider (P2-B fallback vectors)"
   },
   {

@@ -63,10 +63,15 @@ Provider-advertised wins per plan F1 policy.
 
 | | Current family rule (gpt5-5) | models.dev | Disposition |
 |---|---|---|---|
-| `supported_efforts` | `[none, low, medium, high, xhigh]` | Not queried (not in models.dev at 2025-07-30) | **NO DIVERGENCE** |
+| `supported_efforts` | `[none, low, medium, high, xhigh]` | `[low, medium, high]` | **ADOPT** |
 
-**Rationale**: `DATABRICKS_V2_KNOWN_MODELS` entry. Family rule applies. No models.dev data
-available to diverge from.
+**Rationale**: The Databricks AI Gateway v2 endpoint for `databricks-gpt-5-5` advertises only
+`[low, medium, high]` in its `reasoning_options`. The family rule's `none` and `xhigh` are
+derived from the upstream OpenAI GPT-5.5 spec, which this Databricks endpoint does not expose.
+Provider-advertised wins per plan F1 policy.
+
+**Source**: [https://models.dev/api.json](https://models.dev/api.json) — retrieved 2026-07-31; `providers.databricks.models["databricks-gpt-5-5"].reasoning_options = [{"type":"effort","values":["low","medium","high"]}]`  
+**Snapshot**: `scripts/catalog-sample-fixture.json` key `"databricks-gpt-5-5"`
 
 ---
 
@@ -74,10 +79,15 @@ available to diverge from.
 
 | | Current family rule (anthropic-adaptive-xhigh-opus-4-7) | models.dev | Disposition |
 |---|---|---|---|
-| `supported_efforts` | `[low, medium, high, xhigh, max]` | Not in models.dev (Anthropic model) | **NO DIVERGENCE** |
+| `reasoning_options` type | effort-based | `budget_tokens` | **NO EFFORT DIVERGENCE** |
 
-**Rationale**: `DATABRICKS_V2_KNOWN_MODELS` entry. Anthropic family rule applies. No models.dev
-`reasoning_options` data to conflict with.
+**Rationale**: models.dev advertises `reasoning_options=[{"type":"budget_tokens","min":1024}]` —
+a different capability axis (extended thinking token budget), not an effort-level selector.
+There is no effort divergence to reconcile. The effort capabilities for this model come from the
+`anthropic-adaptive-xhigh-opus-4-7` family rule (Anthropic extended-thinking support table).
+
+**Source**: [https://models.dev/api.json](https://models.dev/api.json) — retrieved 2026-07-31; `providers.databricks.models["databricks-claude-opus-4-7"].reasoning_options = [{"type":"budget_tokens","min":1024}]`  
+**Snapshot**: `scripts/catalog-sample-fixture.json` key `"databricks-claude-opus-4-7"`
 
 ---
 

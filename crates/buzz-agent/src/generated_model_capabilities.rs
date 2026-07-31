@@ -163,7 +163,7 @@ pub fn lookup_exact(provider: &str, raw_model_id: &str) -> Option<CapabilityResu
         ("databricks_v2", "databricks-gpt-5-5") => {
             // provenance: exact(databricks_v2::databricks-gpt-5-5)
             //   registry_label: exact_record
-            //   supported_efforts: family:openai-gpt5-5@15
+            //   supported_efforts: exact_record
             //   databricks_v2_wire_route: family:openai-gpt5-5@15
             //   thinking_mode: family:openai-gpt5-5@15
             //   normalization_policy: family:openai-gpt5-5@15
@@ -172,11 +172,9 @@ pub fn lookup_exact(provider: &str, raw_model_id: &str) -> Option<CapabilityResu
                 registry_label: Some("GPT-5.5"),
                 thinking_mode: ThinkingMode::None,
                 supported_efforts: Cow::Borrowed(&[
-                    ThinkingEffort::None,
                     ThinkingEffort::Low,
                     ThinkingEffort::Medium,
                     ThinkingEffort::High,
-                    ThinkingEffort::XHigh,
                 ]),
                 default_effort: Some(ThinkingEffort::Medium),
                 databricks_v2_wire_route: DatabricksV2Route::OpenAiResponses,

@@ -396,4 +396,18 @@ test("schema-negative: databricks_v2_known_models ID with unsafe chars is reject
   );
 });
 
+// ---------------------------------------------------------------------------
+// Rule: unsafe characters in exact_record registry_label
+// ---------------------------------------------------------------------------
+test("schema-negative: exact_record registry_label with unsafe chars is rejected", () => {
+  assertRejects(
+    "exact_record registry_label with backslash",
+    mutate((m) => {
+      const rec = m.exact_records.find((r) => r.raw_model_id === "databricks-gpt-5-4-mini");
+      rec.registry_label = "GPT-5.4 Mini\\injected";
+    }),
+    "unsafe",
+  );
+});
+
 console.log("\nSchema-negative validator tests complete.");

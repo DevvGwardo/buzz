@@ -3,7 +3,7 @@
   "_comment": "Hand-curated model capability manifest. Edit here; run scripts/generate-model-capabilities.mjs to regenerate artifacts.",
   "_generated_by": "scripts/generate-model-capabilities.mjs",
   "_sources": {
-    "models_dev": "https://models.dev (queried 2025-07-30)",
+    "models_dev": "https://models.dev/api.json (retrieved 2026-07-31, SHA-256 d5a4974cd69f19b0f67713acaa6bb3b16e920defdc07ecbdf6b0a936181bb0e0)",
     "anthropic_thinking": "https://platform.claude.com/docs/en/build-with-claude/extended-thinking (July 2025)",
     "anthropic_effort": "https://platform.claude.com/docs/en/build-with-claude/effort (July 2025)",
     "openai_reasoning": "https://platform.openai.com/docs/guides/reasoning (July 2025)",
@@ -654,17 +654,24 @@
       "provider": "databricks_v2",
       "raw_model_id": "databricks-gpt-5-5",
       "registry_label": "GPT-5.5",
-      "source": "DATABRICKS_V2_KNOWN_MODELS; family rule gpt5-5 applies",
-      "_reconciliation": "no-divergence",
-      "_reconciliation_note": "Consistent with family rule. No override needed."
+      "source": "models.dev reasoning_options: low|medium|high (family rule adds none+xhigh \u2014 provider-advertised wins per plan F1)",
+      "_reconciliation": "adopt",
+      "_reconciliation_note": "models.dev (pinned payload) advertises [low, medium, high]. Family rule (gpt5-5) has none+xhigh; this Databricks endpoint does not expose none or xhigh. Provider-advertised wins.",
+      "supported_efforts_override": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "_reconciliation_doc": "https://models.dev/api.json (retrieved 2026-07-31, SHA-256 d5a4974cd69f19b0f67713acaa6bb3b16e920defdc07ecbdf6b0a936181bb0e0): providers.databricks.models[\"databricks-gpt-5-5\"].reasoning_options=[{\"type\":\"effort\",\"values\":[\"low\",\"medium\",\"high\"]}]"
     },
     {
       "provider": "databricks_v2",
       "raw_model_id": "databricks-claude-opus-4-7",
       "registry_label": "Claude Opus 4.7",
       "source": "DATABRICKS_V2_KNOWN_MODELS; family rule anthropic-adaptive-xhigh-opus-4-7 applies",
-      "_reconciliation": "no-divergence",
-      "_reconciliation_note": "Consistent with family rule. No override needed."
+      "_reconciliation": "no-effort-divergence",
+      "_reconciliation_note": "models.dev advertises reasoning_options=[{\"type\":\"budget_tokens\",\"min\":1024}]. This is a different capability axis (extended thinking token budget), not an effort-level selector. No effort divergence to reconcile \u2014 efforts for this model come from the anthropic family rule (anthropic-adaptive-xhigh-opus-4-7).",
+      "_reconciliation_doc": "https://models.dev/api.json (retrieved 2026-07-31, SHA-256 d5a4974cd69f19b0f67713acaa6bb3b16e920defdc07ecbdf6b0a936181bb0e0): providers.databricks.models[\"databricks-claude-opus-4-7\"].reasoning_options=[{\"type\":\"budget_tokens\",\"min\":1024}]"
     }
   ],
   "provider_fallbacks": {

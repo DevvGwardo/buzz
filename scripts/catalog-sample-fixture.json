@@ -5,6 +5,20 @@
   "_payload_sha256": "d5a4974cd69f19b0f67713acaa6bb3b16e920defdc07ecbdf6b0a936181bb0e0",
   "_retrieval_note": "Full payload SHA-256 computed over the raw response body of GET https://models.dev/api.json (no transforms). Re-verify: curl -s https://models.dev/api.json | sha256sum",
   "_models_dev_records": {
+    "databricks-gpt-5-5": {
+      "id": "databricks-gpt-5-5",
+      "name": "GPT-5.5",
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ]
+    },
     "databricks-gpt-5-4-mini": {
       "id": "databricks-gpt-5-4-mini",
       "name": "GPT-5.4 mini",
@@ -45,6 +59,16 @@
             "high",
             "max"
           ]
+        }
+      ]
+    },
+    "databricks-claude-opus-4-7": {
+      "id": "databricks-claude-opus-4-7",
+      "name": "Claude Opus 4.7",
+      "reasoning_options": [
+        {
+          "type": "budget_tokens",
+          "min": 1024
         }
       ]
     }

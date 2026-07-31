@@ -1931,11 +1931,9 @@
       "registry_label": "GPT-5.5",
       "thinking_mode": "none",
       "supported_efforts": [
-        "none",
         "low",
         "medium",
-        "high",
-        "xhigh"
+        "high"
       ],
       "default_effort": "medium",
       "databricks_v2_wire_route": "openai-responses",
@@ -1944,7 +1942,7 @@
         "source": "exact",
         "exact_key": "databricks_v2::databricks-gpt-5-5",
         "registry_label": "exact_record",
-        "supported_efforts": "family:openai-gpt5-5@15",
+        "supported_efforts": "exact_record",
         "databricks_v2_wire_route": "family:openai-gpt5-5@15",
         "thinking_mode": "family:openai-gpt5-5@15",
         "normalization_policy": "family:openai-gpt5-5@15",

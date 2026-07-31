@@ -168,6 +168,24 @@ for (const rule of manifest.family_rules ?? []) {
   for (const provider of rule.providers ?? []) {
     requireSafeString(provider, `family_rules[${rule.id}].providers[]`);
   }
+  // registry_label flows into Rust Some("...") and TS "..." string literals
+  if (rule.registry_label != null) {
+    requireSafeString(rule.registry_label, `family_rules[${rule.id}].registry_label`);
+  }
+}
+
+// exact_records: registry_label values flow into Rust rustString() and TS emitter
+for (const rec of manifest.exact_records ?? []) {
+  if (rec.registry_label != null) {
+    requireSafeString(rec.registry_label, `exact_records[${rec.raw_model_id}].registry_label`);
+  }
+}
+
+// provider_fallbacks: object keys are interpolated as Rust match arms and TS object keys
+for (const providerKey of Object.keys(manifest.provider_fallbacks ?? {})) {
+  if (providerKey !== "_default") {
+    requireSafeString(providerKey, `provider_fallbacks key`);
+  }
 }
 
 // ---------------------------------------------------------------------------
