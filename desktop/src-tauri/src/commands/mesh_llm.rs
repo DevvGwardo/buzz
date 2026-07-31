@@ -503,32 +503,21 @@ pub async fn mesh_start_node(
             ));
         }
     };
-    // Install the runtime BEFORE probing inference readiness so it is always
-    // tracked by AppState and can never become an orphaned listener. The old
-    // code deferred the install until after the probe and, on a readiness
-    // timeout, stopped the node and restarted the whole app "to guarantee
-    // cleanup". But a readiness timeout is not a dead node: mesh binds its
-    // ports after primary weights load while package layers keep downloading,
-    // it serializes all ingress HTTP (including this readiness probe) behind
-    // any in-flight inference, and a cold download can run for minutes. In all
-    // of those the node is alive and progressing, so the restart turned
-    // ordinary startup latency into a whole-app restart loop. Tracking the
-    // runtime removes the orphan risk the restart was guarding against.
+    // Install (track) the runtime BEFORE probing readiness so it can never be
+    // orphaned. A readiness timeout is not death: mesh binds its ports before
+    // weights finish loading / layers finish downloading, and serializes all
+    // ingress HTTP (this probe included) behind any in-flight turn — a cold
+    // start can take minutes. The old code stopped the node and restarted the
+    // app on that timeout, turning startup latency into a restart loop.
     *runtime = Some(started);
     drop(runtime);
     if let Some(config) = sharing_config.as_ref() {
-        // The node is installed and tracked, so Share Compute IS on for this
-        // session — persist the enabled config immediately, mirroring the
-        // restore path. A big model can take minutes to load weights and
-        // download layers, well past the readiness probe's deadline; gating the
-        // save on that probe (the previous behaviour) meant a slow first start
-        // served fine this session but silently came back OFF next launch,
-        // while a retry was rejected because the runtime already existed.
-        // Arming on install is safe: neither the watchdog (evicts only a closed
-        // port) nor restore (leaves a warming-up node alone) can turn a
-        // slow-but-alive node into a restart loop, and a config that genuinely
-        // cannot start fails earlier in `DesktopMeshRuntime::start`, before this
-        // point. The readiness probe below is now purely informational.
+        // Installed + tracked == Share Compute is on, so persist the enabled
+        // config now (mirroring restore), not gated on the probe. Gating it
+        // meant a slow first start served fine but came back OFF next launch.
+        // Safe: neither the watchdog (evicts only a closed port) nor restore
+        // (leaves a warming node alone) can loop a slow-but-alive node, and an
+        // unstartable config fails earlier in `start()`. Probe is informational.
         save_mesh_sharing_config(&app, config)?;
         if let Err(error) = wait_for_mesh_inference(&config.model_id).await {
             eprintln!(
