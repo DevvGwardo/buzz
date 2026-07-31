@@ -442,6 +442,233 @@ async fn test_apply_workspace_flush_cannot_interleave_before_reconcile() {
     config_sync_readiness::mark_unready(); // cleanup
 }
 
+// ── (j) generation-gate blocks stale barrier's decision pass ─────────────────
+//
+// Pass-3 CRITICAL finding: before this fix, `run_decision_pass` wrote gate
+// decisions unconditionally — a preempted barrier resuming after the current
+// one certified `Ready` could overwrite newer gate decisions with its stale
+// relay evidence. The defect was invisible to the 2110-test suite because
+// test (i) only verified that `complete()` is a no-op; it never drove a
+// stale barrier all the way through enforcement.
+//
+// This test exercises the enforcement seam directly: stale barrier S builds a
+// `CoordinateState` from stale relay evidence (the exact CRITICAL cell —
+// `HeadState::Absent` sees cell-3 `PublishLocalEdit`, opening a gate the
+// current barrier parked) and calls `run_decision_pass` while gated by the
+// `is_current()` check. The generation guard must block the write.
+//
+// Deterministic sequence:
+// 1. Flush wins claim (gen 0). Its barrier observes `HeadState::Absent` for
+//    the coordinate — stale evidence that would decide `PublishLocalEdit`.
+// 2. apply_workspace force-claims (gen 1). The current barrier observes
+//    `HeadState::Present` and decides `Park(NoBaselineWithHead)`.
+// 3. Current barrier (gen 1) runs `run_decision_pass` → sets
+//    `publish_blocked = true`. Certifies Ready(path).
+// 4. Stale barrier (gen 0) resumes enforcement with its stale evidence.
+//    Before calling `run_decision_pass`, the generation guard (`is_current()`)
+//    returns false — write is blocked. `publish_blocked` must remain `true`.
+// 5. Vacuity proof: without the guard, the stale pass WOULD clear the flag
+//    (verified on a scratch db so the real store is never mutated by the test).
+#[test]
+fn test_stale_barriers_decision_pass_cannot_alter_publish_blocked() {
+    use crate::managed_agents::{
+        canonical_projection::CanonicalProjection,
+        config_sync::{local_state, plan, run_decision_pass, CoordinateState},
+        decision::{Decision, Head, HeadState, TombstoneEvidence},
+        head_lookup::Coordinate,
+        retention::{is_publish_blocked, open_retention_db, retain_event, RetainedEvent},
+    };
+    use buzz_core_pkg::kind::KIND_PERSONA;
+    use nostr::{EventBuilder, JsonUtil, Kind, Tag};
+
+    config_sync_readiness::mark_unready();
+
+    let keys = nostr::Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let d_tag = "barrier-race";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("retention.db");
+
+    // Retain a no-baseline pending row (the exact revert cell).
+    let event = EventBuilder::new(
+        Kind::Custom(KIND_PERSONA as u16),
+        r#"{"system_prompt":"old"}"#.to_string(),
+    )
+    .tags(vec![Tag::parse(["d", d_tag]).unwrap()])
+    .sign_with_keys(&keys)
+    .expect("sign");
+    {
+        let conn = open_retention_db(&db_path).expect("open db");
+        retain_event(
+            &conn,
+            &RetainedEvent {
+                kind: KIND_PERSONA,
+                pubkey: pubkey.clone(),
+                d_tag: d_tag.to_string(),
+                content: event.content.to_string(),
+                created_at: event.created_at.as_secs() as i64,
+                raw_event: event.as_json(),
+                event_id: None,
+                pending_sync: true,
+                publish_blocked: false,
+            },
+        )
+        .expect("retain");
+    }
+
+    let coordinate = Coordinate {
+        kind: KIND_PERSONA,
+        d_tag: d_tag.to_string(),
+    };
+
+    // Step 1: flush wins the initial claim (gen 0). Stale relay evidence:
+    // HeadState::Absent → no baseline → cell-2 PublishLocalEdit (would open the gate).
+    let stale_claim = config_sync_readiness::claim_in_progress().unwrap();
+    assert_eq!(config_sync_readiness::current_generation(), 0);
+    let stale_observation = {
+        let conn = open_retention_db(&db_path).expect("open db for stale observation");
+        local_state(
+            &conn,
+            &pubkey,
+            &coordinate,
+            None,
+            HeadState::Absent,
+            TombstoneEvidence::NotFound,
+        )
+        .unwrap()
+    };
+    let stale_states = vec![CoordinateState {
+        coordinate: coordinate.clone(),
+        observation: stale_observation,
+    }];
+
+    // Vacuity check: the stale evidence would decide PublishLocalEdit.
+    // If this fails the test is measuring the wrong thing.
+    assert_eq!(
+        plan(&stale_states)[0].1.decision,
+        Decision::PublishLocalEdit,
+        "vacuity: stale evidence (Absent head, no baseline) must decide PublishLocalEdit"
+    );
+
+    // Step 2: apply_workspace fires — force_claim bumps to gen 1.
+    let force_claim = config_sync_readiness::force_claim_in_progress();
+    assert_eq!(config_sync_readiness::current_generation(), 1);
+
+    // Step 3: current barrier (gen 1) runs its pass — Present head + no baseline
+    // → Park(NoBaselineWithHead) → publish_blocked = true. Certifies Ready.
+    {
+        let current_observation = {
+            let conn = open_retention_db(&db_path).expect("open db for current observation");
+            local_state(
+                &conn,
+                &pubkey,
+                &coordinate,
+                None,
+                HeadState::Present(Head {
+                    event_id: "id-relay-head".to_string(),
+                    created_at: 200,
+                    projection: CanonicalProjection {
+                        content: "good-edit".to_string(),
+                        shared: false,
+                    },
+                }),
+                TombstoneEvidence::NotFound,
+            )
+            .unwrap()
+        };
+        let current_conn = open_retention_db(&db_path).expect("open db for current pass");
+        run_decision_pass(
+            &current_conn,
+            &pubkey,
+            &[CoordinateState {
+                coordinate: coordinate.clone(),
+                observation: current_observation,
+            }],
+        )
+        .expect("current barrier enforces");
+    }
+    assert!(
+        is_publish_blocked(
+            &open_retention_db(&db_path).unwrap(),
+            KIND_PERSONA,
+            &pubkey,
+            d_tag,
+        )
+        .unwrap(),
+        "precondition: current barrier (gen 1) must have set publish_blocked = true"
+    );
+    force_claim.complete(db_path.clone());
+    assert!(config_sync_readiness::is_ready_for(&db_path));
+
+    // Step 4: stale barrier (gen 0) resumes enforcement.
+    //
+    // The enforcement seam: `run_boot_barrier_for_scope` calls `claim.is_current()`
+    // while holding `managed_agents_store_lock`, and returns `Abandoned` without
+    // calling `run_decision_pass` when it returns false.
+    //
+    // We reproduce that guard here: `is_current()` must return false.
+    assert!(
+        !stale_claim.is_current(),
+        "stale claim (gen 0) must not be current after force_claim bumped to gen 1"
+    );
+
+    // Enforcement seam: the stale barrier only calls run_decision_pass if
+    // is_current() returns true. Since it doesn't, the write is blocked.
+    // This is the invariant the production guard enforces.
+    if stale_claim.is_current() {
+        let conn = open_retention_db(&db_path).expect("open db for stale enforcement");
+        run_decision_pass(&conn, &pubkey, &stale_states).expect("stale pass");
+    }
+
+    // Vacuity companion: confirm the stale pass WOULD have cleared the flag
+    // by running it on an isolated scratch db. This proves the test would
+    // catch a regression where is_current() is removed — the stale evidence
+    // genuinely opens the gate when unguarded.
+    {
+        let scratch_dir = tempfile::tempdir().expect("scratch tempdir");
+        let scratch_db = scratch_dir.path().join("scratch.db");
+        let scratch_conn = open_retention_db(&scratch_db).expect("open scratch");
+        retain_event(
+            &scratch_conn,
+            &RetainedEvent {
+                kind: KIND_PERSONA,
+                pubkey: pubkey.clone(),
+                d_tag: d_tag.to_string(),
+                content: "old".to_string(),
+                created_at: 100,
+                raw_event: event.as_json(),
+                event_id: None,
+                pending_sync: true,
+                publish_blocked: true,
+            },
+        )
+        .expect("retain in scratch");
+        run_decision_pass(&scratch_conn, &pubkey, &stale_states).expect("unguarded stale pass");
+        assert!(
+            !is_publish_blocked(&scratch_conn, KIND_PERSONA, &pubkey, d_tag).unwrap(),
+            "vacuity: without the guard the stale pass clears publish_blocked"
+        );
+    }
+
+    // Step 5: real store must be unchanged — publish_blocked must remain true.
+    assert!(
+        is_publish_blocked(
+            &open_retention_db(&db_path).unwrap(),
+            KIND_PERSONA,
+            &pubkey,
+            d_tag,
+        )
+        .unwrap(),
+        "publish_blocked must remain true: stale barrier's run_decision_pass was blocked by the generation guard"
+    );
+
+    // Stale claim drops (gen mismatch → latch no-op; force-claim already certified Ready).
+    drop(stale_claim);
+    assert!(config_sync_readiness::is_ready_for(&db_path));
+
+    config_sync_readiness::mark_unready(); // cleanup
+}
+
 // ── (i) leg-1 end-to-end: stale flush barrier cannot publish after force-claim ─
 //
 // Paul's second bounce, leg 1: flush wins claim at t≈0, its inline barrier

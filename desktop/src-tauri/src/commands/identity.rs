@@ -383,6 +383,36 @@ pub async fn import_identity(
 
         eprintln!("buzz-desktop: imported identity pubkey {}", pubkey_hex);
 
+        // Enqueue the new owner's disk projections and run the boot barrier.
+        // Without this, config publication silently stops until the next
+        // restart: the flush loop checks `is_ready_for(db_path)` against the
+        // OLD owner's scope, and the new owner's scope was never certified.
+        //
+        // Mirrors `apply_workspace`'s force-claim sequence. The legacy-
+        // migration step is skipped here — only the keys changed, not the
+        // relay or scope database, so there is nothing to adopt from a
+        // pre-scoping global store.
+        {
+            match crate::managed_agents::retention::active_retention_scope(
+                &app_handle,
+                &state,
+            ) {
+                Ok(scope) => {
+                    let claim =
+                        crate::managed_agents::config_sync_readiness::force_claim_in_progress();
+                    crate::event_sync::spawn_event_sync_with_held_claim(
+                        app_handle.clone(),
+                        scope.owner_keys,
+                        scope.db_path,
+                        claim,
+                    );
+                }
+                Err(e) => {
+                    eprintln!("buzz-desktop: import-identity: scope unavailable, config barrier skipped: {e}");
+                }
+            }
+        }
+
         Ok(IdentityInfo {
             pubkey: pubkey_hex,
             display_name,

@@ -123,7 +123,7 @@ async fn run_boot_barrier_enforcing(
         }
     };
 
-    match run_boot_barrier_for_scope(app, &state, &scope).await {
+    match run_boot_barrier_for_scope(app, &state, &scope, &claim).await {
         Ok(BarrierOutcome::Success) => {
             // complete() transitions to Ready only if this claim's generation
             // still matches — a preempted claim is a silent no-op.
@@ -190,6 +190,7 @@ async fn run_boot_barrier_for_scope(
     app: &tauri::AppHandle,
     state: &AppState,
     scope: &RetentionScope,
+    claim: &super::config_sync_readiness::ReadinessClaim,
 ) -> Result<BarrierOutcome, String> {
     let owner_pubkey = scope.owner_keys.public_key().to_hex();
 
@@ -272,6 +273,21 @@ async fn run_boot_barrier_for_scope(
             coordinate,
             observation,
         });
+    }
+
+    // Phase 4 — generation-gate the enforcement phase.
+    //
+    // A preempted barrier that has stale relay evidence (e.g. it observed
+    // `HeadState::Absent` for a coordinate the current barrier just parked)
+    // must not overwrite the current barrier's gate decisions. The check runs
+    // while `managed_agents_store_lock` is held, so the generation cannot
+    // change between this check and the `run_decision_pass` write below.
+    if !claim.is_current() {
+        tracing::info!(
+            target: "buzz::config_sync",
+            "boot barrier abandoned: preempted before enforcement; no gate writes applied"
+        );
+        return Ok(BarrierOutcome::Abandoned);
     }
 
     run_decision_pass(&conn, &owner_pubkey, &states)?;

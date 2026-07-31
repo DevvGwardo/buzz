@@ -13,10 +13,20 @@ use std::path::Path;
 /// `sync_team_personas` wrote in [`crate::migration::run_boot_migrations`]
 /// (see its `# Ordering` guard). Event signing needs the resolved owner keys,
 /// so this runs after identity resolution, not in the boot migrations.
-pub fn run_event_sync(app: &tauri::AppHandle, owner_keys: &nostr::Keys, db_path: &Path) {
-    migrate_personas_to_events(app, owner_keys, db_path);
-    migrate_teams_to_events(app, owner_keys, db_path);
-    crate::managed_agents::reconcile::reconcile_agents_to_events(app, owner_keys, db_path);
+///
+/// Returns `Err` if any reconcile leg fails. A failed leg means some
+/// coordinates were not written to the retention store; the caller must not
+/// certify the scope `Ready` — it stays `Unready` and the full transition
+/// (reconcile + barrier) runs again on the next flush retry.
+pub fn run_event_sync(
+    app: &tauri::AppHandle,
+    owner_keys: &nostr::Keys,
+    db_path: &Path,
+) -> Result<(), String> {
+    migrate_personas_to_events(app, owner_keys, db_path)?;
+    migrate_teams_to_events(app, owner_keys, db_path)?;
+    crate::managed_agents::reconcile::reconcile_agents_to_events(app, owner_keys, db_path)?;
+    Ok(())
 }
 
 /// Variant for workspace applies: spawn the reconcile+barrier with an
@@ -50,18 +60,35 @@ pub fn spawn_event_sync_with_held_claim(
 ) {
     tauri::async_runtime::spawn(async move {
         let barrier_app = app.clone();
-        if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
-            run_event_sync(&app, &owner_keys, &db_path);
+        let reconcile_result = tauri::async_runtime::spawn_blocking(move || {
+            run_event_sync(&app, &owner_keys, &db_path)
         })
-        .await
-        {
-            eprintln!("buzz-desktop: event-sync: spawn_blocking failed: {e}");
+        .await;
+
+        match reconcile_result {
+            Ok(Ok(())) => {
+                // Reconcile succeeded. InProgress is still held here — no
+                // mark_unready between reconcile and the barrier.
+                // run_boot_barrier_after_claim owns the transition to Ready or
+                // Unready without re-claiming.
+                crate::managed_agents::config_barrier::run_boot_barrier_after_claim(
+                    &barrier_app,
+                    claim,
+                )
+                .await;
+            }
+            Ok(Err(e)) => {
+                // A required reconcile leg failed. Drop the claim without
+                // completing — RAII resets to Unready (if still current gen),
+                // leaving the scope fail-closed for retry on the next flush tick.
+                eprintln!("buzz-desktop: event-sync: reconcile failed, not certifying Ready: {e}");
+                drop(claim);
+            }
+            Err(e) => {
+                eprintln!("buzz-desktop: event-sync: spawn_blocking failed: {e}");
+                drop(claim);
+            }
         }
-        // InProgress is still held here — no mark_unready between reconcile
-        // and the barrier. run_boot_barrier_after_claim owns the transition
-        // to Ready or Unready without re-claiming.
-        crate::managed_agents::config_barrier::run_boot_barrier_after_claim(&barrier_app, claim)
-            .await;
     });
 }
 
@@ -85,22 +112,28 @@ pub fn spawn_event_sync_with_held_claim(
 /// `pending_sync = 1` for later relay publish. Migration succeeds on local
 /// write, not relay acknowledgment. Every retained row is a real signed
 /// event — there is no placeholder path.
-pub fn migrate_personas_to_events(app: &tauri::AppHandle, keys: &nostr::Keys, db_path: &Path) {
+pub fn migrate_personas_to_events(
+    app: &tauri::AppHandle,
+    keys: &nostr::Keys,
+    db_path: &Path,
+) -> Result<(), String> {
     use crate::managed_agents::managed_agents_base_dir;
 
     let Ok(base_dir) = managed_agents_base_dir(app) else {
-        return;
+        return Ok(());
     };
 
     match migrate_personas_in_dir_at(&base_dir, keys, db_path) {
-        Ok(0) => {}
+        Ok(0) => Ok(()),
         Ok(migrated) => {
             eprintln!(
                 "buzz-desktop: persona-event-migration: {migrated} personas migrated to retention"
             );
+            Ok(())
         }
         Err(e) => {
             eprintln!("buzz-desktop: persona-event-migration: {e}");
+            Err(e)
         }
     }
 }
@@ -233,20 +266,26 @@ fn migrate_personas_in_dir_at(
 ///
 /// Must run after the persisted identity is resolved (it signs each event with
 /// the owner's keys).
-pub fn migrate_teams_to_events(app: &tauri::AppHandle, keys: &nostr::Keys, db_path: &Path) {
+pub fn migrate_teams_to_events(
+    app: &tauri::AppHandle,
+    keys: &nostr::Keys,
+    db_path: &Path,
+) -> Result<(), String> {
     use crate::managed_agents::managed_agents_base_dir;
 
     let Ok(base_dir) = managed_agents_base_dir(app) else {
-        return;
+        return Ok(());
     };
 
     match migrate_teams_in_dir_at(&base_dir, keys, db_path) {
-        Ok(0) => {}
+        Ok(0) => Ok(()),
         Ok(migrated) => {
             eprintln!("buzz-desktop: team-event-migration: {migrated} teams migrated to retention");
+            Ok(())
         }
         Err(e) => {
             eprintln!("buzz-desktop: team-event-migration: {e}");
+            Err(e)
         }
     }
 }

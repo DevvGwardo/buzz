@@ -114,6 +114,17 @@ impl ReadinessClaim {
         Self { generation }
     }
 
+    /// Return `true` iff this claim's generation still matches the latch.
+    ///
+    /// Used by the barrier's enforcement phase: while holding
+    /// `managed_agents_store_lock`, call this immediately before
+    /// [`run_decision_pass`][super::config_sync::run_decision_pass] to ensure
+    /// a preempted barrier cannot overwrite gate decisions produced by the
+    /// current owner's barrier.
+    pub fn is_current(&self) -> bool {
+        with_lock(|latch| latch.generation == self.generation).unwrap_or(false)
+    }
+
     /// Transition the latch to `Ready(db_path)` if and only if this claim is
     /// still current (latch generation matches). A preempted claim's call is
     /// a silent no-op — the preemptor owns the latch now.
