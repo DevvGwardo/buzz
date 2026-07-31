@@ -242,51 +242,50 @@ pub async fn flush_pending_events(
 ///
 /// # Readiness gate
 ///
-/// Before taking a publish snapshot, this function checks whether the active
-/// scope's boot barrier has completed successfully. If not (first run or after
-/// a workspace switch), it runs the barrier inline before flushing. A barrier
-/// failure leaves the scope unready and skips the flush for this tick — the
-/// next tick retries, so a transient relay-unreachable at boot does not wedge
-/// publishing for the session.
+/// Before taking a publish snapshot, this function checks the scope's
+/// single-flight readiness state:
+///
+/// - `Ready(path)` matching the active scope → flush proceeds.
+/// - `InProgress` → a reconcile+barrier is in-flight; skip this tick.
+/// - `Unready` → no barrier has claimed the slot; run the barrier inline
+///   (which will claim `InProgress`, run, and set `Ready` or `Unready`).
+///   A barrier failure skips this tick; the next tick retries.
 pub async fn flush_active_pending_events(
     app: &tauri::AppHandle,
     state: &AppState,
 ) -> Result<u32, String> {
+    use crate::managed_agents::config_sync_readiness::{self, ReadinessState};
+
     let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
 
-    // Check readiness before snapshotting pending rows. The check and the
-    // snapshot are separate DB reads — a gate set between the two is caught
-    // by the per-row publish_blocked re-read immediately before submit.
-    let scope_is_ready = state
-        .config_sync_ready_scope
-        .lock()
-        .map_err(|e| format!("config_sync_ready_scope lock poisoned: {e}"))?
-        .as_ref()
-        .is_some_and(|ready| *ready == scope.db_path);
-
-    if !scope_is_ready {
-        // Barrier not yet run (first boot tick) or a previous barrier failed
-        // (relay unreachable). Run it now; on success the latch is set and the
-        // flush proceeds. On failure the scope stays unready and we skip this
-        // tick — next tick retries the barrier rather than wedging forever.
-        crate::managed_agents::config_barrier::run_boot_barrier(app).await;
-
-        // Re-check readiness after the barrier attempt. If it failed, skip
-        // this flush tick; the barrier will retry on the next one.
-        let now_ready = state
-            .config_sync_ready_scope
-            .lock()
-            .map_err(|e| format!("config_sync_ready_scope lock poisoned: {e}"))?
-            .as_ref()
-            .is_some_and(|ready| *ready == scope.db_path);
-
-        if !now_ready {
+    match config_sync_readiness::readiness_state() {
+        Some(ReadinessState::Ready(ref path)) if *path == scope.db_path => {
+            // Scope is ready — fall through to flush.
+        }
+        Some(ReadinessState::InProgress) => {
+            // Reconcile+barrier is in-flight. Skip this tick; the owning
+            // task will transition to Ready (or Unready on error).
             tracing::info!(
                 target: "buzz::config_sync",
                 db_path = %scope.db_path.display(),
-                "flush skipped: boot barrier has not completed for this scope"
+                "flush skipped: reconcile+barrier in progress for this scope"
             );
             return Ok(0);
+        }
+        _ => {
+            // Unready (or None if lock poisoned). Run the barrier inline;
+            // claim_in_progress inside run_boot_barrier is the CAS guard.
+            crate::managed_agents::config_barrier::run_boot_barrier(app).await;
+
+            // Re-check after the barrier attempt.
+            if !config_sync_readiness::is_ready_for(&scope.db_path) {
+                tracing::info!(
+                    target: "buzz::config_sync",
+                    db_path = %scope.db_path.display(),
+                    "flush skipped: boot barrier has not completed for this scope"
+                );
+                return Ok(0);
+            }
         }
     }
 
@@ -311,6 +310,14 @@ async fn flush_pending_events_at(
         let conn = open_retention_db(db_path)?;
         get_pending_sync(&conn)?
     }; // connection dropped before any .await
+
+    // Test-only hook: called after the pending snapshot is taken but before
+    // any per-row publish. Tests use this to gate rows between snapshot and
+    // submit, exercising the pre-submit `publish_blocked` re-read.
+    #[cfg(test)]
+    if let Some(hook) = POST_SNAPSHOT_HOOK.with(|h| h.borrow().clone()) {
+        hook(db_path);
+    }
 
     let mut flushed = 0u32;
     let mut failed_tombstones: std::collections::HashSet<(String, String)> =
@@ -575,4 +582,40 @@ pub fn preview_prospective_persona_snapshot(
     preview
 }
 #[cfg(test)]
+mod flush_barrier_tests;
+#[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+use std::cell::RefCell;
+
+#[cfg(test)]
+type PostSnapshotHookFn = dyn Fn(&std::path::Path) + Send + Sync;
+
+// Thread-local hook called between snapshot and per-row submit in
+// `flush_pending_events_at`. Set by tests to gate rows mid-flight and
+// verify the pre-submit `publish_blocked` re-read catches them.
+#[cfg(test)]
+thread_local! {
+    static POST_SNAPSHOT_HOOK: RefCell<Option<std::sync::Arc<PostSnapshotHookFn>>> =
+        const { RefCell::new(None) };
+}
+
+/// Register a post-snapshot hook for the current thread.
+///
+/// The hook is called with the DB path after `get_pending_sync` takes its
+/// snapshot but before any row's pre-submit re-read runs.
+#[cfg(test)]
+pub fn set_post_snapshot_hook(f: impl Fn(&std::path::Path) + Send + Sync + 'static) {
+    POST_SNAPSHOT_HOOK.with(|h| {
+        *h.borrow_mut() = Some(std::sync::Arc::new(f));
+    });
+}
+
+/// Clear the post-snapshot hook for the current thread.
+#[cfg(test)]
+pub fn clear_post_snapshot_hook() {
+    POST_SNAPSHOT_HOOK.with(|h| {
+        *h.borrow_mut() = None;
+    });
+}

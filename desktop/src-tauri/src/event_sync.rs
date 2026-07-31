@@ -26,21 +26,38 @@ pub fn run_event_sync(app: &tauri::AppHandle, owner_keys: &nostr::Keys, db_path:
 /// SQLite, and signing work, so it runs on the blocking pool rather than an
 /// async worker.
 ///
-/// # Ordering: reconcile, then barrier, enforced by the flush readiness latch
+/// # Ordering: reconcile, then barrier, enforced by the single-flight latch
 ///
 /// The reconcile marks changed coordinates `pending_sync = 1`; the boot barrier
-/// ([`crate::managed_agents::config_barrier::run_boot_barrier`]) then decides
-/// which of those may actually go out and gates the rest. The flush loop
-/// enforces this ordering structurally: before publishing any row it checks the
-/// per-scope readiness latch in `AppState::config_sync_ready_scope`; if unset,
-/// it runs the barrier inline and only proceeds on success. This guarantees that
-/// nothing publishes for a scope until the barrier has completed successfully —
-/// regardless of when the flush loop's first tick fires.
+/// ([`crate::managed_agents::config_barrier::run_boot_barrier_after_claim`])
+/// then decides which may go out and gates the rest. Ordering is enforced
+/// structurally:
+///
+/// 1. This function claims `InProgress` on the process-global readiness latch
+///    BEFORE the reconcile task starts, preventing any concurrent flush tick
+///    from running its own barrier against the pre-reconcile database state.
+///
+/// 2. The blocking task runs reconcile; `run_boot_barrier_after_claim` then
+///    completes the transition to `Ready(db_path)` (or back to `Unready` on
+///    error). InProgress is held continuously — there is no reset between
+///    reconcile and barrier, so no concurrent flush tick can win the CAS and
+///    certify readiness against a pre-reconcile snapshot.
+///
+/// 3. The flush loop sees `InProgress` during the entire reconcile+barrier
+///    window and skips its tick rather than racing to certify readiness early.
 pub fn spawn_event_sync(
     app: tauri::AppHandle,
     owner_keys: nostr::Keys,
     db_path: std::path::PathBuf,
 ) {
+    // Claim the single-flight slot synchronously before spawning. The flush
+    // loop sees InProgress immediately and skips until reconcile+barrier
+    // completes — no concurrent inline barrier can beat the reconcile.
+    if !crate::managed_agents::config_sync_readiness::claim_in_progress() {
+        // Already InProgress or Ready: another path owns this cycle.
+        return;
+    }
+
     tauri::async_runtime::spawn(async move {
         let barrier_app = app.clone();
         if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
@@ -49,11 +66,11 @@ pub fn spawn_event_sync(
         .await
         {
             eprintln!("buzz-desktop: event-sync: spawn_blocking failed: {e}");
-            // The barrier still runs: a failed reconcile leaves whatever rows
-            // a previous boot queued, and gating those is exactly the case the
-            // barrier exists for.
         }
-        crate::managed_agents::config_barrier::run_boot_barrier(&barrier_app).await;
+        // InProgress is still held here — no mark_unready between reconcile
+        // and the barrier. run_boot_barrier_after_claim owns the transition
+        // to Ready or Unready without re-claiming.
+        crate::managed_agents::config_barrier::run_boot_barrier_after_claim(&barrier_app).await;
     });
 }
 

@@ -221,9 +221,7 @@ pub async fn apply_workspace(
             // unready until its own boot barrier completes. Without this,
             // a prior scope's latch could let the new scope's flush loop
             // publish before its gate has run.
-            if let Ok(mut ready) = state.config_sync_ready_scope.lock() {
-                *ready = None;
-            }
+            crate::managed_agents::config_sync_readiness::mark_unready();
             // Adopt whatever the pre-scoping release left queued in the global
             // retention database BEFORE the scoped reconcile and flush run, so
             // stranded tombstones and archive requests publish on this boot

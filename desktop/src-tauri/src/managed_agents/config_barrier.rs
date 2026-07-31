@@ -47,48 +47,76 @@ use buzz_core_pkg::kind::{KIND_MANAGED_AGENT, KIND_PERSONA, KIND_TEAM};
 
 /// Run the boot barrier for the active scope.
 ///
-/// On success, marks the scope's `db_path` as ready in `AppState`, allowing
-/// the flush loop to publish for that scope. On any error, leaves the ready
-/// latch unset so the scope stays fail-closed until a later retry succeeds.
+/// Attempts to claim the `Unready → InProgress` transition. If another
+/// caller already owns it (state is `InProgress` or `Ready`), this returns
+/// immediately — the in-flight or completed barrier is sufficient.
 ///
-/// This is called from the flush loop when it finds the scope not ready —
-/// so a transient failure (relay unreachable) retries on the next flush tick
-/// rather than wedging publishing for the session.
+/// On success, marks the scope `Ready`, allowing the flush loop to publish
+/// for that scope. On any error, resets to `Unready` so the scope stays
+/// fail-closed until a later retry succeeds.
+///
+/// Called from the flush loop (retry path, only when `Unready`). The
+/// `claim_in_progress` CAS ensures at most one barrier runs at a time.
+/// `spawn_event_sync` calls [`run_boot_barrier_after_claim`] instead, which
+/// assumes the caller already holds `InProgress` and skips the CAS.
 pub async fn run_boot_barrier(app: &tauri::AppHandle) {
+    use super::config_sync_readiness;
+
+    // Single-flight: only the first caller to claim InProgress runs the
+    // barrier. If the state is already InProgress (spawn_event_sync's
+    // reconcile is in-flight) or Ready, skip.
+    if !config_sync_readiness::claim_in_progress() {
+        return;
+    }
+
+    run_boot_barrier_enforcing(app).await;
+}
+
+/// Execute the barrier enforcement assuming the caller already claimed
+/// `InProgress`.
+///
+/// Called from `spawn_event_sync` after reconcile completes. The caller holds
+/// `InProgress` through the entire reconcile+barrier window, preventing any
+/// concurrent flush tick from certifying readiness against the pre-reconcile
+/// database state. This function never calls `claim_in_progress` — ownership
+/// is the caller's invariant.
+///
+/// On success: transitions to `Ready(db_path)`. On any error: resets to
+/// `Unready` (fail-closed, retryable on the next flush tick).
+pub(crate) async fn run_boot_barrier_after_claim(app: &tauri::AppHandle) {
+    run_boot_barrier_enforcing(app).await;
+}
+
+/// Shared enforcement body: scope resolution, relay lookups, decision pass.
+///
+/// Caller must own `InProgress` (either via `claim_in_progress` in
+/// `run_boot_barrier`, or via the pre-spawn claim in `spawn_event_sync` passed
+/// through `run_boot_barrier_after_claim`).
+async fn run_boot_barrier_enforcing(app: &tauri::AppHandle) {
+    use super::config_sync_readiness;
+
     let state = app.state::<AppState>();
     let scope = match active_retention_scope(app, &state) {
         Ok(scope) => scope,
         Err(error) => {
             tracing::warn!(target: "buzz::config_sync", %error, "boot barrier skipped: no active scope");
+            config_sync_readiness::mark_unready();
             return;
         }
     };
 
     match run_boot_barrier_for_scope(app, &state, &scope).await {
         Ok(()) => {
-            // Mark the scope ready. Any error in the scope check or lock is
-            // treated as a barrier failure — leave unready rather than risk
-            // opening the gate without enforcement.
-            match state.config_sync_ready_scope.lock() {
-                Ok(mut guard) => {
-                    *guard = Some(scope.db_path.clone());
-                    tracing::info!(
-                        target: "buzz::config_sync",
-                        db_path = %scope.db_path.display(),
-                        "boot barrier complete; scope is ready for publication"
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "buzz::config_sync",
-                        %error,
-                        "boot barrier completed but failed to set ready latch; scope stays closed"
-                    );
-                }
-            }
+            config_sync_readiness::mark_ready(scope.db_path.clone());
+            tracing::info!(
+                target: "buzz::config_sync",
+                db_path = %scope.db_path.display(),
+                "boot barrier complete; scope is ready for publication"
+            );
         }
         Err(error) => {
             tracing::warn!(target: "buzz::config_sync", %error, "boot barrier failed; scope stays closed for retry");
+            config_sync_readiness::mark_unready();
         }
     }
 }
