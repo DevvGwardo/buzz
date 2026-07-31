@@ -126,6 +126,7 @@ export function WorkspaceTabs({
   localSnapshotError,
   localSnapshotLoading,
   project,
+  projectId,
   repoDiff,
   repoDiffError,
   repoDiffLoading,
@@ -163,6 +164,7 @@ export function WorkspaceTabs({
   localSnapshotError: unknown;
   localSnapshotLoading: boolean;
   project: Repository;
+  projectId: string;
   repoDiff: ProjectRepoDiff | null | undefined;
   repoDiffError: unknown;
   repoDiffLoading: boolean;
@@ -531,7 +533,7 @@ export function WorkspaceTabs({
       </TabsContent>
       {createPullRequestAction && createPullRequestOpen ? (
         <CreatePullRequestDialog
-          initialProjectId={project.id}
+          initialProjectId={projectId}
           onCreated={createPullRequestAction.onCreated}
           onOpenChange={setCreatePullRequestOpen}
           open

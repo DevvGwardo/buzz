@@ -185,7 +185,13 @@ export function ProjectsView() {
     filter === "repositories" ? projects : [],
   );
   const [repositoryScope, setRepositoryScope] =
-    React.useState<ProjectsRepositoryScope>(() => readStoredRepositoryScope());
+    React.useState<ProjectsRepositoryScope>(() => {
+      const storedScope = readStoredRepositoryScope();
+      return filter === "projects" &&
+        (storedScope === "buzz" || storedScope === "linked")
+        ? "all"
+        : storedScope;
+    });
   const [pullRequestScope, setPullRequestScope] =
     React.useState<ProjectsWorkItemScope>(() => readStoredPullRequestScope());
   const [issueScope, setIssueScope] = React.useState<ProjectsWorkItemScope>(
@@ -264,10 +270,20 @@ export function ProjectsView() {
     [],
   );
 
-  const handleFilterChange = React.useCallback((nextFilter: ProjectsFilter) => {
-    setFilter(nextFilter);
-    writeStoredFilter(nextFilter);
-  }, []);
+  const handleFilterChange = React.useCallback(
+    (nextFilter: ProjectsFilter) => {
+      if (
+        nextFilter === "projects" &&
+        (repositoryScope === "buzz" || repositoryScope === "linked")
+      ) {
+        setRepositoryScope("all");
+        writeStoredRepositoryScope("all");
+      }
+      setFilter(nextFilter);
+      writeStoredFilter(nextFilter);
+    },
+    [repositoryScope],
+  );
 
   const handleRepositoryScopeChange = React.useCallback(
     (scope: ProjectsRepositoryScope) => {

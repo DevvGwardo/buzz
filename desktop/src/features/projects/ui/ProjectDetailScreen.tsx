@@ -947,6 +947,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                 onSelectedTabChange={setActiveTab}
                 profiles={profiles}
                 project={repository}
+                projectId={project.id}
                 repoDiff={displayedRepoDiff}
                 repoDiffError={displayedRepoDiffError}
                 repoDiffLoading={displayedRepoDiffLoading}
