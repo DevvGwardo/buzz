@@ -692,9 +692,10 @@ pub(crate) fn normalize_agent_command_identity(command: &str) -> String {
 
 fn default_agent_args(command: &str) -> Option<Vec<String>> {
     match normalize_agent_command_identity(command).as_str() {
-        "goose" => Some(vec!["acp".to_string()]),
+        "goose" | "opencode" => Some(vec!["acp".to_string()]),
         "codex" | "codex-acp" | "claude-agent-acp" | "claude-code-acp" | "claude-code"
         | "claudecode" | "buzz-agent" => Some(Vec::new()),
+        "hermes" | "hermes-agent" | "hermes-acp" => Some(Vec::new()),
         _ => None,
     }
 }
@@ -1590,6 +1591,35 @@ mod tests {
             normalize_agent_args("buzz-agent", vec!["acp".into()]),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn normalizes_hermes_args_to_empty() {
+        // `hermes-acp` is itself an ACP-mode launcher, so it must never receive
+        // the legacy `acp` argument — that would double it up to `hermes acp acp`
+        // and abort startup, leaving the model dropdown empty.
+        for command in [
+            "hermes",
+            "hermes-agent",
+            "hermes-acp",
+            "/opt/hermes/bin/hermes-acp",
+        ] {
+            assert_eq!(
+                normalize_agent_args(command, Vec::new()),
+                Vec::<String>::new(),
+                "unexpected defaults for {command}"
+            );
+            assert_eq!(
+                normalize_agent_args(command, vec!["acp".into()]),
+                Vec::<String>::new(),
+                "unexpected legacy-acp handling for {command}"
+            );
+            assert_eq!(
+                normalize_agent_args(command, vec!["".into()]),
+                Vec::<String>::new(),
+                "unexpected empty-arg handling for {command}"
+            );
+        }
     }
 
     #[test]
