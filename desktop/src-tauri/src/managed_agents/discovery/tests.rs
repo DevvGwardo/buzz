@@ -95,6 +95,35 @@ fn normalizes_buzz_agent_args_to_empty() {
 }
 
 #[test]
+fn normalizes_hermes_args_to_empty() {
+    // `hermes-acp` is itself an ACP-mode launcher, so it must never receive
+    // the legacy `acp` argument — that would double it up to `hermes acp acp`
+    // and abort startup, leaving the model dropdown empty.
+    for command in [
+        "hermes",
+        "hermes-agent",
+        "hermes-acp",
+        "/opt/hermes/bin/hermes-acp",
+    ] {
+        assert_eq!(
+            normalize_agent_args(command, Vec::new()),
+            Vec::<String>::new(),
+            "unexpected defaults for {command}"
+        );
+        assert_eq!(
+            normalize_agent_args(command, vec!["acp".into()]),
+            Vec::<String>::new(),
+            "unexpected legacy-acp handling for {command}"
+        );
+        assert_eq!(
+            normalize_agent_args(command, vec!["".into()]),
+            Vec::<String>::new(),
+            "unexpected empty-arg handling for {command}"
+        );
+    }
+}
+
+#[test]
 fn login_shell_lookup_treats_command_as_data() {
     let marker =
         std::env::temp_dir().join(format!("buzz-discovery-marker-{}", uuid::Uuid::new_v4()));

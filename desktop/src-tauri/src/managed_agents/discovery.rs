@@ -445,6 +445,7 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
         "goose" => Some(vec!["acp".to_string()]),
         "codex" | "codex-acp" | "claude-agent-acp" | "claude-code-acp" | "claude-code"
         | "claudecode" | "buzz-agent" => Some(Vec::new()),
+        "hermes" | "hermes-agent" | "hermes-acp" => Some(Vec::new()),
         _ => None,
     }
 }
