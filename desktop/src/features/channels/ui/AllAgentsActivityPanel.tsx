@@ -38,17 +38,51 @@ type WorkingAgentActivityCardProps = {
   profiles?: UserProfileLookup;
 };
 
-function WorkingAgentActivityCard({
+/** Mount heavy transcript panels only when the card approaches the viewport. */
+function useNearViewport(rootMargin = "160px") {
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  const [near, setNear] = React.useState(false);
+
+  React.useEffect(() => {
+    if (near) {
+      return;
+    }
+    const node = ref.current;
+    if (!node || typeof IntersectionObserver === "undefined") {
+      setNear(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setNear(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [near, rootMargin]);
+
+  return { ref, near };
+}
+
+const WorkingAgentActivityCard = React.memo(function WorkingAgentActivityCard({
   agent,
   avatarUrl,
   channelId = null,
   onOpenAgentSession,
   profiles,
 }: WorkingAgentActivityCardProps) {
+  const { ref, near } = useNearViewport();
+
   return (
-    <article
+    <div
       className="overflow-hidden rounded-lg border border-border/70 bg-background/80 shadow-xs"
       data-testid={`all-agents-activity-card-${agent.pubkey}`}
+      ref={ref}
+      style={{ contentVisibility: "auto", containIntrinsicSize: "0 220px" }}
     >
       <div className="flex items-center gap-3 border-b border-border/50 px-3 py-2.5">
         <UserAvatar
@@ -74,34 +108,41 @@ function WorkingAgentActivityCard({
       </div>
 
       <div className="relative flex h-44 flex-col overflow-hidden">
-        <ManagedAgentSessionPanel
-          agent={{
-            pubkey: agent.pubkey,
-            name: agent.name,
-            status: agent.status ?? "running",
-            avatarUrl,
-          }}
-          autoTail={true}
-          channelId={channelId}
-          className="min-h-0 flex-1 border-0 bg-transparent px-3 text-xs shadow-none **:data-message-id:pointer-events-none"
-          emptyDescription="Waiting for activity…"
-          emptyState="loading"
-          panelPadding={false}
-          profiles={profiles}
-          rawLayout="responsive"
-          showHeader={false}
-          showRaw={false}
-          transcriptContentClassName="py-2"
-          transcriptVariant="compactPreview"
-        />
+        {near ? (
+          <ManagedAgentSessionPanel
+            agent={{
+              pubkey: agent.pubkey,
+              name: agent.name,
+              status: agent.status ?? "running",
+              avatarUrl,
+            }}
+            autoTail={true}
+            channelId={channelId}
+            className="min-h-0 flex-1 border-0 bg-transparent px-3 text-xs shadow-none **:data-message-id:pointer-events-none"
+            emptyDescription="Waiting for activity…"
+            emptyState="loading"
+            includeArchivedEvents={false}
+            panelPadding={false}
+            profiles={profiles}
+            rawLayout="responsive"
+            showHeader={false}
+            showRaw={false}
+            transcriptContentClassName="py-2"
+            transcriptVariant="compactPreview"
+          />
+        ) : (
+          <div className="flex min-h-0 flex-1 items-center justify-center text-xs text-muted-foreground">
+            Loading activity…
+          </div>
+        )}
         <div
           aria-hidden="true"
           className="pointer-events-none absolute inset-x-0 top-0 h-6 bg-linear-to-b from-background/80 to-transparent"
         />
       </div>
-    </article>
+    </div>
   );
-}
+});
 
 export function AllAgentsActivityPanel({
   agents,
@@ -122,8 +163,11 @@ export function AllAgentsActivityPanel({
     () => agentsForAllActivityPanel({ agents, workingBotPubkeys }),
     [agents, workingBotPubkeys],
   );
-  const agentAvatarUrl = (agent: BotActivityAgent) =>
-    profiles?.[agent.pubkey.toLowerCase()]?.avatarUrl ?? null;
+  const agentAvatarUrl = React.useCallback(
+    (agent: BotActivityAgent) =>
+      profiles?.[agent.pubkey.toLowerCase()]?.avatarUrl ?? null,
+    [profiles],
+  );
 
   return (
     <AuxiliaryPanel

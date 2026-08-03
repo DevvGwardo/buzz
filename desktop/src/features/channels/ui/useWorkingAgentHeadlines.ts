@@ -8,22 +8,13 @@ import {
 import { useAgentTranscript } from "@/features/agents/ui/useObserverEvents";
 import type { TranscriptItem } from "@/features/agents/ui/agentSessionTypes";
 
-export function collectActivityHeadlines(
-  transcript: TranscriptItem[],
-  channelId?: string | null,
-  maxHeadlines = 5,
+function collectHeadlinesWithFilter(
+  scopedTranscript: TranscriptItem[],
+  passFilter: (item: TranscriptItem) => boolean,
+  maxHeadlines: number,
 ): string[] {
   const seen = new Set<string>();
   const headlines: string[] = [];
-  const scopedTranscript = channelId
-    ? transcript.filter((item) => item.channelId === channelId)
-    : transcript;
-
-  const passFilter: (item: TranscriptItem) => boolean = scopedTranscript.some(
-    isSpineItem,
-  )
-    ? isSpineItem
-    : isMeaningfulItem;
 
   for (let i = scopedTranscript.length - 1; i >= 0; i--) {
     const item = scopedTranscript[i];
@@ -43,6 +34,41 @@ export function collectActivityHeadlines(
   }
 
   return headlines;
+}
+
+export function collectActivityHeadlines(
+  transcript: TranscriptItem[],
+  channelId?: string | null,
+  maxHeadlines = 5,
+): string[] {
+  // Prefer reverse scan over filter+some so long transcripts stop early.
+  // Only materialize a channel-scoped array when a channel filter is set.
+  let scopedTranscript = transcript;
+  if (channelId) {
+    scopedTranscript = [];
+    for (let i = 0; i < transcript.length; i++) {
+      const item = transcript[i];
+      if (item.channelId === channelId) {
+        scopedTranscript.push(item);
+      }
+    }
+  }
+
+  // Prefer spine rows when any exist. Reverse-scan to find one instead of
+  // walking the whole array with .some() on long transcripts.
+  let hasSpine = false;
+  for (let i = scopedTranscript.length - 1; i >= 0; i--) {
+    if (isSpineItem(scopedTranscript[i])) {
+      hasSpine = true;
+      break;
+    }
+  }
+
+  return collectHeadlinesWithFilter(
+    scopedTranscript,
+    hasSpine ? isSpineItem : isMeaningfulItem,
+    maxHeadlines,
+  );
 }
 
 export function useWorkingAgentHeadlines(

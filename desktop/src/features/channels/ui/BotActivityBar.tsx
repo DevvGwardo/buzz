@@ -2,10 +2,7 @@ import * as React from "react";
 import { Loader2 } from "lucide-react";
 
 import { useWorkingAgentHeadlines } from "@/features/channels/ui/useWorkingAgentHeadlines";
-import {
-  shouldShowViewAllAgentActivity,
-  type ChannelActivityAgent,
-} from "@/features/channels/ui/botActivityViewAll";
+import type { ChannelActivityAgent } from "@/features/channels/ui/botActivityViewAll";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { ManagedAgent } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
@@ -124,9 +121,9 @@ export function BotActivityComposerAction({
         }`
       : `${workingAgents[0]?.name ?? "Agent"} +${workingAgents.length - 1}`;
 
+  // workingAgents is already the filtered set — avoid a second full scan.
   const canViewAll =
-    Boolean(onOpenAllAgentActivity) &&
-    shouldShowViewAllAgentActivity({ agents, workingBotPubkeys });
+    Boolean(onOpenAllAgentActivity) && workingAgents.length >= 2;
   const handleViewAll = React.useCallback(() => {
     clearHoverTimer();
     setOpen(false);
