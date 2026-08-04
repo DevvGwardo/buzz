@@ -1520,6 +1520,15 @@ impl AcpClient {
 
                     tracing::debug!(target: "acp::wire", "← {trimmed}");
 
+                    // Any stdout line means the agent is alive — reset the idle
+                    // deadline even for non-JSON lines (thinking/reasoning output
+                    // from opencode and similar ACP adapters). The hard deadline
+                    // (max_turn_duration) is the real safety valve for runaway
+                    // agents; the idle timer only guards against total silence.
+                    let activity_now = Instant::now();
+                    idle_deadline = activity_now + idle_timeout;
+                    last_activity_at = activity_now;
+
                     let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                         Ok(v) => v,
                         Err(e) => {
@@ -1538,10 +1547,6 @@ impl AcpClient {
                         }
                     };
                     self.observe("acp_read", msg.clone());
-
-                    let activity_now = Instant::now();
-                    idle_deadline = activity_now + idle_timeout;
-                    last_activity_at = activity_now;
 
                     // Steer response routing must come BEFORE the prompt
                     // response check: a steer response is a regular

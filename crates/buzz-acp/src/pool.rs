@@ -821,7 +821,15 @@ const CONTEXT_COUNT_TIMEOUT: Duration = Duration::from_millis(500);
 const CONTEXT_FETCH_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Timeout for model-switch requests (`session/set_config_option`, `session/set_model`).
-const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Applied right after `session/new`, while a heavy ACP adapter (opencode with
+/// a large skill/plugin set, hermes with its MCP server tree) is still booting.
+/// 5s was too short: opencode answered `session/new` but took longer than 5s
+/// to answer the follow-up `session/set_model`, which surfaced as a fatal
+/// transport error → respawn → circuit-open → the agent never responded.
+/// Mirrors the MODELS_TIMEOUT 10s→30s raise (hermes MCP boot exceeding the
+/// probe budget) — startup-time RPCs get a startup-sized budget.
+const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bounded grace window for the post-cancel drain after a control-signal
 /// cancellation (steer fallback, interrupt, or explicit stop). This is a
@@ -831,7 +839,9 @@ const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 /// Timeout for permission-mode requests (`session/set_config_option` with `configId: "mode"`).
-const PERMISSION_MODE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Also applied right after `session/new` during agent boot — same reasoning as
+/// `MODEL_SWITCH_TIMEOUT` (heavy adapters answer slowly while starting up).
+const PERMISSION_MODE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Placeholder [`fetch_channel_info`] substitutes when a channel's metadata
 /// event carries no `name` tag. Not a real channel name — consumers that need
@@ -1097,11 +1107,16 @@ async fn apply_model_switch(
                 "applied model {desired} via {method_label} on session {session_id}"
             );
         }
-        // Transport-class errors may have corrupted the stdio stream — propagate
-        // so the caller can respawn the agent instead of reusing a poisoned one.
+        // Transport-class errors may have corrupted the stdio stream — but a
+        // timeout is NOT evidence of corruption: heavy adapters (opencode
+        // answers `session/new` but never responds to `session/set_model` /
+        // `session/set_config_option` model RPCs — it only emits a terminal
+        // escape) simply don't support the RPC. Respawn-looping on that was
+        // killing agents outright: 3 attempts → circuit open → never responds.
+        // Io/WriteTimeout/Protocol/AgentExited still propagate (real pipe
+        // damage); Timeout is downgraded to the graceful arm below.
         Ok(Err(e @ AcpError::Io(_)))
         | Ok(Err(e @ AcpError::WriteTimeout(_)))
-        | Ok(Err(e @ AcpError::Timeout(_)))
         | Ok(Err(e @ AcpError::Protocol(_)))
         | Ok(Err(e @ AcpError::AgentExited)) => {
             tracing::error!(
@@ -1110,7 +1125,15 @@ async fn apply_model_switch(
             );
             return Err(e);
         }
-        // Application-level errors (Json, etc.) — agent is fine, just uses default model.
+        // Application-level errors and timeouts — agent is fine, just uses its
+        // default model (matching this function's documented "intentionally
+        // non-fatal" contract).
+        Ok(Err(AcpError::Timeout(_))) => {
+            tracing::warn!(
+                target: "pool::model",
+                "timed out setting model {desired} via {method_label} — proceeding with agent default"
+            );
+        }
         Ok(Err(e)) => {
             tracing::warn!(
                 target: "pool::model",
@@ -1118,13 +1141,13 @@ async fn apply_model_switch(
             );
         }
         Err(_) => {
-            // Outer timeout fired — the inner send_request may have left the
-            // stream in an unknown state. Treat as transport error.
-            tracing::error!(
+            // Outer timeout fired — same reasoning as above: the agent is
+            // alive (it answered session/new) but doesn't answer the model
+            // RPC. Non-fatal; proceed with the agent's default model.
+            tracing::warn!(
                 target: "pool::model",
-                "model set via {method_label} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
+                "model set via {method_label} timed out ({MODEL_SWITCH_TIMEOUT:?}) — proceeding with agent default"
             );
-            return Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT));
         }
     }
     Ok(())

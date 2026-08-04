@@ -16,7 +16,6 @@ import { asRecord, asString, titleCase } from "./agentSessionUtils";
 import {
   describeTurnStarted,
   describeSessionResolved,
-  extractBlockText,
   extractContentText,
   extractPlanText,
   extractPromptText,
@@ -759,16 +758,10 @@ export function processTranscriptEvent(
       event.kind,
     );
   } else if (event.kind === "acp_parse_error") {
-    upsertTextItem(
-      d,
-      `parse-error:${ch}:${event.seq}`,
-      "lifecycle",
-      "Wire parse error",
-      extractBlockText(event.payload),
-      event.timestamp,
-      ctx,
-      event.kind,
-    );
+    // Non-JSON lines from ACP adapters (e.g. opencode thinking/reasoning
+    // chunks) are normal — the idle timer already resets on any stdout
+    // line, so no silent-agent issue either. Silently discard; never
+    // render as transcript noise.
   } else if (event.kind === "turn_error" || event.kind === "agent_panic") {
     const payload = asRecord(event.payload);
     const outcome = asString(payload.outcome) ?? "error";
