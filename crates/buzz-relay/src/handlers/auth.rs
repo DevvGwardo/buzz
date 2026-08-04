@@ -76,6 +76,14 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
     // The tag is integrity-protected by the event's Schnorr signature — if
     // tampered, NIP-42 verification will fail before we ever inspect it.
     let auth_tag_json = extract_auth_tag_json(&event);
+    tracing::debug!(
+        agent = %event.pubkey,
+        tag_present = auth_tag_json.is_some(),
+        raw_tags = format!("{:?}", event.tags),
+        "auth: extracted NIP-OA tag present={} raw_tags={:?}",
+        auth_tag_json.is_some(),
+        event.tags
+    );
 
     let relay_url =
         crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &conn.tenant);

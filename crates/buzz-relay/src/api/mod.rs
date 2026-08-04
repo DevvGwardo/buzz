@@ -74,6 +74,7 @@ pub mod relay_members {
             .is_relay_member(community, &pubkey_hex)
             .await
             .map_err(|e| format!("relay membership check failed: {e}"))?;
+        tracing::debug!(community = %community, pubkey = %pubkey_hex, direct_member = is_member, allow_nip_oa = state.config.allow_nip_oa_auth, tag = auth_tag_header.is_some(), "relay membership check");
         if is_member {
             return Ok(MembershipDecision::Member);
         }
