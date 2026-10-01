@@ -46,6 +46,36 @@ test("describeRawEvent falls back to the event kind when no method is present", 
   assert.equal(describeRawEvent(event), "acp_parse_error");
 });
 
+test("RawEventRail render: hides ACP parse diagnostics but keeps normal events", () => {
+  const events = [
+    rawEvent({ kind: "acp_parse_error", seq: 1 }),
+    rawEvent({
+      kind: "acp_read",
+      seq: 2,
+      payload: { method: "session/prompt" },
+    }),
+  ];
+  const html = renderToStaticMarkup(
+    React.createElement(RawEventRail, { events }),
+  );
+
+  assert.ok(!html.includes('data-message-id="1:2026-07-13T00:00:00.000Z"'));
+  assert.ok(html.includes('data-message-id="2:2026-07-13T00:00:00.000Z"'));
+  assert.ok(!html.includes("acp_parse_error"));
+  assert.ok(html.includes("session/prompt"));
+});
+
+test("RawEventRail render: shows the empty state when only ACP parse diagnostics exist", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(RawEventRail, {
+      events: [rawEvent({ kind: "acp_parse_error" })],
+    }),
+  );
+
+  assert.ok(html.includes("No raw events yet."));
+  assert.ok(!html.includes("acp_parse_error"));
+});
+
 test("RawEventRail render: each row exposes data-message-id keyed on (seq, timestamp) for scroll anchoring", () => {
   const events = [rawEvent({ seq: 1 }), rawEvent({ seq: 2 })];
   const html = renderToStaticMarkup(
